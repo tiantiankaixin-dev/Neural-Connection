@@ -14,6 +14,7 @@ import {
 	filterMcpToolsForMode,
 	resolveToolAlias,
 } from "../prompts/tools/filter-tools-for-mode"
+import { applyProgressiveDisclosure } from "../prompts/tools/progressive-disclosure"
 
 interface BuildToolsOptions {
 	provider: ClineProvider
@@ -32,6 +33,12 @@ interface BuildToolsOptions {
 	 * to pass all tool definitions while restricting callable tools.
 	 */
 	includeAllToolsWithRestrictions?: boolean
+	/**
+	 * Set of tool names the model has already "discovered" via progressive disclosure.
+	 * When provided, enables progressive tool disclosure: only codebase_search and
+	 * discovered tools get full definitions; others are stripped to name + brief description.
+	 */
+	discoveredTools?: Set<string>
 }
 
 interface BuildToolsResult {
@@ -92,6 +99,7 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 		disabledTools,
 		modelInfo,
 		includeAllToolsWithRestrictions,
+		discoveredTools,
 	} = options
 
 	const mcpHub = provider.getMcpHub()
@@ -99,6 +107,7 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 	// Get CodeIndexManager for feature checking.
 	const { CodeIndexManager } = await import("../../services/code-index/manager")
 	const codeIndexManager = CodeIndexManager.getInstance(provider.context, cwd)
+
 
 	// Build settings object for tool filtering.
 	const filterSettings = {
@@ -147,6 +156,7 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 	// Combine filtered tools (for backward compatibility and for allowedFunctionNames)
 	const filteredTools = [...filteredNativeTools, ...filteredMcpTools, ...nativeCustomTools]
 
+
 	// If includeAllToolsWithRestrictions is true, return ALL tools but provide
 	// allowed names based on mode filtering
 	if (includeAllToolsWithRestrictions) {
@@ -165,8 +175,19 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 		}
 	}
 
+	// Apply progressive disclosure if discoveredTools is provided
+	const finalTools = discoveredTools ? applyProgressiveDisclosure(filteredTools, discoveredTools) : filteredTools
+
+	// DEBUG: Log final tools sent to model
+	const toolNames = finalTools.map((t) => {
+		const fn = (t as any).function
+		const hasParams = fn?.parameters?.properties && Object.keys(fn.parameters.properties).length > 0
+		return `${fn?.name}${hasParams ? "(full)" : "(stripped)"}`
+	})
+	console.log(`[build-tools DEBUG] Final tools (${finalTools.length}): ${toolNames.join(", ")}`)
+
 	// Default behavior: return only filtered tools
 	return {
-		tools: filteredTools,
+		tools: finalTools,
 	}
 }

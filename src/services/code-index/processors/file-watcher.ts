@@ -581,6 +581,11 @@ export class FileWatcher implements IFileWatcher {
 							codeChunk: block.content,
 							startLine: block.start_line,
 							endLine: block.end_line,
+							defines: block.relations?.defines || [],
+							refs: block.relations?.refs || [],
+							refDensity: block.relations?.refDensity || 0,
+							className: block.relations?.classContext?.className || null,
+							classExtends: block.relations?.classContext?.extends || null,
 						},
 					}
 				})

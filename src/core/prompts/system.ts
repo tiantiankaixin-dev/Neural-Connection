@@ -72,6 +72,10 @@ async function generatePrompt(
 
 	const codeIndexManager = CodeIndexManager.getInstance(context, cwd)
 
+	// DEBUG: Verify RAG system state when system prompt is generated
+	const codeIndexEnabled = !!(codeIndexManager?.isFeatureEnabled && codeIndexManager?.isFeatureConfigured && codeIndexManager?.isInitialized)
+	console.log(`[SYSTEM_PROMPT DEBUG] cwd=${cwd}, codeIndexManager exists=${!!codeIndexManager}, enabled=${codeIndexManager?.isFeatureEnabled}, configured=${codeIndexManager?.isFeatureConfigured}, initialized=${codeIndexManager?.isInitialized}, => RAG section included: ${codeIndexEnabled}`)
+
 	// Tool calling is native-only.
 	const effectiveProtocol = "native"
 
@@ -91,7 +95,7 @@ ${getSharedToolUseSection()}${toolsCatalog}
 
 	${getToolUseGuidelinesSection()}
 
-${getCapabilitiesSection(cwd, shouldIncludeMcp ? mcpHub : undefined)}
+${getCapabilitiesSection(cwd, shouldIncludeMcp ? mcpHub : undefined, codeIndexEnabled)}
 
 ${modesSection}
 ${skillsSection ? `\n${skillsSection}` : ""}

@@ -333,12 +333,8 @@ export class CodeIndexManager {
 		await rooIgnoreController.initialize()
 
 		// (Re)Create shared service instances
-		const { embedder, vectorStore, scanner, fileWatcher } = this._serviceFactory.createServices(
-			this.context,
-			this._cacheManager!,
-			ignoreInstance,
-			rooIgnoreController,
-		)
+		const { embedder, vectorStore, scanner, fileWatcher, pageRankService, graphExpander } =
+			this._serviceFactory.createServices(this.context, this._cacheManager!, ignoreInstance, rooIgnoreController)
 
 		// Validate embedder configuration before proceeding
 		const validationResult = await this._serviceFactory.validateEmbedder(embedder)
@@ -358,6 +354,7 @@ export class CodeIndexManager {
 			scanner,
 			fileWatcher,
 		)
+		this._orchestrator.setPageRankService(pageRankService)
 
 		// (Re)Initialize search service
 		this._searchService = new CodeIndexSearchService(
@@ -366,6 +363,7 @@ export class CodeIndexManager {
 			embedder,
 			vectorStore,
 		)
+		this._searchService.setGraphExpander(graphExpander)
 
 		// Clear any error state after successful recreation
 		this._stateManager.setSystemState("Standby", "")

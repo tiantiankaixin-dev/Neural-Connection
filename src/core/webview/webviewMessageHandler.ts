@@ -1137,14 +1137,18 @@ export const webviewMessageHandler = async (
 			}
 			break
 		case "openFile":
-			let filePath: string = message.text!
-			if (!path.isAbsolute(filePath)) {
-				filePath = path.join(getCurrentCwd(), filePath)
+			if (message.text) {
+				let filePath: string = message.text
+				if (!path.isAbsolute(filePath)) {
+					filePath = path.join(getCurrentCwd(), filePath)
+				}
+				openFile(filePath, message.values as { create?: boolean; content?: string; line?: number })
 			}
-			openFile(filePath, message.values as { create?: boolean; content?: string; line?: number })
 			break
 		case "openMention":
-			openMention(getCurrentCwd(), message.text)
+			if (message.text) {
+				openMention(getCurrentCwd(), message.text)
+			}
 			break
 		case "openExternal":
 			if (message.url) {

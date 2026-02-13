@@ -4,6 +4,7 @@ import { IEmbedder } from "./interfaces/embedder"
 import { IVectorStore } from "./interfaces/vector-store"
 import { CodeIndexConfigManager } from "./config-manager"
 import { CodeIndexStateManager } from "./state-manager"
+import { GraphExpander, ExpandedSearchResult } from "./graph-expander"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 
@@ -11,12 +12,21 @@ import { TelemetryEventName } from "@roo-code/types"
  * Service responsible for searching the code index.
  */
 export class CodeIndexSearchService {
+	private graphExpander?: GraphExpander
+
 	constructor(
 		private readonly configManager: CodeIndexConfigManager,
 		private readonly stateManager: CodeIndexStateManager,
 		private readonly embedder: IEmbedder,
 		private readonly vectorStore: IVectorStore,
 	) {}
+
+	/**
+	 * Set the GraphExpander for code graph enriched search.
+	 */
+	setGraphExpander(expander: GraphExpander): void {
+		this.graphExpander = expander
+	}
 
 	/**
 	 * Searches the code index for relevant content.
@@ -54,8 +64,14 @@ export class CodeIndexSearchService {
 				normalizedPrefix = path.normalize(directoryPrefix)
 			}
 
-			// Perform search
+			// Perform vector search
 			const results = await this.vectorStore.search(vector, normalizedPrefix, minScore, maxResults)
+
+			// Expand with code graph if available
+			if (this.graphExpander) {
+				return await this.graphExpander.expand(results)
+			}
+
 			return results
 		} catch (error) {
 			console.error("[CodeIndexSearchService] Error during search:", error)

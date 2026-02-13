@@ -41,6 +41,7 @@ import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 
 import { formatResponse } from "../prompts/responses"
 import { sanitizeToolUseId } from "../../utils/tool-id"
+import { isStrippedTool, getFullToolSchemaText } from "../prompts/tools/progressive-disclosure"
 
 /**
  * Processes and presents assistant message content to the user interface.
@@ -704,6 +705,14 @@ export async function presentAssistantMessage(cline: Task) {
 					)
 					break
 				}
+			}
+
+			// Progressive tool disclosure: intercept calls to stripped tools
+			if (block.name && isStrippedTool(block.name, cline.discoveredTools)) {
+				cline.discoveredTools.add(block.name)
+				const schemaText = getFullToolSchemaText(block.name)
+				pushToolResult(schemaText)
+				break
 			}
 
 			switch (block.name) {

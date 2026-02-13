@@ -331,6 +331,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	consecutiveNoToolUseCount: number = 0
 	consecutiveNoAssistantMessagesCount: number = 0
 	toolUsage: ToolUsage = {}
+	// Progressive tool disclosure: tracks which tools the model has "discovered"
+	discoveredTools: Set<string> = new Set()
 
 	// Checkpoints
 	enableCheckpoints: boolean
@@ -4357,6 +4359,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				disabledTools: state?.disabledTools,
 				modelInfo,
 				includeAllToolsWithRestrictions: supportsAllowedFunctionNames,
+				discoveredTools: this.discoveredTools,
 			})
 			allTools = toolsResult.tools
 			allowedFunctionNames = toolsResult.allowedFunctionNames

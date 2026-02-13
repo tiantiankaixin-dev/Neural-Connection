@@ -48,13 +48,13 @@ export function getNativeTools(options: NativeToolsOptions = {}): OpenAI.Chat.Ch
 	}
 
 	return [
+		codebaseSearch, // RAG semantic search - placed first for model primacy bias
 		accessMcpResource,
 		apply_diff,
 		applyPatch,
 		askFollowupQuestion,
 		attemptCompletion,
 		browserAction,
-		codebaseSearch,
 		executeCommand,
 		generateImage,
 		listFiles,

@@ -10,6 +10,7 @@ import { MAX_BLOCK_CHARS, MIN_BLOCK_CHARS, MIN_CHUNK_REMAINDER_CHARS, MAX_CHARS_
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 import { sanitizeErrorMessage } from "../shared/validation-helpers"
+import { TagExtractor, FileTagResult } from "../analyzers/tag-extractor"
 
 /**
  * Implementation of the code parser interface
@@ -17,6 +18,7 @@ import { sanitizeErrorMessage } from "../shared/validation-helpers"
 export class CodeParser implements ICodeParser {
 	private loadedParsers: LanguageParser = {}
 	private pendingLoads: Map<string, Promise<LanguageParser>> = new Map()
+	private tagExtractor: TagExtractor = new TagExtractor()
 	// Markdown files are now supported using the custom markdown parser
 	// which extracts headers and sections for semantic indexing
 
@@ -226,7 +228,87 @@ export class CodeParser implements ICodeParser {
 			// Nodes smaller than minBlockChars are ignored
 		}
 
+		// [Code Graph] Extract tags and map to blocks
+		this.mapTagsToBlocks(results, filePath, content, language.parser, language.language)
+
 		return results
+	}
+
+	/**
+	 * Maps file-level tags (definitions + references) to individual CodeBlocks by line range.
+	 * This enriches each block with relation data for the code graph.
+	 */
+	private mapTagsToBlocks(
+		blocks: CodeBlock[],
+		filePath: string,
+		content: string,
+		parser: any,
+		language: any,
+	): void {
+		if (blocks.length === 0) {
+			return
+		}
+
+		try {
+			const tagResult: FileTagResult = this.tagExtractor.extract(filePath, content, parser, language)
+
+			const fileImports = tagResult.imports.map((imp) => ({ symbol: imp.symbol, path: imp.path }))
+
+			for (const block of blocks) {
+				const blockDefines = [
+					...new Set(
+						tagResult.tags
+							.filter(
+								(t) =>
+									t.kind === "def" &&
+									t.line >= block.start_line &&
+									t.line <= block.end_line,
+							)
+							.map((t) => t.name),
+					),
+				]
+
+				const blockRefs = [
+					...new Set(
+						tagResult.tags
+							.filter(
+								(t) =>
+									t.kind === "ref" &&
+									t.line >= block.start_line &&
+									t.line <= block.end_line,
+							)
+							.map((t) => t.name),
+					),
+				]
+
+				const lineCount = block.end_line - block.start_line + 1
+				const refDensity = lineCount > 0 ? blockRefs.length / lineCount : 0
+
+				const enclosingClass = tagResult.classDeclarations.find(
+					(c) => c.startLine <= block.start_line && c.endLine >= block.end_line,
+				)
+
+				const classContext = enclosingClass
+					? {
+							className: enclosingClass.name,
+							extends: enclosingClass.extends,
+							implements: enclosingClass.implements,
+						}
+					: undefined
+
+				block.relations = {
+					defines: blockDefines,
+					refs: blockRefs,
+					refDensity,
+					fileImports,
+					classContext,
+				}
+			}
+		} catch (error) {
+			console.warn(
+				`Tag extraction failed for ${filePath}: ${error instanceof Error ? error.message : error}`,
+			)
+		}
 	}
 
 	/**

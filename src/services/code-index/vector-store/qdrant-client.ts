@@ -329,6 +329,43 @@ export class QdrantVectorStore implements IVectorStore {
 				}
 			}
 		}
+
+		// Code graph relation indexes
+		const keywordFields = ["defines", "refs", "className", "classExtends"]
+		for (const field of keywordFields) {
+			try {
+				await this.client.createPayloadIndex(this.collectionName, {
+					field_name: field,
+					field_schema: "keyword",
+				})
+			} catch (indexError: any) {
+				const errorMessage = (indexError?.message || "").toLowerCase()
+				if (!errorMessage.includes("already exists")) {
+					console.warn(
+						`[QdrantVectorStore] Could not create payload index for ${field} on ${this.collectionName}. Details:`,
+						indexError?.message || indexError,
+					)
+				}
+			}
+		}
+
+		const floatFields = ["refDensity", "pageRank"]
+		for (const field of floatFields) {
+			try {
+				await this.client.createPayloadIndex(this.collectionName, {
+					field_name: field,
+					field_schema: "float",
+				})
+			} catch (indexError: any) {
+				const errorMessage = (indexError?.message || "").toLowerCase()
+				if (!errorMessage.includes("already exists")) {
+					console.warn(
+						`[QdrantVectorStore] Could not create payload index for ${field} on ${this.collectionName}. Details:`,
+						indexError?.message || indexError,
+					)
+				}
+			}
+		}
 	}
 
 	/**
@@ -648,6 +685,192 @@ export class QdrantVectorStore implements IVectorStore {
 		} catch (error) {
 			console.error("[QdrantVectorStore] Failed to mark indexing as complete:", error)
 			throw error
+		}
+	}
+
+	/**
+	 * Scrolls through all points in the collection, returning id and payload.
+	 * Used by PageRankService to build the in-memory graph.
+	 */
+	async scrollAllPoints(): Promise<Array<{ id: string; payload: Record<string, any> }>> {
+		const allPoints: Array<{ id: string; payload: Record<string, any> }> = []
+		let offset: string | number | undefined = undefined
+
+		try {
+			while (true) {
+				const response = await this.client.scroll(this.collectionName, {
+					limit: 100,
+					offset,
+					with_payload: true,
+					with_vector: false,
+					filter: {
+						must_not: [
+							{
+								key: "type",
+								match: { value: "metadata" },
+							},
+						],
+					},
+				})
+
+				if (!response.points || response.points.length === 0) {
+					break
+				}
+
+				for (const point of response.points) {
+					allPoints.push({
+						id: String(point.id),
+						payload: (point.payload || {}) as Record<string, any>,
+					})
+				}
+
+				if (!response.next_page_offset) {
+					break
+				}
+				offset = response.next_page_offset as string | number | undefined
+			}
+		} catch (error) {
+			console.error("[QdrantVectorStore] Failed to scroll all points:", error)
+			throw error
+		}
+
+		return allPoints
+	}
+
+	/**
+	 * Batch update payloads for multiple points (e.g. writing PageRank scores).
+	 */
+	async batchUpdatePayloads(updates: Array<{ id: string; payload: Record<string, any> }>): Promise<void> {
+		const BATCH_SIZE = 100
+		try {
+			for (let i = 0; i < updates.length; i += BATCH_SIZE) {
+				const batch = updates.slice(i, i + BATCH_SIZE)
+				for (const update of batch) {
+					await this.client.setPayload(this.collectionName, {
+						points: [update.id],
+						payload: update.payload,
+					})
+				}
+			}
+		} catch (error) {
+			console.error("[QdrantVectorStore] Failed to batch update payloads:", error)
+			throw error
+		}
+	}
+
+	/**
+	 * Find code blocks whose `defines` array contains any of the given symbols.
+	 * Used by GraphExpander to find definition blocks for referenced symbols.
+	 */
+	async findBlocksByDefines(symbols: string[], limit: number = 20): Promise<VectorStoreSearchResult[]> {
+		if (symbols.length === 0) return []
+		try {
+			const response = await this.client.scroll(this.collectionName, {
+				limit,
+				with_payload: true,
+				with_vector: false,
+				filter: {
+					should: symbols.map((s) => ({
+						key: "defines",
+						match: { value: s },
+					})),
+				},
+			})
+			return (response.points || []).map((point) => ({
+				id: String(point.id),
+				score: 0,
+				payload: (point.payload || {}) as Payload,
+			}))
+		} catch (error) {
+			console.warn("[QdrantVectorStore] findBlocksByDefines failed:", error)
+			return []
+		}
+	}
+
+	/**
+	 * Find code blocks whose `refs` array contains any of the given symbols.
+	 * Used by GraphExpander to find callers of defined symbols.
+	 */
+	async findBlocksByRefs(symbols: string[], limit: number = 20): Promise<VectorStoreSearchResult[]> {
+		if (symbols.length === 0) return []
+		try {
+			const response = await this.client.scroll(this.collectionName, {
+				limit,
+				with_payload: true,
+				with_vector: false,
+				filter: {
+					should: symbols.map((s) => ({
+						key: "refs",
+						match: { value: s },
+					})),
+				},
+			})
+			return (response.points || []).map((point) => ({
+				id: String(point.id),
+				score: 0,
+				payload: (point.payload || {}) as Payload,
+			}))
+		} catch (error) {
+			console.warn("[QdrantVectorStore] findBlocksByRefs failed:", error)
+			return []
+		}
+	}
+
+	/**
+	 * Find code blocks with matching className.
+	 */
+	async findBlocksByClassName(className: string, limit: number = 20): Promise<VectorStoreSearchResult[]> {
+		try {
+			const response = await this.client.scroll(this.collectionName, {
+				limit,
+				with_payload: true,
+				with_vector: false,
+				filter: {
+					must: [
+						{
+							key: "className",
+							match: { value: className },
+						},
+					],
+				},
+			})
+			return (response.points || []).map((point) => ({
+				id: String(point.id),
+				score: 0,
+				payload: (point.payload || {}) as Payload,
+			}))
+		} catch (error) {
+			console.warn("[QdrantVectorStore] findBlocksByClassName failed:", error)
+			return []
+		}
+	}
+
+	/**
+	 * Find code blocks whose classExtends matches the given class name.
+	 */
+	async findBlocksByClassExtends(className: string, limit: number = 20): Promise<VectorStoreSearchResult[]> {
+		try {
+			const response = await this.client.scroll(this.collectionName, {
+				limit,
+				with_payload: true,
+				with_vector: false,
+				filter: {
+					must: [
+						{
+							key: "classExtends",
+							match: { value: className },
+						},
+					],
+				},
+			})
+			return (response.points || []).map((point) => ({
+				id: String(point.id),
+				score: 0,
+				payload: (point.payload || {}) as Payload,
+			}))
+		} catch (error) {
+			console.warn("[QdrantVectorStore] findBlocksByClassExtends failed:", error)
+			return []
 		}
 	}
 

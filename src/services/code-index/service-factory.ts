@@ -26,6 +26,8 @@ import { ICodeParser, IEmbedder, IFileWatcher, IVectorStore } from "./interfaces
 import { CodeIndexConfigManager } from "./config-manager"
 import { CacheManager } from "./cache-manager"
 import { BATCH_SEGMENT_THRESHOLD } from "./constants"
+import { PageRankService } from "./pagerank-service"
+import { GraphExpander, GraphExpansionConfig, DEFAULT_CONFIG as DEFAULT_GRAPH_CONFIG } from "./graph-expander"
 
 /**
  * Factory class responsible for creating and configuring code indexing service dependencies.
@@ -229,6 +231,31 @@ export class CodeIndexServiceFactory {
 	}
 
 	/**
+	 * Creates a PageRankService for code graph ranking.
+	 */
+	public createPageRankService(vectorStore: IVectorStore): PageRankService {
+		return new PageRankService(vectorStore as QdrantVectorStore)
+	}
+
+	/**
+	 * Creates a GraphExpander for code graph enriched search.
+	 */
+	public createGraphExpander(vectorStore: IVectorStore): GraphExpander {
+		let config: Partial<GraphExpansionConfig> = {}
+		try {
+			const vsConfig = vscode.workspace.getConfiguration(Package.name)
+			config = {
+				enabled: vsConfig.get<boolean>("codeIndex.graphExpansion.enabled", DEFAULT_GRAPH_CONFIG.enabled),
+				maxDepth: vsConfig.get<number>("codeIndex.graphExpansion.maxDepth", DEFAULT_GRAPH_CONFIG.maxDepth),
+				maxResults: vsConfig.get<number>("codeIndex.graphExpansion.maxResults", DEFAULT_GRAPH_CONFIG.maxResults),
+			}
+		} catch {
+			// In test environment, vscode.workspace might not be available
+		}
+		return new GraphExpander(vectorStore as QdrantVectorStore, config)
+	}
+
+	/**
 	 * Creates all required service dependencies if the service is properly configured.
 	 * @throws Error if the service is not properly configured
 	 */
@@ -243,6 +270,8 @@ export class CodeIndexServiceFactory {
 		parser: ICodeParser
 		scanner: DirectoryScanner
 		fileWatcher: IFileWatcher
+		pageRankService: PageRankService
+		graphExpander: GraphExpander
 	} {
 		if (!this.configManager.isFeatureConfigured) {
 			throw new Error(t("embeddings:serviceFactory.codeIndexingNotConfigured"))
@@ -260,6 +289,8 @@ export class CodeIndexServiceFactory {
 			ignoreInstance,
 			rooIgnoreController,
 		)
+		const pageRankService = this.createPageRankService(vectorStore)
+		const graphExpander = this.createGraphExpander(vectorStore)
 
 		return {
 			embedder,
@@ -267,6 +298,8 @@ export class CodeIndexServiceFactory {
 			parser,
 			scanner,
 			fileWatcher,
+			pageRankService,
+			graphExpander,
 		}
 	}
 }

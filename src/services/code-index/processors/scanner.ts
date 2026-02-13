@@ -424,6 +424,12 @@ export class DirectoryScanner implements IDirectoryScanner {
 							startLine: block.start_line,
 							endLine: block.end_line,
 							segmentHash: block.segmentHash,
+							// Code graph relation data
+							defines: block.relations?.defines || [],
+							refs: block.relations?.refs || [],
+							refDensity: block.relations?.refDensity || 0,
+							className: block.relations?.classContext?.className || null,
+							classExtends: block.relations?.classContext?.extends || null,
 						},
 					}
 				})

@@ -104,6 +104,14 @@ export interface FileProcessingResult {
  * Common types used across the code-index service
  */
 
+export interface BlockRelations {
+	defines: string[]
+	refs: string[]
+	refDensity: number
+	fileImports: { symbol: string; path: string }[]
+	classContext?: { className: string; extends?: string; implements?: string[] }
+}
+
 export interface CodeBlock {
 	file_path: string
 	identifier: string | null
@@ -113,4 +121,5 @@ export interface CodeBlock {
 	content: string
 	fileHash: string
 	segmentHash: string
+	relations?: BlockRelations
 }

@@ -8,6 +8,7 @@ import { CacheManager } from "./cache-manager"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 import { t } from "../../i18n"
+import { PageRankService } from "./pagerank-service"
 
 /**
  * Manages the code indexing workflow, coordinating between different services and managers.
@@ -15,6 +16,8 @@ import { t } from "../../i18n"
 export class CodeIndexOrchestrator {
 	private _fileWatcherSubscriptions: vscode.Disposable[] = []
 	private _isProcessing: boolean = false
+
+	private pageRankService?: PageRankService
 
 	constructor(
 		private readonly configManager: CodeIndexConfigManager,
@@ -25,6 +28,13 @@ export class CodeIndexOrchestrator {
 		private readonly scanner: DirectoryScanner,
 		private readonly fileWatcher: IFileWatcher,
 	) {}
+
+	/**
+	 * Set the PageRankService for code graph ranking.
+	 */
+	setPageRankService(service: PageRankService): void {
+		this.pageRankService = service
+	}
 
 	/**
 	 * Starts the file watcher if not already running.
@@ -195,6 +205,15 @@ export class CodeIndexOrchestrator {
 
 				await this._startWatcher()
 
+				// Compute PageRank scores before marking complete
+				if (this.pageRankService) {
+					try {
+						await this.pageRankService.computeRanks()
+					} catch (error) {
+						console.warn("[Orchestrator] PageRank computation failed (non-fatal):", error)
+					}
+				}
+
 				// Mark indexing as complete after successful incremental scan
 				await this.vectorStore.markIndexingComplete()
 
@@ -275,6 +294,15 @@ export class CodeIndexOrchestrator {
 				}
 
 				await this._startWatcher()
+
+				// Compute PageRank scores before marking complete
+				if (this.pageRankService) {
+					try {
+						await this.pageRankService.computeRanks()
+					} catch (error) {
+						console.warn("[Orchestrator] PageRank computation failed (non-fatal):", error)
+					}
+				}
 
 				// Mark indexing as complete after successful full scan
 				await this.vectorStore.markIndexingComplete()
