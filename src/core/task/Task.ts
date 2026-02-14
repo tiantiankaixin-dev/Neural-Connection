@@ -108,6 +108,7 @@ import { type AssistantMessageContent, presentAssistantMessage } from "../assist
 import { NativeToolCallParser } from "../assistant-message/NativeToolCallParser"
 import { manageContext, willManageContext } from "../context-management"
 import { ClineProvider } from "../webview/ClineProvider"
+import { ContextInspectorPanel } from "../webview/ContextInspectorPanel"
 import { MultiSearchReplaceDiffStrategy } from "../diff/strategies/multi-search-replace"
 import {
 	type ApiMessage,
@@ -4389,6 +4390,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const abortSignal = this.currentRequestAbortController.signal
 		// Reset the flag after using it
 		this.skipPrevResponseIdOnce = false
+
+		// Auto-capture full context and auto-show the inspector panel on every API request
+		{
+			const inspector = ContextInspectorPanel.getInstance()
+			inspector.show()
+			inspector.logCapturedContext({
+				systemPrompt,
+				messages: cleanConversationHistory as any[],
+				metadata,
+				modelId: this.api.getModel().id,
+				provider: this.apiConfiguration?.apiProvider,
+			})
+		}
 
 		// The provider accepts reasoning items alongside standard messages; cast to the expected parameter type.
 		const stream = this.api.createMessage(

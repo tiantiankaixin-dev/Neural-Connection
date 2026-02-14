@@ -22,4 +22,7 @@ export const DIRS_TO_IGNORE = [
 	"Pods",
 	".git",
 	".*",
+	// Unity engine packages (third-party libraries, not user code)
+	"TextMesh Pro",
+	"Standard Assets",
 ]

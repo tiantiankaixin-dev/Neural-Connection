@@ -352,6 +352,25 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	registerCommands({ context, outputChannel, provider })
 
+	// Register Context Inspector command directly (bypasses types package rebuild).
+	// Also start the network interceptor so all HTTP/HTTPS traffic is captured.
+	{
+		const { ContextInspectorPanel } = require("./core/webview/ContextInspectorPanel")
+		const { NetworkInterceptor } = require("./core/webview/NetworkInterceptor")
+
+		context.subscriptions.push(
+			vscode.commands.registerCommand("roo-cline.openContextInspector", () => {
+				const inspector = ContextInspectorPanel.getInstance()
+				inspector.show()
+				// Start network interceptor on first open
+				const net = NetworkInterceptor.getInstance()
+				if (!net.isRunning()) {
+					net.start()
+				}
+			}),
+		)
+	}
+
 	/**
 	 * We use the text document content provider API to show the left side for diff
 	 * view by creating a virtual document for the original content. This makes it

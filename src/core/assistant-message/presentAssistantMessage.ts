@@ -370,7 +370,7 @@ export async function presentAssistantMessage(cline: Task) {
 					case "switch_mode":
 						return `[${block.name} to '${block.params.mode_slug}'${block.params.reason ? ` because: ${block.params.reason}` : ""}]`
 					case "codebase_search":
-						return `[${block.name} for '${block.params.query}']`
+						return `[${block.name} for '${Array.isArray(block.params.query) ? block.params.query.join("', '") : block.params.query}']`
 					case "read_command_output":
 						return `[${block.name} for '${block.params.artifact_id}']`
 					case "update_todo_list":

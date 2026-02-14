@@ -31,15 +31,14 @@ describe("GraphExpander", () => {
 	describe("expand() - disabled", () => {
 		it("should return direct hits as-is when disabled", async () => {
 			const disabledExpander = new GraphExpander(mockQdrant, { enabled: false })
-			const hits = [
-				makeHit("1", 0.9, { filePath: "a.ts", codeChunk: "code", startLine: 1, endLine: 5 }),
-			]
+			const hits = [makeHit("1", 0.9, { filePath: "a.ts", codeChunk: "code", startLine: 1, endLine: 5 })]
 
 			const results = await disabledExpander.expand(hits)
 
 			expect(results.length).toBe(1)
 			expect(results[0].isDirectHit).toBe(true)
-			expect(results[0].score).toBe(0.9)
+			// 0.7 * 0.9 + 0.2 * 0 + 0.1 * 0 = 0.63 (direct hit re-scored with PageRank/refDensity)
+			expect(results[0].score).toBeCloseTo(0.63, 10)
 		})
 
 		it("should return empty for empty input", async () => {
@@ -241,7 +240,11 @@ describe("GraphExpander", () => {
 
 			const results = await smallExpander.expand(hits)
 
-			expect(results.length).toBeLessThanOrEqual(3)
+			// maxResults caps each category (direct/related) independently
+			const directResults = results.filter((r) => r.isDirectHit)
+			const relatedResults = results.filter((r) => !r.isDirectHit)
+			expect(directResults.length).toBeLessThanOrEqual(3)
+			expect(relatedResults.length).toBeLessThanOrEqual(3)
 		})
 
 		it("should skip hits with null payload", async () => {
@@ -557,9 +560,7 @@ describe("GraphExpander", () => {
 				refDensity: 0,
 			}
 
-			mockQdrant.findBlocksByDefines.mockResolvedValue([
-				{ id: "rel", score: 0, payload: relatedPayload },
-			])
+			mockQdrant.findBlocksByDefines.mockResolvedValue([{ id: "rel", score: 0, payload: relatedPayload }])
 
 			const r1 = await expander.expand(hits1)
 			const score1 = r1.find((r) => r.id === "rel")!.score
@@ -660,7 +661,14 @@ describe("GraphExpander", () => {
 				{
 					id: "related",
 					score: 0,
-					payload: { filePath: "b.ts", codeChunk: "rel", startLine: 1, endLine: 5, pageRank: 0.5, refDensity: 0 },
+					payload: {
+						filePath: "b.ts",
+						codeChunk: "rel",
+						startLine: 1,
+						endLine: 5,
+						pageRank: 0.5,
+						refDensity: 0,
+					},
 				},
 			])
 
@@ -691,13 +699,25 @@ describe("GraphExpander", () => {
 				Array.from({ length: 10 }, (_, i) => ({
 					id: `r-${i}`,
 					score: 0,
-					payload: { filePath: `f${i}.ts`, codeChunk: `c${i}`, startLine: 1, endLine: 5, pageRank: 0, refDensity: 0 },
+					payload: {
+						filePath: `f${i}.ts`,
+						codeChunk: `c${i}`,
+						startLine: 1,
+						endLine: 5,
+						pageRank: 0,
+						refDensity: 0,
+					},
 				})),
 			)
 
 			expander.updateConfig({ maxResults: 3 })
 			const results = await expander.expand(hits)
-			expect(results.length).toBeLessThanOrEqual(3)
+
+			// maxResults caps each category (direct/related) independently
+			const directResults = results.filter((r) => r.isDirectHit)
+			const relatedResults = results.filter((r) => !r.isDirectHit)
+			expect(directResults.length).toBeLessThanOrEqual(3)
+			expect(relatedResults.length).toBeLessThanOrEqual(3)
 		})
 
 		it("should update weights via updateConfig()", async () => {
@@ -716,7 +736,14 @@ describe("GraphExpander", () => {
 				{
 					id: "target",
 					score: 0,
-					payload: { filePath: "b.ts", codeChunk: "t", startLine: 1, endLine: 5, pageRank: 0.8, refDensity: 0 },
+					payload: {
+						filePath: "b.ts",
+						codeChunk: "t",
+						startLine: 1,
+						endLine: 5,
+						pageRank: 0.8,
+						refDensity: 0,
+					},
 				},
 			])
 

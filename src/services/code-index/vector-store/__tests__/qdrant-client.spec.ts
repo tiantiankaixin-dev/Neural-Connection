@@ -553,7 +553,7 @@ describe("QdrantVectorStore", () => {
 					field_schema: "keyword",
 				})
 			}
-			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
+			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(12)
 		})
 		it("should not create a new collection if one exists with matching vectorSize and return false", async () => {
 			// Mock getCollection to return existing collection info with matching vector size
@@ -587,7 +587,7 @@ describe("QdrantVectorStore", () => {
 					field_schema: "keyword",
 				})
 			}
-			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
+			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(12)
 		})
 		it("should recreate collection if it exists but vectorSize mismatches and return true", async () => {
 			const differentVectorSize = 768
@@ -644,7 +644,7 @@ describe("QdrantVectorStore", () => {
 					field_schema: "keyword",
 				})
 			}
-			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
+			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(12)
 			;(console.warn as any).mockRestore() // Restore console.warn
 		})
 		it("should log warning for non-404 errors but still create collection", async () => {
@@ -658,7 +658,7 @@ describe("QdrantVectorStore", () => {
 			expect(mockQdrantClientInstance.getCollection).toHaveBeenCalledTimes(1)
 			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledTimes(1)
 			expect(mockQdrantClientInstance.deleteCollection).not.toHaveBeenCalled()
-			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
+			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(12)
 			expect(console.warn).toHaveBeenCalledWith(
 				expect.stringContaining(`Warning during getCollectionInfo for "${expectedCollectionName}"`),
 				genericError.message,
@@ -705,11 +705,11 @@ describe("QdrantVectorStore", () => {
 			expect(result).toBe(true)
 			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledTimes(1)
 
-			// Verify all payload index creations were attempted (6: type + 5 pathSegments)
-			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
+			// Verify all payload index creations were attempted (12: type + 5 pathSegments + 4 keyword + 2 float)
+			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(12)
 
-			// Verify warnings were logged for each failed index (now 6)
-			expect(console.warn).toHaveBeenCalledTimes(6)
+			// Verify warnings were logged for each failed index (now 12)
+			expect(console.warn).toHaveBeenCalledTimes(12)
 			// Verify warning for 'type' index
 			expect(console.warn).toHaveBeenCalledWith(
 				expect.stringContaining(`Could not create payload index for type`),
@@ -843,7 +843,7 @@ describe("QdrantVectorStore", () => {
 			expect(mockQdrantClientInstance.getCollection).toHaveBeenCalledTimes(2)
 			expect(mockQdrantClientInstance.deleteCollection).toHaveBeenCalledTimes(1)
 			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledTimes(1)
-			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
+			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(12)
 			;(console.warn as any).mockRestore()
 		})
 
@@ -940,7 +940,7 @@ describe("QdrantVectorStore", () => {
 					on_disk: true,
 				},
 			})
-			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(6)
+			expect(mockQdrantClientInstance.createPayloadIndex).toHaveBeenCalledTimes(12)
 			;(console.warn as any).mockRestore()
 		})
 
@@ -1287,7 +1287,19 @@ describe("QdrantVectorStore", () => {
 					exact: false,
 				},
 				with_payload: {
-					include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+					include: [
+						"filePath",
+						"codeChunk",
+						"startLine",
+						"endLine",
+						"pathSegments",
+						"defines",
+						"refs",
+						"refDensity",
+						"className",
+						"classExtends",
+						"pageRank",
+					],
 				},
 			})
 			expect(callArgs.filter).toEqual({
@@ -1326,7 +1338,21 @@ describe("QdrantVectorStore", () => {
 				score_threshold: DEFAULT_SEARCH_MIN_SCORE,
 				limit: DEFAULT_MAX_SEARCH_RESULTS,
 				params: { hnsw_ef: 128, exact: false },
-				with_payload: { include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"] },
+				with_payload: {
+					include: [
+						"filePath",
+						"codeChunk",
+						"startLine",
+						"endLine",
+						"pathSegments",
+						"defines",
+						"refs",
+						"refDensity",
+						"className",
+						"classExtends",
+						"pageRank",
+					],
+				},
 			})
 			expect(callArgs2.filter).toEqual({
 				must: [
@@ -1358,7 +1384,19 @@ describe("QdrantVectorStore", () => {
 					exact: false,
 				},
 				with_payload: {
-					include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+					include: [
+						"filePath",
+						"codeChunk",
+						"startLine",
+						"endLine",
+						"pathSegments",
+						"defines",
+						"refs",
+						"refDensity",
+						"className",
+						"classExtends",
+						"pageRank",
+					],
 				},
 			})
 			expect(callArgs3.filter).toEqual({
@@ -1385,7 +1423,19 @@ describe("QdrantVectorStore", () => {
 					exact: false,
 				},
 				with_payload: {
-					include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+					include: [
+						"filePath",
+						"codeChunk",
+						"startLine",
+						"endLine",
+						"pathSegments",
+						"defines",
+						"refs",
+						"refDensity",
+						"className",
+						"classExtends",
+						"pageRank",
+					],
 				},
 			})
 			expect(callArgs4.filter).toEqual({
@@ -1516,7 +1566,19 @@ describe("QdrantVectorStore", () => {
 					exact: false,
 				},
 				with_payload: {
-					include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+					include: [
+						"filePath",
+						"codeChunk",
+						"startLine",
+						"endLine",
+						"pathSegments",
+						"defines",
+						"refs",
+						"refDensity",
+						"className",
+						"classExtends",
+						"pageRank",
+					],
 				},
 			})
 			expect(callArgs5.filter).toEqual({
@@ -1590,7 +1652,19 @@ describe("QdrantVectorStore", () => {
 						exact: false,
 					},
 					with_payload: {
-						include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+						include: [
+							"filePath",
+							"codeChunk",
+							"startLine",
+							"endLine",
+							"pathSegments",
+							"defines",
+							"refs",
+							"refDensity",
+							"className",
+							"classExtends",
+							"pageRank",
+						],
 					},
 				})
 				expect(callArgs7.filter).toEqual({
@@ -1619,7 +1693,19 @@ describe("QdrantVectorStore", () => {
 						exact: false,
 					},
 					with_payload: {
-						include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+						include: [
+							"filePath",
+							"codeChunk",
+							"startLine",
+							"endLine",
+							"pathSegments",
+							"defines",
+							"refs",
+							"refDensity",
+							"className",
+							"classExtends",
+							"pageRank",
+						],
 					},
 				})
 				expect(callArgs6.filter).toEqual({
@@ -1646,7 +1732,19 @@ describe("QdrantVectorStore", () => {
 						exact: false,
 					},
 					with_payload: {
-						include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+						include: [
+							"filePath",
+							"codeChunk",
+							"startLine",
+							"endLine",
+							"pathSegments",
+							"defines",
+							"refs",
+							"refDensity",
+							"className",
+							"classExtends",
+							"pageRank",
+						],
 					},
 				})
 				expect(callArgs8.filter).toEqual({
@@ -1673,7 +1771,19 @@ describe("QdrantVectorStore", () => {
 						exact: false,
 					},
 					with_payload: {
-						include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+						include: [
+							"filePath",
+							"codeChunk",
+							"startLine",
+							"endLine",
+							"pathSegments",
+							"defines",
+							"refs",
+							"refDensity",
+							"className",
+							"classExtends",
+							"pageRank",
+						],
 					},
 				})
 				expect(callArgs9.filter).toEqual({
@@ -1700,7 +1810,19 @@ describe("QdrantVectorStore", () => {
 						exact: false,
 					},
 					with_payload: {
-						include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+						include: [
+							"filePath",
+							"codeChunk",
+							"startLine",
+							"endLine",
+							"pathSegments",
+							"defines",
+							"refs",
+							"refDensity",
+							"className",
+							"classExtends",
+							"pageRank",
+						],
 					},
 				})
 				expect(callArgs10.filter).toEqual({
@@ -1727,7 +1849,19 @@ describe("QdrantVectorStore", () => {
 						exact: false,
 					},
 					with_payload: {
-						include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+						include: [
+							"filePath",
+							"codeChunk",
+							"startLine",
+							"endLine",
+							"pathSegments",
+							"defines",
+							"refs",
+							"refDensity",
+							"className",
+							"classExtends",
+							"pageRank",
+						],
 					},
 				})
 				expect(callArgs11.filter).toEqual({
@@ -1760,7 +1894,19 @@ describe("QdrantVectorStore", () => {
 						exact: false,
 					},
 					with_payload: {
-						include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+						include: [
+							"filePath",
+							"codeChunk",
+							"startLine",
+							"endLine",
+							"pathSegments",
+							"defines",
+							"refs",
+							"refDensity",
+							"className",
+							"classExtends",
+							"pageRank",
+						],
 					},
 				})
 				expect(callArgs12.filter).toEqual({

@@ -114,7 +114,7 @@ export type NativeToolArgs = {
 		follow_up: Array<{ text: string; mode?: string }>
 	}
 	browser_action: BrowserActionParams
-	codebase_search: { query: string; path?: string }
+	codebase_search: { query: string | string[]; path?: string }
 	generate_image: GenerateImageParams
 	run_slash_command: { command: string; args?: string }
 	skill: { skill: string; args?: string | null }

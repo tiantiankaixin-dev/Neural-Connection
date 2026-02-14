@@ -244,10 +244,17 @@ export class CodeIndexServiceFactory {
 		let config: Partial<GraphExpansionConfig> = {}
 		try {
 			const vsConfig = vscode.workspace.getConfiguration(Package.name)
+			const weightsFromConfig = vsConfig.get<Record<string, number>>("codeIndex.graphExpansion.weights")
 			config = {
 				enabled: vsConfig.get<boolean>("codeIndex.graphExpansion.enabled", DEFAULT_GRAPH_CONFIG.enabled),
 				maxDepth: vsConfig.get<number>("codeIndex.graphExpansion.maxDepth", DEFAULT_GRAPH_CONFIG.maxDepth),
-				maxResults: vsConfig.get<number>("codeIndex.graphExpansion.maxResults", DEFAULT_GRAPH_CONFIG.maxResults),
+				maxResults: vsConfig.get<number>(
+					"codeIndex.graphExpansion.maxResults",
+					DEFAULT_GRAPH_CONFIG.maxResults,
+				),
+				weights: weightsFromConfig
+					? { ...DEFAULT_GRAPH_CONFIG.weights, ...weightsFromConfig }
+					: DEFAULT_GRAPH_CONFIG.weights,
 			}
 		} catch {
 			// In test environment, vscode.workspace might not be available

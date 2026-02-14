@@ -490,7 +490,19 @@ export class QdrantVectorStore implements IVectorStore {
 					exact: false,
 				},
 				with_payload: {
-					include: ["filePath", "codeChunk", "startLine", "endLine", "pathSegments"],
+					include: [
+						"filePath",
+						"codeChunk",
+						"startLine",
+						"endLine",
+						"pathSegments",
+						"defines",
+						"refs",
+						"refDensity",
+						"className",
+						"classExtends",
+						"pageRank",
+					],
 				},
 			}
 

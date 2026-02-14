@@ -37,18 +37,33 @@ export const DEFAULT_WEIGHTS: GraphExpansionWeights = {
 	refDensity: 0.1,
 }
 
+// Direct hit scoring weights (vector similarity dominant, PageRank/refDensity as boosters)
+export interface DirectHitWeights {
+	vectorSim: number
+	pageRank: number
+	refDensity: number
+}
+
+export const DEFAULT_DIRECT_WEIGHTS: DirectHitWeights = {
+	vectorSim: 0.7,
+	pageRank: 0.2,
+	refDensity: 0.1,
+}
+
 export interface GraphExpansionConfig {
 	enabled: boolean
 	maxDepth: number
 	maxResults: number
 	weights: GraphExpansionWeights
+	directWeights: DirectHitWeights
 }
 
 export const DEFAULT_CONFIG: GraphExpansionConfig = {
 	enabled: true,
 	maxDepth: 1,
-	maxResults: 20,
+	maxResults: 10,
 	weights: DEFAULT_WEIGHTS,
+	directWeights: DEFAULT_DIRECT_WEIGHTS,
 }
 
 // ─── Expanded result type ───
@@ -82,26 +97,31 @@ export class GraphExpander {
 
 	/**
 	 * Expand vector search results by traversing the code graph.
+	 * Optionally supplements with keyword-based payload filter search.
 	 *
 	 * @param directHits Initial vector search results
+	 * @param query Original search query (for keyword supplementation)
 	 * @returns Combined and ranked results (direct hits + related code)
 	 */
-	async expand(directHits: VectorStoreSearchResult[]): Promise<ExpandedSearchResult[]> {
+	async expand(directHits: VectorStoreSearchResult[], query?: string): Promise<ExpandedSearchResult[]> {
 		if (!this.config.enabled || directHits.length === 0) {
+			console.log(`[GraphExpander] Skipped: enabled=${this.config.enabled}, hits=${directHits.length}`)
 			return directHits
 				.filter((hit) => hit.payload != null)
 				.map((hit) => ({
 					id: String(hit.id),
 					payload: hit.payload!,
-					score: hit.score,
+					score: this.computeDirectHitScore(hit.score, hit.payload!),
 					isDirectHit: true,
 				}))
 		}
 
+		console.log(`[GraphExpander] Expanding ${directHits.length} direct hits...`)
+
 		const seen = new Set<string>()
 		const allResults: ExpandedSearchResult[] = []
 
-		// Add direct hits first
+		// Add direct hits first (re-scored with PageRank + refDensity)
 		for (const hit of directHits) {
 			if (!hit.payload) continue
 			const id = String(hit.id)
@@ -109,19 +129,31 @@ export class GraphExpander {
 			allResults.push({
 				id,
 				payload: hit.payload,
-				score: hit.score,
+				score: this.computeDirectHitScore(hit.score, hit.payload),
 				isDirectHit: true,
 			})
 		}
 
 		// Expand each direct hit
+		let totalRelated = 0
 		for (const hit of directHits) {
 			if (!hit.payload) continue
+			const p = hit.payload
+			const defs = (p.defines as string[]) || []
+			const refs = (p.refs as string[]) || []
+			const cn = p.className as string | null
+			const ce = p.classExtends as string | null
+			console.log(
+				`[GraphExpander]   Hit ${p.filePath}:${p.startLine}-${p.endLine} → defines=${defs.length}, refs=${refs.length}, className=${cn || "null"}, classExtends=${ce || "null"}, pageRank=${p.pageRank ?? "undefined"}`,
+			)
 			const related = await this.findRelatedBlocks(hit as VectorStoreSearchResult & { payload: Payload })
 
+			totalRelated += related.length
+			let added = 0
 			for (const rel of related) {
 				if (seen.has(rel.id)) continue
 				seen.add(rel.id)
+				added++
 
 				const score = this.computeScore(rel, hit.score)
 				allResults.push({
@@ -132,18 +164,71 @@ export class GraphExpander {
 					relationType: rel.relationType,
 				})
 			}
+			if (related.length > 0) {
+				console.log(
+					`[GraphExpander]     → found ${related.length} related, added ${added} new (${related.length - added} deduped)`,
+				)
+			}
 		}
 
-		// Sort by score descending, direct hits first for same score
-		allResults.sort((a, b) => {
-			if (a.isDirectHit !== b.isDirectHit) {
-				return a.isDirectHit ? -1 : 1
-			}
-			return b.score - a.score
-		})
+		// ── Keyword supplement: extract identifiers from query, search by payload filter ──
+		if (query) {
+			const identifiers = GraphExpander.extractIdentifiers(query)
+			if (identifiers.length > 0) {
+				console.log(`[GraphExpander] Keyword supplement: identifiers=[${identifiers.join(", ")}]`)
+				let keywordAdded = 0
 
-		// Truncate to maxResults
-		return allResults.slice(0, this.config.maxResults)
+				// Search defines for identifiers
+				const defHits = await this.qdrantClient.findBlocksByDefines(identifiers, 10)
+				for (const hit of defHits) {
+					const id = String(hit.id)
+					if (seen.has(id) || !hit.payload) continue
+					seen.add(id)
+					keywordAdded++
+					allResults.push({
+						id,
+						payload: hit.payload,
+						score: this.computeDirectHitScore(0.5, hit.payload), // base score for keyword match
+						isDirectHit: true,
+						relationType: "keywordMatch",
+					})
+				}
+
+				// Search className for identifiers
+				for (const ident of identifiers) {
+					const classHits = await this.qdrantClient.findBlocksByClassName(ident, 5)
+					for (const hit of classHits) {
+						const id = String(hit.id)
+						if (seen.has(id) || !hit.payload) continue
+						seen.add(id)
+						keywordAdded++
+						allResults.push({
+							id,
+							payload: hit.payload,
+							score: this.computeDirectHitScore(0.5, hit.payload),
+							isDirectHit: true,
+							relationType: "keywordMatch",
+						})
+					}
+				}
+
+				if (keywordAdded > 0) {
+					console.log(`[GraphExpander] Keyword supplement added ${keywordAdded} new blocks`)
+				}
+			}
+		}
+
+		console.log(
+			`[GraphExpander] Expansion complete: ${directHits.length} direct + ${allResults.length - directHits.length} related = ${allResults.length} total`,
+		)
+
+		// Separate direct hits and related, sort each by score, then combine
+		const directs = allResults.filter((r) => r.isDirectHit).sort((a, b) => b.score - a.score)
+		const related = allResults.filter((r) => !r.isDirectHit).sort((a, b) => b.score - a.score)
+
+		// Allocate slots: direct hits get maxResults, related get maxResults
+		const maxR = this.config.maxResults
+		return [...directs.slice(0, maxR), ...related.slice(0, maxR)]
 	}
 
 	/**
@@ -196,6 +281,44 @@ export class GraphExpander {
 		}
 
 		return results
+	}
+
+	/**
+	 * Extract potential identifier names (class names, function names, symbols)
+	 * from a natural language query. Used for keyword-based supplement search.
+	 */
+	static extractIdentifiers(query: string): string[] {
+		const identifiers: Set<string> = new Set()
+
+		// Match PascalCase identifiers (e.g., GameManager, PlayerController)
+		const pascalCase = query.match(/\b[A-Z][a-zA-Z0-9]{2,}\b/g)
+		if (pascalCase) pascalCase.forEach((m) => identifiers.add(m))
+
+		// Match camelCase identifiers (e.g., updateGameState, onPlayerDeath)
+		const camelCase = query.match(/\b[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\b/g)
+		if (camelCase) camelCase.forEach((m) => identifiers.add(m))
+
+		// Match snake_case identifiers (e.g., game_manager, update_state)
+		const snakeCase = query.match(/\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g)
+		if (snakeCase) snakeCase.forEach((m) => identifiers.add(m))
+
+		// Match UPPER_CASE constants (e.g., MAX_HEALTH, PLAYER_SPEED)
+		const upperCase = query.match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g)
+		if (upperCase) upperCase.forEach((m) => identifiers.add(m))
+
+		return Array.from(identifiers)
+	}
+
+	/**
+	 * Compute the score for a direct hit.
+	 * Vector similarity is dominant; PageRank and refDensity act as boosters
+	 * to promote structurally important code when semantic scores are close.
+	 */
+	private computeDirectHitScore(vectorScore: number, payload: Payload): number {
+		const dw = this.config.directWeights
+		const pr = (payload.pageRank as number) || 0
+		const rd = Math.min((payload.refDensity as number) || 0, 2) / 2
+		return dw.vectorSim * vectorScore + dw.pageRank * pr + dw.refDensity * rd
 	}
 
 	/**

@@ -93,5 +93,11 @@ export interface Payload {
 	codeChunk: string
 	startLine: number
 	endLine: number
+	defines?: string[]
+	refs?: string[]
+	refDensity?: number
+	className?: string | null
+	classExtends?: string | null
+	pageRank?: number
 	[key: string]: any
 }

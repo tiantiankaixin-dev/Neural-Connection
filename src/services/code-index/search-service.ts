@@ -67,9 +67,9 @@ export class CodeIndexSearchService {
 			// Perform vector search
 			const results = await this.vectorStore.search(vector, normalizedPrefix, minScore, maxResults)
 
-			// Expand with code graph if available
+			// Expand with code graph if available (pass query for keyword supplementation)
 			if (this.graphExpander) {
-				return await this.graphExpander.expand(results)
+				return await this.graphExpander.expand(results, query)
 			}
 
 			return results

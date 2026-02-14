@@ -176,17 +176,29 @@ export class CodeParser implements ICodeParser {
 
 		while (queue.length > 0) {
 			const currentNode = queue.shift()!
-			// const lineSpan = currentNode.endPosition.row - currentNode.startPosition.row + 1 // Removed as per lint error
 
 			// Check if the node meets the minimum character requirement
 			if (currentNode.text.length >= MIN_BLOCK_CHARS) {
 				// If it also exceeds the maximum character limit, try to break it down
 				if (currentNode.text.length > MAX_BLOCK_CHARS * MAX_CHARS_TOLERANCE_FACTOR) {
-					if (currentNode.children.filter((child) => child !== null).length > 0) {
-						// If it has children, process them instead
-						queue.push(...currentNode.children.filter((child) => child !== null))
+					const nonCommentChildren = currentNode.children.filter(
+						(child): child is Node => child !== null && !child.type.includes("comment"),
+					)
+					if (nonCommentChildren.length > 0) {
+						const merged = this._decomposeWithMerge(
+							nonCommentChildren,
+							filePath,
+							content,
+							fileHash,
+							seenSegmentHashes,
+						)
+						if (merged.blocks.length > 0) {
+							results.push(...merged.blocks)
+						}
+						if (merged.requeue.length > 0) {
+							queue.push(...merged.requeue)
+						}
 					} else {
-						// If it's a leaf node, chunk it
 						const chunkedBlocks = this._chunkLeafNodeByLines(
 							currentNode,
 							filePath,
@@ -234,17 +246,185 @@ export class CodeParser implements ICodeParser {
 		return results
 	}
 
+	// Node type suffixes that indicate structural/anchor nodes (cross-language)
+	private static readonly STRUCTURAL_NODE_SUFFIXES = [
+		"_declaration",
+		"_definition",
+		"_item", // Rust: function_item, struct_item, impl_item
+	]
+
+	/**
+	 * Checks if a node is a structural anchor (method, class, etc.) vs a satellite (field, statement).
+	 * An anchor must match a structural type pattern AND span multiple lines.
+	 */
+	private _isAnchorNode(node: Node): boolean {
+		const isStructuralType = CodeParser.STRUCTURAL_NODE_SUFFIXES.some((suffix) => node.type.endsWith(suffix))
+		const isMultiLine = node.endPosition.row - node.startPosition.row >= 1
+		return isStructuralType && isMultiLine
+	}
+
+	/**
+	 * Decompose a large node's children using Node Type classification + merge.
+	 *
+	 * 1. Classify children as anchors (structural, multi-line) or satellites (single-line)
+	 * 2. Assign each satellite to its nearest anchor by line distance
+	 * 3. Expand each anchor's line range to include assigned satellites
+	 * 4. Extract text from file content for the expanded range
+	 * 5. If merged block fits MAX_BLOCK_CHARS → create block; else → requeue anchor for further decomposition
+	 * 6. If no anchors → fallback to line-based chunking
+	 */
+	private _decomposeWithMerge(
+		children: Node[],
+		filePath: string,
+		fileContent: string,
+		fileHash: string,
+		seenSegmentHashes: Set<string>,
+	): { blocks: CodeBlock[]; requeue: Node[] } {
+		const blocks: CodeBlock[] = []
+		const requeue: Node[] = []
+
+		// Sort children by start position
+		const sorted = [...children].sort((a, b) => a.startPosition.row - b.startPosition.row)
+
+		// Classify
+		const anchors: Array<{ node: Node; startRow: number; endRow: number; satellites: Node[] }> = []
+		const satellites: Node[] = []
+
+		for (const child of sorted) {
+			if (this._isAnchorNode(child)) {
+				anchors.push({
+					node: child,
+					startRow: child.startPosition.row,
+					endRow: child.endPosition.row,
+					satellites: [],
+				})
+			} else {
+				satellites.push(child)
+			}
+		}
+
+		// Edge case: no anchors → fallback to line-based chunking
+		if (anchors.length === 0) {
+			// Merge all satellites' text; if big enough, chunk by lines
+			if (sorted.length > 0) {
+				const firstRow = sorted[0].startPosition.row
+				const lastRow = sorted[sorted.length - 1].endPosition.row
+				const lines = fileContent.split("\n").slice(firstRow, lastRow + 1)
+				const chunked = this._chunkTextByLines(
+					lines,
+					filePath,
+					fileHash,
+					sorted[0].type,
+					seenSegmentHashes,
+					firstRow + 1, // 1-based
+				)
+				blocks.push(...chunked)
+			}
+			return { blocks, requeue }
+		}
+
+		// Assign each satellite to the nearest anchor
+		for (const sat of satellites) {
+			const satRow = sat.startPosition.row
+			let bestAnchor = anchors[0]
+			let bestDist = Math.abs(satRow - anchors[0].startRow)
+
+			for (const anchor of anchors) {
+				const distToStart = Math.abs(satRow - anchor.startRow)
+				const distToEnd = Math.abs(satRow - anchor.endRow)
+				const dist = Math.min(distToStart, distToEnd)
+				if (dist < bestDist) {
+					bestDist = dist
+					bestAnchor = anchor
+				}
+			}
+			bestAnchor.satellites.push(sat)
+		}
+
+		// For each anchor, expand range and create block
+		const fileLines = fileContent.split("\n")
+
+		for (const anchor of anchors) {
+			// Compute expanded range
+			let minRow = anchor.startRow
+			let maxRow = anchor.endRow
+			for (const sat of anchor.satellites) {
+				minRow = Math.min(minRow, sat.startPosition.row)
+				maxRow = Math.max(maxRow, sat.endPosition.row)
+			}
+
+			const mergedText = fileLines.slice(minRow, maxRow + 1).join("\n")
+
+			if (mergedText.length < MIN_BLOCK_CHARS) {
+				continue // Too small even after merge
+			}
+
+			if (mergedText.length > MAX_BLOCK_CHARS * MAX_CHARS_TOLERANCE_FACTOR) {
+				// Still too big after merge → requeue the anchor node for further decomposition
+				// and create blocks from satellites that don't overlap with the anchor
+				requeue.push(anchor.node)
+
+				// Satellites that are outside the anchor's original range get their own merge attempt
+				for (const sat of anchor.satellites) {
+					if (sat.text.length >= MIN_BLOCK_CHARS) {
+						const startLine = sat.startPosition.row + 1
+						const endLine = sat.endPosition.row + 1
+						const contentPreview = sat.text.slice(0, 100)
+						const segmentHash = createHash("sha256")
+							.update(`${filePath}-${startLine}-${endLine}-${sat.text.length}-${contentPreview}`)
+							.digest("hex")
+						if (!seenSegmentHashes.has(segmentHash)) {
+							seenSegmentHashes.add(segmentHash)
+							blocks.push({
+								file_path: filePath,
+								identifier: null,
+								type: sat.type,
+								start_line: startLine,
+								end_line: endLine,
+								content: sat.text,
+								segmentHash,
+								fileHash,
+							})
+						}
+					}
+				}
+			} else {
+				// Fits within limit → create merged block
+				const startLine = minRow + 1
+				const endLine = maxRow + 1
+				const identifier =
+					anchor.node.childForFieldName("name")?.text ||
+					anchor.node.children.find((c) => c?.type === "identifier")?.text ||
+					null
+				const contentPreview = mergedText.slice(0, 100)
+				const segmentHash = createHash("sha256")
+					.update(`${filePath}-${startLine}-${endLine}-${mergedText.length}-${contentPreview}`)
+					.digest("hex")
+
+				if (!seenSegmentHashes.has(segmentHash)) {
+					seenSegmentHashes.add(segmentHash)
+					blocks.push({
+						file_path: filePath,
+						identifier,
+						type: anchor.node.type,
+						start_line: startLine,
+						end_line: endLine,
+						content: mergedText,
+						segmentHash,
+						fileHash,
+					})
+				}
+			}
+		}
+
+		return { blocks, requeue }
+	}
+
 	/**
 	 * Maps file-level tags (definitions + references) to individual CodeBlocks by line range.
 	 * This enriches each block with relation data for the code graph.
 	 */
-	private mapTagsToBlocks(
-		blocks: CodeBlock[],
-		filePath: string,
-		content: string,
-		parser: any,
-		language: any,
-	): void {
+	private mapTagsToBlocks(blocks: CodeBlock[], filePath: string, content: string, parser: any, language: any): void {
 		if (blocks.length === 0) {
 			return
 		}
@@ -258,12 +438,7 @@ export class CodeParser implements ICodeParser {
 				const blockDefines = [
 					...new Set(
 						tagResult.tags
-							.filter(
-								(t) =>
-									t.kind === "def" &&
-									t.line >= block.start_line &&
-									t.line <= block.end_line,
-							)
+							.filter((t) => t.kind === "def" && t.line >= block.start_line && t.line <= block.end_line)
 							.map((t) => t.name),
 					),
 				]
@@ -271,12 +446,7 @@ export class CodeParser implements ICodeParser {
 				const blockRefs = [
 					...new Set(
 						tagResult.tags
-							.filter(
-								(t) =>
-									t.kind === "ref" &&
-									t.line >= block.start_line &&
-									t.line <= block.end_line,
-							)
+							.filter((t) => t.kind === "ref" && t.line >= block.start_line && t.line <= block.end_line)
 							.map((t) => t.name),
 					),
 				]
@@ -305,9 +475,7 @@ export class CodeParser implements ICodeParser {
 				}
 			}
 		} catch (error) {
-			console.warn(
-				`Tag extraction failed for ${filePath}: ${error instanceof Error ? error.message : error}`,
-			)
+			console.warn(`Tag extraction failed for ${filePath}: ${error instanceof Error ? error.message : error}`)
 		}
 	}
 

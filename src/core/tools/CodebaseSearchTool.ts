@@ -12,7 +12,7 @@ import type { ToolUse } from "../../shared/tools"
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 
 interface CodebaseSearchParams {
-	query: string
+	query: string | string[]
 	path?: string
 }
 
@@ -21,7 +21,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 
 	async execute(params: CodebaseSearchParams, task: Task, callbacks: ToolCallbacks): Promise<void> {
 		const { askApproval, handleError, pushToolResult } = callbacks
-		const { query, path: directoryPrefix } = params
+		const { query: rawQuery, path: directoryPrefix } = params
 
 		const workspacePath = task.cwd && task.cwd.trim() !== "" ? task.cwd : getWorkspacePath()
 
@@ -30,7 +30,14 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 			return
 		}
 
-		if (!query) {
+		// Normalize query to array (handle both string and string[])
+		const queries: string[] = Array.isArray(rawQuery)
+			? rawQuery.filter((q) => q && q.trim().length > 0)
+			: rawQuery && rawQuery.trim().length > 0
+				? [rawQuery]
+				: []
+
+		if (queries.length === 0) {
 			task.consecutiveMistakeCount++
 			task.didToolFailInCurrentTurn = true
 			pushToolResult(await task.sayAndCreateMissingParamError("codebase_search", "query"))
@@ -39,7 +46,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 
 		const sharedMessageProps = {
 			tool: "codebaseSearch",
-			query: query,
+			query: queries.length === 1 ? queries[0] : queries,
 			path: directoryPrefix,
 			isOutsideWorkspace: false,
 		}
@@ -71,29 +78,43 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				throw new Error("Code Indexing is not configured (Missing OpenAI Key or Qdrant URL).")
 			}
 
-			const searchResults: VectorStoreSearchResult[] = await manager.searchIndex(query, directoryPrefix)
+			// Search with each query and merge results (dedup by ID, keep highest score)
+			const mergedMap = new Map<string | number, VectorStoreSearchResult>()
+			for (const q of queries) {
+				const results = await manager.searchIndex(q, directoryPrefix)
+				if (results) {
+					for (const r of results) {
+						const existing = mergedMap.get(r.id)
+						if (!existing || r.score > existing.score) {
+							mergedMap.set(r.id, r)
+						}
+					}
+				}
+			}
+			const searchResults = Array.from(mergedMap.values())
 
-			if (!searchResults || searchResults.length === 0) {
-				pushToolResult(`No relevant code snippets found for the query: "${query}"`)
+			if (searchResults.length === 0) {
+				pushToolResult(
+					`No relevant code snippets found for queries: ${queries.map((q) => `"${q}"`).join(", ")}`,
+				)
 				return
 			}
 
-			const jsonResult = {
-				query,
-				results: [],
-			} as {
-				query: string
-				results: Array<{
-					filePath: string
-					score: number
-					startLine: number
-					endLine: number
-					codeChunk: string
-					pageRank?: number
-					isDirectHit?: boolean
-					relationType?: string
-				}>
+			interface EnrichedResult {
+				filePath: string
+				score: number
+				startLine: number
+				endLine: number
+				codeChunk: string
+				pageRank?: number
+				isDirectHit?: boolean
+				relationType?: string
+				className?: string | null
+				classExtends?: string | null
+				defines?: string[]
 			}
+
+			const allResults: EnrichedResult[] = []
 
 			searchResults.forEach((result) => {
 				const p = (result as ExpandedSearchResult).payload || (result as VectorStoreSearchResult).payload
@@ -103,7 +124,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				const relativePath = vscode.workspace.asRelativePath(p.filePath, false)
 				const expanded = result as ExpandedSearchResult
 
-				jsonResult.results.push({
+				allResults.push({
 					filePath: relativePath,
 					score: result.score,
 					startLine: p.startLine,
@@ -112,35 +133,84 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 					pageRank: p.pageRank as number | undefined,
 					isDirectHit: expanded.isDirectHit,
 					relationType: expanded.relationType,
+					className: p.className as string | null | undefined,
+					classExtends: p.classExtends as string | null | undefined,
+					defines: p.defines as string[] | undefined,
 				})
 			})
 
+			// Send raw results to webview (unchanged)
+			const jsonResult = { query: queries, results: allResults }
 			const payload = { tool: "codebaseSearch", content: jsonResult }
 			await task.say("codebase_search_result", JSON.stringify(payload))
 
-			const directHits = jsonResult.results.filter((r) => r.isDirectHit !== false)
-			const relatedCode = jsonResult.results.filter((r) => r.isDirectHit === false)
+			// ── Result refinement: absorb fully-contained blocks ──
+			const absorbed = new Set<number>()
+			for (let i = 0; i < allResults.length; i++) {
+				if (absorbed.has(i)) continue
+				for (let j = i + 1; j < allResults.length; j++) {
+					if (absorbed.has(j)) continue
+					const a = allResults[i]
+					const b = allResults[j]
+					if (a.filePath !== b.filePath) continue
+					if (
+						a.startLine <= b.startLine &&
+						a.endLine >= b.endLine &&
+						a.endLine - a.startLine > b.endLine - b.startLine
+					) {
+						absorbed.add(j)
+					} else if (
+						b.startLine <= a.startLine &&
+						b.endLine >= a.endLine &&
+						b.endLine - b.startLine > a.endLine - a.startLine
+					) {
+						absorbed.add(i)
+					}
+				}
+			}
 
-			let output = `Query: ${query}\n`
+			// Split into direct/related, skip absorbed, sort by score descending
+			const directHits = allResults
+				.map((r, i) => ({ r, i }))
+				.filter(({ r, i }) => r.isDirectHit !== false && !absorbed.has(i))
+				.sort((a, b) => b.r.score - a.r.score)
+			const relatedCode = allResults
+				.map((r, i) => ({ r, i }))
+				.filter(({ r, i }) => r.isDirectHit === false && !absorbed.has(i))
+				.sort((a, b) => b.r.score - a.r.score)
+
+			// ── Format output with metadata enrichment ──
+			const formatBlock = (r: EnrichedResult, isRelated: boolean): string => {
+				let header = `File: ${r.filePath}  Score: ${r.score.toFixed(2)}  Lines: ${r.startLine}-${r.endLine}`
+				if (r.pageRank) header += `  PR: ${r.pageRank.toFixed(3)}`
+				if (isRelated && r.relationType) header += `  [${r.relationType}]`
+
+				const meta: string[] = []
+				if (r.className) {
+					let classInfo = `Class: ${r.className}`
+					if (r.classExtends) classInfo += ` (extends ${r.classExtends})`
+					meta.push(classInfo)
+				}
+				if (r.defines && r.defines.length > 0) {
+					meta.push(`Defines: ${r.defines.join(", ")}`)
+				}
+
+				let block = header + "\n"
+				if (meta.length > 0) block += meta.join("\n") + "\n"
+				block += `Code: ${r.codeChunk}\n`
+				return block
+			}
+
+			let output = `Query: ${queries.join(" | ")}\n`
 
 			if (directHits.length > 0) {
 				output += `\n=== Direct Hits ===\n\n`
-				output += directHits
-					.map(
-						(r) =>
-							`File: ${r.filePath}  Score: ${r.score.toFixed(2)}  Lines: ${r.startLine}-${r.endLine}${r.pageRank ? `  PR: ${r.pageRank.toFixed(3)}` : ""}\nCode: ${r.codeChunk}\n`,
-					)
-					.join("\n")
+				output += directHits.map(({ r }) => formatBlock(r, false)).join("\n")
 			}
 
 			if (relatedCode.length > 0) {
 				output += `\n=== Related Code ===\n\n`
-				output += relatedCode
-					.map(
-						(r) =>
-							`File: ${r.filePath}  Lines: ${r.startLine}-${r.endLine}  [${r.relationType || "related"}]${r.pageRank ? `  PR: ${r.pageRank.toFixed(3)}` : ""}\nCode: ${r.codeChunk}\n`,
-					)
-					.join("\n")
+				output += relatedCode.map(({ r }) => formatBlock(r, true)).join("\n")
 			}
 
 			pushToolResult(output)
@@ -150,12 +220,12 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 	}
 
 	override async handlePartial(task: Task, block: ToolUse<"codebase_search">): Promise<void> {
-		const query: string | undefined = block.params.query
+		const rawQuery = block.params.query as string | string[] | undefined
 		const directoryPrefix: string | undefined = block.params.path
 
 		const sharedMessageProps = {
 			tool: "codebaseSearch",
-			query: query,
+			query: rawQuery,
 			path: directoryPrefix,
 			isOutsideWorkspace: false,
 		}
