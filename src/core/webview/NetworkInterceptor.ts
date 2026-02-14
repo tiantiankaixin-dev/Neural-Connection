@@ -68,18 +68,16 @@ export class NetworkInterceptor {
 
 	private patchHttp(): void {
 		this.originalHttpRequest = httpMod.request
-		const self = this
-		httpMod.request = function (...args: any[]) {
-			return self.interceptRequest(self.originalHttpRequest!, "http", args)
-		} as any
+		httpMod.request = ((...args: any[]) => {
+			return this.interceptRequest(this.originalHttpRequest!, "http", args)
+		}) as any
 	}
 
 	private patchHttps(): void {
 		this.originalHttpsRequest = httpsMod.request
-		const self = this
-		httpsMod.request = function (...args: any[]) {
-			return self.interceptRequest(self.originalHttpsRequest!, "https", args)
-		} as any
+		httpsMod.request = ((...args: any[]) => {
+			return this.interceptRequest(this.originalHttpsRequest!, "https", args)
+		}) as any
 	}
 
 	private restoreHttp(): void {
@@ -195,7 +193,7 @@ export class NetworkInterceptor {
 		}
 
 		// Call original function
-		const req = originalFn.apply(null, newArgs as any) as ClientRequest
+		const req = originalFn(...(newArgs as [any])) as ClientRequest
 
 		// Intercept request body (write calls)
 		const originalWrite = req.write.bind(req)
