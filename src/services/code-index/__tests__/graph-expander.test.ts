@@ -37,8 +37,8 @@ describe("GraphExpander", () => {
 
 			expect(results.length).toBe(1)
 			expect(results[0].isDirectHit).toBe(true)
-			// 0.7 * 0.9 + 0.2 * 0 + 0.1 * 0 = 0.63 (direct hit re-scored with PageRank/refDensity)
-			expect(results[0].score).toBeCloseTo(0.63, 10)
+			// Phase 1 only (disabled skips Phase 2 reranking): vectorScore + 0 pathBoost = 0.9
+			expect(results[0].score).toBeCloseTo(0.9, 10)
 		})
 
 		it("should return empty for empty input", async () => {
@@ -268,20 +268,20 @@ describe("GraphExpander", () => {
 	})
 
 	/**
-	 * Scoring formula under test (from computeScore):
+	 * Two-phase scoring formula under test:
 	 *
+	 * Phase 1 (computeScore — pure semantic):
 	 *   vectorSim = parentVectorScore * 0.8
 	 *   relationWeight = RELATION_WEIGHTS[relationType]   // calls=1.0, calledBy=0.9, sameClass=0.7, extends=0.5
+	 *   phase1 = w.vectorSim(0.4) * vectorSim + w.relation(0.25) * relationWeight
+	 *
+	 * Phase 2 (reranking — reference density boost):
 	 *   pr = payload.pageRank || 0
 	 *   rd = min(payload.refDensity || 0, 2) / 2
-	 *
-	 *   score = w.vectorSim(0.4) * vectorSim
-	 *         + w.relation(0.25) * relationWeight
-	 *         + w.pageRank(0.25) * pr
-	 *         + w.refDensity(0.1) * rd
+	 *   finalScore = phase1 * (1 + dw.pageRank(0.2) * pr + dw.refDensity(0.1) * rd)
 	 */
 	describe("scoring — exact formula verification", () => {
-		// Helper: compute expected score manually using the same formula
+		// Helper: compute expected score manually using the two-phase formula
 		function expectedScore(
 			parentVectorScore: number,
 			relationType: "calls" | "calledBy" | "sameClass" | "extends",
@@ -294,12 +294,16 @@ describe("GraphExpander", () => {
 				sameClass: 0.7,
 				extends: 0.5,
 			}
-			const w = { vectorSim: 0.4, relation: 0.25, pageRank: 0.25, refDensity: 0.1 }
+			const w = { vectorSim: 0.4, relation: 0.25 }
+			const dw = { pageRank: 0.2, refDensity: 0.1 }
 			const vectorSim = parentVectorScore * 0.8
 			const relationWeight = RELATION_WEIGHTS_MAP[relationType]
 			const pr = pageRank
 			const rd = Math.min(refDensity, 2) / 2
-			return w.vectorSim * vectorSim + w.relation * relationWeight + w.pageRank * pr + w.refDensity * rd
+			// Phase 1: pure semantic
+			const phase1 = w.vectorSim * vectorSim + w.relation * relationWeight
+			// Phase 2: reranking
+			return phase1 * (1 + dw.pageRank * pr + dw.refDensity * rd)
 		}
 
 		it("should compute exact score for 'calls' relation type", async () => {
@@ -336,11 +340,9 @@ describe("GraphExpander", () => {
 			const target = results.find((r) => r.id === "target")!
 			const expected = expectedScore(parentScore, "calls", pr, rd)
 			expect(target.score).toBeCloseTo(expected, 10)
-			// Verify: 0.4*(0.9*0.8) + 0.25*1.0 + 0.25*0.6 + 0.1*(0.4/2)
-			//       = 0.4*0.72     + 0.25      + 0.15      + 0.1*0.2
-			//       = 0.288        + 0.25      + 0.15      + 0.02
-			//       = 0.708
-			expect(target.score).toBeCloseTo(0.708, 10)
+			// Phase 1: 0.4*(0.9*0.8) + 0.25*1.0 = 0.288 + 0.25 = 0.538
+			// Phase 2: 0.538 * (1 + 0.2*0.6 + 0.1*0.2) = 0.538 * 1.14 = 0.61332
+			expect(target.score).toBeCloseTo(0.61332, 10)
 		})
 
 		it("should compute exact score for 'calledBy' relation type", async () => {
@@ -377,10 +379,9 @@ describe("GraphExpander", () => {
 			const caller = results.find((r) => r.id === "caller")!
 			const expected = expectedScore(parentScore, "calledBy", pr, rd)
 			expect(caller.score).toBeCloseTo(expected, 10)
-			// 0.4*(0.85*0.8) + 0.25*0.9 + 0.25*0.3 + 0.1*(1.0/2)
-			// = 0.272         + 0.225    + 0.075    + 0.05
-			// = 0.622
-			expect(caller.score).toBeCloseTo(0.622, 10)
+			// Phase 1: 0.4*(0.85*0.8) + 0.25*0.9 = 0.272 + 0.225 = 0.497
+			// Phase 2: 0.497 * (1 + 0.2*0.3 + 0.1*0.5) = 0.497 * 1.11 = 0.55167
+			expect(caller.score).toBeCloseTo(0.55167, 10)
 		})
 
 		it("should compute exact score for 'sameClass' relation type", async () => {
@@ -418,9 +419,8 @@ describe("GraphExpander", () => {
 			const sibling = results.find((r) => r.id === "sibling")!
 			const expected = expectedScore(parentScore, "sameClass", pr, rd)
 			expect(sibling.score).toBeCloseTo(expected, 10)
-			// 0.4*(0.7*0.8) + 0.25*0.7 + 0.25*0 + 0.1*0
-			// = 0.224        + 0.175    + 0      + 0
-			// = 0.399
+			// Phase 1: 0.4*(0.7*0.8) + 0.25*0.7 = 0.224 + 0.175 = 0.399
+			// Phase 2: 0.399 * (1 + 0 + 0) = 0.399
 			expect(sibling.score).toBeCloseTo(0.399, 10)
 		})
 
@@ -465,10 +465,9 @@ describe("GraphExpander", () => {
 			// Since refs is empty, this comes from the classExtends path → relationType = "extends"
 			const expected = expectedScore(parentScore, "extends", pr, rd)
 			expect(parentBlock.score).toBeCloseTo(expected, 10)
-			// 0.4*(0.8*0.8) + 0.25*0.5 + 0.25*1.0 + 0.1*(0.8/2)
-			// = 0.256        + 0.125    + 0.25     + 0.04
-			// = 0.671
-			expect(parentBlock.score).toBeCloseTo(0.671, 10)
+			// Phase 1: 0.4*(0.8*0.8) + 0.25*0.5 = 0.256 + 0.125 = 0.381
+			// Phase 2: 0.381 * (1 + 0.2*1.0 + 0.1*0.4) = 0.381 * 1.24 = 0.47244
+			expect(parentBlock.score).toBeCloseTo(0.47244, 10)
 		})
 
 		it("should cap refDensity at 2.0 before normalizing", async () => {
@@ -569,13 +568,13 @@ describe("GraphExpander", () => {
 			const r2 = await expander2.expand(hits2)
 			const score2 = r2.find((r) => r.id === "rel")!.score
 
-			// Difference should be exactly: 0.4 * 0.8 * (1.0 - 0.5) = 0.16
+			// Difference should be exactly: 0.4 * 0.8 * (1.0 - 0.5) = 0.16 (no PR/RD so Phase 2 is 1.0)
 			expect(score1 - score2).toBeCloseTo(0.4 * 0.8 * 0.5, 10)
 		})
 
-		it("should use custom weights when configured", async () => {
+		it("should use custom directWeights for Phase 2 reranking", async () => {
 			const customExpander = new GraphExpander(mockQdrant, {
-				weights: { vectorSim: 0.0, relation: 0.0, pageRank: 1.0, refDensity: 0.0 },
+				directWeights: { vectorSim: 0.7, pageRank: 1.0, refDensity: 0.0 },
 			})
 			const hits = [
 				makeHit("1", 0.9, {
@@ -605,8 +604,9 @@ describe("GraphExpander", () => {
 
 			const results = await customExpander.expand(hits)
 			const block = results.find((r) => r.id === "pr-only")!
-			// With all weights zero except pageRank=1.0: score = 1.0 * 0.75 = 0.75
-			expect(block.score).toBeCloseTo(0.75, 10)
+			// Phase 1: 0.4*(0.9*0.8) + 0.25*1.0 = 0.538
+			// Phase 2 (dw.pageRank=1.0): 0.538 * (1 + 1.0*0.75 + 0) = 0.538 * 1.75 = 0.9415
+			expect(block.score).toBeCloseTo(0.9415, 10)
 		})
 
 		it("should treat missing pageRank/refDensity as 0", async () => {
@@ -639,7 +639,8 @@ describe("GraphExpander", () => {
 			const block = results.find((r) => r.id === "no-pr-rd")!
 			const expected = expectedScore(0.9, "calls", 0, 0)
 			expect(block.score).toBeCloseTo(expected, 10)
-			// 0.4*(0.9*0.8) + 0.25*1.0 + 0 + 0 = 0.288 + 0.25 = 0.538
+			// Phase 1: 0.4*(0.9*0.8) + 0.25*1.0 = 0.538
+			// Phase 2: 0.538 * (1 + 0 + 0) = 0.538
 			expect(block.score).toBeCloseTo(0.538, 10)
 		})
 	})
@@ -720,7 +721,7 @@ describe("GraphExpander", () => {
 			expect(relatedResults.length).toBeLessThanOrEqual(3)
 		})
 
-		it("should update weights via updateConfig()", async () => {
+		it("should update directWeights via updateConfig()", async () => {
 			const hits = [
 				makeHit("1", 0.9, {
 					filePath: "a.ts",
@@ -747,17 +748,181 @@ describe("GraphExpander", () => {
 				},
 			])
 
-			// Score with default weights
+			// Score with default directWeights (pageRank=0.2)
 			const r1 = await expander.expand(hits)
 			const score1 = r1.find((r) => r.id === "target")!.score
 
-			// Change to pageRank-only weighting
-			expander.updateConfig({ weights: { vectorSim: 0, relation: 0, pageRank: 1.0, refDensity: 0 } })
+			// Change to high pageRank weight in directWeights
+			expander.updateConfig({ directWeights: { vectorSim: 0.7, pageRank: 1.0, refDensity: 0 } })
 			const r2 = await expander.expand(hits)
 			const score2 = r2.find((r) => r.id === "target")!.score
 
-			expect(score2).toBeCloseTo(0.8, 10) // 1.0 * 0.8
+			// Phase 1: 0.4*(0.9*0.8) + 0.25*1.0 = 0.538
+			// Phase 2 (dw.pageRank=1.0): 0.538 * (1 + 1.0*0.8 + 0) = 0.538 * 1.8 = 0.9684
+			expect(score2).toBeCloseTo(0.9684, 10)
 			expect(score2).not.toBeCloseTo(score1, 2) // Different from default
+		})
+	})
+
+	describe("maxRelatedPerFile deduplication", () => {
+		it("should limit related blocks per file to maxRelatedPerFile (default 2)", async () => {
+			const hits = [
+				makeHit("1", 0.9, {
+					filePath: "a.ts",
+					codeChunk: "code",
+					startLine: 1,
+					endLine: 5,
+					defines: ["Foo"],
+					refs: [],
+				}),
+			]
+
+			// 5 related blocks from same file "big.ts" + 1 from "other.ts"
+			mockQdrant.findBlocksByRefs.mockResolvedValue([
+				{
+					id: "r1",
+					score: 0,
+					payload: {
+						filePath: "big.ts",
+						codeChunk: "c1",
+						startLine: 1,
+						endLine: 5,
+						pageRank: 0.5,
+						refDensity: 0,
+					},
+				},
+				{
+					id: "r2",
+					score: 0,
+					payload: {
+						filePath: "big.ts",
+						codeChunk: "c2",
+						startLine: 6,
+						endLine: 10,
+						pageRank: 0.4,
+						refDensity: 0,
+					},
+				},
+				{
+					id: "r3",
+					score: 0,
+					payload: {
+						filePath: "big.ts",
+						codeChunk: "c3",
+						startLine: 11,
+						endLine: 15,
+						pageRank: 0.3,
+						refDensity: 0,
+					},
+				},
+				{
+					id: "r4",
+					score: 0,
+					payload: {
+						filePath: "big.ts",
+						codeChunk: "c4",
+						startLine: 16,
+						endLine: 20,
+						pageRank: 0.2,
+						refDensity: 0,
+					},
+				},
+				{
+					id: "r5",
+					score: 0,
+					payload: {
+						filePath: "big.ts",
+						codeChunk: "c5",
+						startLine: 21,
+						endLine: 25,
+						pageRank: 0.1,
+						refDensity: 0,
+					},
+				},
+				{
+					id: "r6",
+					score: 0,
+					payload: {
+						filePath: "other.ts",
+						codeChunk: "c6",
+						startLine: 1,
+						endLine: 5,
+						pageRank: 0,
+						refDensity: 0,
+					},
+				},
+			])
+
+			const results = await expander.expand(hits)
+			const related = results.filter((r) => !r.isDirectHit)
+			const bigTsBlocks = related.filter((r) => (r.payload.filePath as string) === "big.ts")
+			const otherTsBlocks = related.filter((r) => (r.payload.filePath as string) === "other.ts")
+
+			// Default maxRelatedPerFile=2: only 2 blocks from big.ts should survive
+			expect(bigTsBlocks.length).toBe(2)
+			// other.ts should keep its 1 block
+			expect(otherTsBlocks.length).toBe(1)
+		})
+
+		it("should respect custom maxRelatedPerFile via updateConfig", async () => {
+			expander.updateConfig({ maxRelatedPerFile: 1 })
+
+			const hits = [
+				makeHit("1", 0.9, {
+					filePath: "a.ts",
+					codeChunk: "code",
+					startLine: 1,
+					endLine: 5,
+					defines: ["Foo"],
+					refs: [],
+				}),
+			]
+
+			mockQdrant.findBlocksByRefs.mockResolvedValue([
+				{
+					id: "r1",
+					score: 0,
+					payload: {
+						filePath: "big.ts",
+						codeChunk: "c1",
+						startLine: 1,
+						endLine: 5,
+						pageRank: 0.5,
+						refDensity: 0,
+					},
+				},
+				{
+					id: "r2",
+					score: 0,
+					payload: {
+						filePath: "big.ts",
+						codeChunk: "c2",
+						startLine: 6,
+						endLine: 10,
+						pageRank: 0.4,
+						refDensity: 0,
+					},
+				},
+				{
+					id: "r3",
+					score: 0,
+					payload: {
+						filePath: "other.ts",
+						codeChunk: "c3",
+						startLine: 1,
+						endLine: 5,
+						pageRank: 0,
+						refDensity: 0,
+					},
+				},
+			])
+
+			const results = await expander.expand(hits)
+			const related = results.filter((r) => !r.isDirectHit)
+			const bigTsBlocks = related.filter((r) => (r.payload.filePath as string) === "big.ts")
+
+			// maxRelatedPerFile=1: only 1 block from big.ts
+			expect(bigTsBlocks.length).toBe(1)
 		})
 	})
 
@@ -830,6 +995,116 @@ describe("GraphExpander", () => {
 			await expander.expand(hits)
 
 			expect(mockQdrant.findBlocksByDefines).toHaveBeenCalledWith(["BaseClass"], 5)
+		})
+	})
+
+	describe("extractIdentifiers()", () => {
+		it("should extract PascalCase identifiers", () => {
+			const result = GraphExpander.extractIdentifiers("GameManager and PlayerController")
+			expect(result).toContain("GameManager")
+			expect(result).toContain("PlayerController")
+		})
+
+		it("should extract capitalized words (4+ chars) as potential type names", () => {
+			const result = GraphExpander.extractIdentifiers("Singleton pattern implementation")
+			expect(result).toContain("Singleton")
+		})
+
+		it("should NOT extract very short capitalized words (1-2 lowercase chars)", () => {
+			const result = GraphExpander.extractIdentifiers("If Do Go")
+			expect(result).toHaveLength(0)
+		})
+
+		it("should extract camelCase identifiers", () => {
+			const result = GraphExpander.extractIdentifiers("updateGameState and onPlayerDeath")
+			expect(result).toContain("updateGameState")
+			expect(result).toContain("onPlayerDeath")
+		})
+
+		it("should extract UPPER_CASE constants", () => {
+			const result = GraphExpander.extractIdentifiers("MAX_HEALTH and PLAYER_SPEED")
+			expect(result).toContain("MAX_HEALTH")
+			expect(result).toContain("PLAYER_SPEED")
+		})
+
+		it("should extract snake_case identifiers", () => {
+			const result = GraphExpander.extractIdentifiers("game_manager update_state")
+			expect(result).toContain("game_manager")
+			expect(result).toContain("update_state")
+		})
+
+		it("should extract mixed identifiers from a complex query", () => {
+			const result = GraphExpander.extractIdentifiers("Singleton pattern with GameManager class")
+			expect(result).toContain("Singleton")
+			expect(result).toContain("GameManager")
+		})
+	})
+
+	describe("keyword supplement — classExtends search", () => {
+		let mockQdrant: ReturnType<typeof createMockQdrant>
+		let expander: GraphExpander
+
+		beforeEach(() => {
+			mockQdrant = createMockQdrant()
+			expander = new GraphExpander(mockQdrant)
+		})
+
+		it("should search classExtends for extracted identifiers", async () => {
+			const hits = [
+				makeHit("1", 0.9, {
+					filePath: "a.ts",
+					codeChunk: "code",
+					startLine: 1,
+					endLine: 5,
+					defines: [],
+					refs: [],
+				}),
+			]
+
+			await expander.expand(hits, "Singleton pattern")
+
+			// Should search classExtends for "Singleton"
+			expect(mockQdrant.findBlocksByClassExtends).toHaveBeenCalledWith("Singleton", 5)
+		})
+
+		it("should add classExtends results with discounted base score", async () => {
+			const extendsBlock = {
+				id: "ext-1",
+				score: 0,
+				payload: {
+					filePath: "managers/GameManager.cs",
+					codeChunk: "class GameManager : Singleton<GameManager>",
+					startLine: 1,
+					endLine: 10,
+					className: "GameManager",
+					classExtends: "Singleton",
+					pageRank: 0.5,
+					refDensity: 0.3,
+				} as Payload,
+			}
+
+			mockQdrant.findBlocksByClassExtends.mockResolvedValue([extendsBlock])
+
+			const hits = [
+				makeHit("1", 0.9, {
+					filePath: "a.ts",
+					codeChunk: "code",
+					startLine: 1,
+					endLine: 5,
+					defines: [],
+					refs: [],
+				}),
+			]
+
+			const results = await expander.expand(hits, "Singleton pattern")
+
+			// Find the classExtends keyword match
+			const extResult = results.find((r) => r.id === "ext-1")
+			expect(extResult).toBeDefined()
+			expect(extResult!.relationType).toBe("keywordMatch")
+			// Base score = 0.65 * 0.9 = 0.585, then Phase 2 reranking applies
+			// Phase 2: 0.585 * (1 + 0.2*0.5 + 0.1*(0.3/2)) = 0.585 * 1.115 = 0.652275
+			expect(extResult!.score).toBeCloseTo(0.585 * (1 + 0.2 * 0.5 + 0.1 * (Math.min(0.3, 2) / 2)), 5)
 		})
 	})
 })

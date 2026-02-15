@@ -48,9 +48,7 @@ describe("TagExtractor", () => {
 				delete: vi.fn(),
 			}
 			mockParse.mockReturnValue(mockTree)
-			mockCaptures.mockReturnValue([
-				{ name: "name.definition.function", node: mockNode },
-			])
+			mockCaptures.mockReturnValue([{ name: "name.definition.function", node: mockNode }])
 
 			// Pre-populate the tags query cache to bypass require("web-tree-sitter")
 			;(extractor as any).tagsQueryCache.set("ts", mockQuery)
@@ -89,12 +87,64 @@ describe("TagExtractor", () => {
 			// Pre-populate the tags query cache to bypass require("web-tree-sitter")
 			;(extractor as any).tagsQueryCache.set("ts", mockQuery)
 
-			const result = extractor.extract("/test/file.ts", "function foo() {}\nbar()\n", mockParser as any, {} as any)
+			const result = extractor.extract(
+				"/test/file.ts",
+				"function foo() {}\nbar()\n",
+				mockParser as any,
+				{} as any,
+			)
 
 			const refs = result.tags.filter((t) => t.kind === "ref")
 			expect(refs.length).toBe(1)
 			expect(refs[0].name).toBe("bar")
 			expect(refs[0].subKind).toBe("call")
+		})
+
+		it("should strip generic type parameters from captured text", () => {
+			const mockTree = {
+				rootNode: {
+					type: "program",
+					childCount: 0,
+					child: () => null,
+				},
+				delete: vi.fn(),
+			}
+			mockParse.mockReturnValue(mockTree)
+			mockCaptures.mockReturnValue([
+				{
+					name: "name.reference.class",
+					node: { text: "Singleton<GameManager>", startPosition: { row: 5 } },
+				},
+				{
+					name: "name.reference.class",
+					node: { text: "Dictionary<string, List<int>>", startPosition: { row: 10 } },
+				},
+				{
+					name: "name.definition.class",
+					node: { text: "GameManager", startPosition: { row: 0 } },
+				},
+			])
+
+			// Pre-populate the tags query cache for .cs extension
+			;(extractor as any).tagsQueryCache.set("cs", mockQuery)
+
+			const result = extractor.extract(
+				"/test/file.cs",
+				"class GameManager : Singleton<GameManager> {}",
+				mockParser as any,
+				{} as any,
+			)
+
+			const refs = result.tags.filter((t) => t.kind === "ref")
+			expect(refs.length).toBe(2)
+			// Generic params should be stripped
+			expect(refs[0].name).toBe("Singleton")
+			expect(refs[1].name).toBe("Dictionary")
+
+			const defs = result.tags.filter((t) => t.kind === "def")
+			expect(defs.length).toBe(1)
+			// Non-generic names should be unchanged
+			expect(defs[0].name).toBe("GameManager")
 		})
 
 		it("should skip empty capture names", () => {
@@ -359,13 +409,71 @@ describe("TagExtractor", () => {
 			mockParse.mockReturnValue(mockTree)
 			mockCaptures.mockReturnValue([])
 
-			const result = extractor.extract("/test/file.ts", "class MyClass extends BaseClass {}", mockParser as any, {} as any)
+			const result = extractor.extract(
+				"/test/file.ts",
+				"class MyClass extends BaseClass {}",
+				mockParser as any,
+				{} as any,
+			)
 
 			expect(result.classDeclarations.length).toBe(1)
 			expect(result.classDeclarations[0].name).toBe("MyClass")
 			expect(result.classDeclarations[0].extends).toBe("BaseClass")
 			expect(result.classDeclarations[0].startLine).toBe(1)
 			expect(result.classDeclarations[0].endLine).toBe(11)
+		})
+
+		it("should strip generic type parameters from extends in class declarations", () => {
+			// Simulate C# AST: class GameManager : Singleton<GameManager>
+			// base_list child is a generic_name node whose text includes type args
+			const baseType = {
+				text: "Singleton<GameManager>",
+				type: "generic_name",
+				childCount: 0,
+				child: () => null,
+			}
+			const baseList = {
+				type: "base_list",
+				childCount: 1,
+				child: (i: number) => (i === 0 ? baseType : null),
+				children: [baseType],
+				childForFieldName: () => null,
+			}
+			const classNameNode = { text: "GameManager" }
+			const classNode = {
+				type: "class_declaration",
+				childForFieldName: (name: string) => {
+					if (name === "name") return classNameNode
+					return null
+				},
+				startPosition: { row: 0 },
+				endPosition: { row: 10 },
+				childCount: 2,
+				child: (i: number) => (i === 1 ? baseList : null),
+			}
+			const mockTree = {
+				rootNode: {
+					type: "program",
+					childCount: 1,
+					child: (i: number) => (i === 0 ? classNode : null),
+				},
+				delete: vi.fn(),
+			}
+			mockParse.mockReturnValue(mockTree)
+			mockCaptures.mockReturnValue([])
+
+			const result = extractor.extract(
+				"/test/file.cs",
+				"class GameManager : Singleton<GameManager> {}",
+				mockParser as any,
+				{} as any,
+			)
+
+			expect(result.classDeclarations.length).toBe(1)
+			const decl = result.classDeclarations[0]
+			expect(decl.name).toBe("GameManager")
+			// Generic type params should be stripped
+			expect(decl.extends).toBe("Singleton")
 		})
 
 		it("should extract implements from class_heritage / heritage_clause", () => {

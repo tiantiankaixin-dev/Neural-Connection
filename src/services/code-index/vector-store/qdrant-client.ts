@@ -6,6 +6,7 @@ import { IVectorStore } from "../interfaces/vector-store"
 import { Payload, VectorStoreSearchResult } from "../interfaces"
 import { DEFAULT_MAX_SEARCH_RESULTS, DEFAULT_SEARCH_MIN_SCORE, QDRANT_CODE_BLOCK_NAMESPACE } from "../constants"
 import { t } from "../../../i18n"
+import type { SparseVector } from "../shared/sparse-embedding"
 
 /**
  * Qdrant implementation of the vector store interface
@@ -155,9 +156,19 @@ export class QdrantVectorStore implements IVectorStore {
 				// Collection info not retrieved (assume not found or inaccessible), create it
 				await this.client.createCollection(this.collectionName, {
 					vectors: {
-						size: this.vectorSize,
-						distance: this.DISTANCE_METRIC,
-						on_disk: true,
+						content: {
+							size: this.vectorSize,
+							distance: this.DISTANCE_METRIC,
+							on_disk: true,
+						},
+						relation: {
+							size: this.vectorSize,
+							distance: this.DISTANCE_METRIC,
+							on_disk: true,
+						},
+					},
+					sparse_vectors: {
+						keywords: {},
 					},
 					hnsw_config: {
 						m: 64,
@@ -167,11 +178,17 @@ export class QdrantVectorStore implements IVectorStore {
 				})
 				created = true
 			} else {
-				// Collection exists, check vector size
+				// Collection exists, check vector size and named vector support
 				const vectorsConfig = collectionInfo.config?.params?.vectors
 				let existingVectorSize: number
+				let hasNamedVectors = false
 
-				if (typeof vectorsConfig === "number") {
+				if (vectorsConfig && typeof vectorsConfig === "object" && "content" in vectorsConfig) {
+					// Named vectors format
+					hasNamedVectors = true
+					const contentConfig = (vectorsConfig as any).content
+					existingVectorSize = contentConfig?.size ?? 0
+				} else if (typeof vectorsConfig === "number") {
 					existingVectorSize = vectorsConfig
 				} else if (
 					vectorsConfig &&
@@ -182,6 +199,31 @@ export class QdrantVectorStore implements IVectorStore {
 					existingVectorSize = vectorsConfig.size
 				} else {
 					existingVectorSize = 0 // Fallback for unknown configuration
+				}
+
+				// Force recreate if old collection doesn't have named vectors
+				if (!hasNamedVectors) {
+					console.warn(
+						`[QdrantVectorStore] Collection ${this.collectionName} uses legacy single-vector format. Recreating with named vectors.`,
+					)
+					created = await this._recreateCollectionWithNewDimension(existingVectorSize)
+					await this._createPayloadIndexes()
+					return created
+				}
+
+				// Force recreate if collection is missing sparse vectors
+				const sparseVectorsConfig = collectionInfo.config?.params?.sparse_vectors as
+					| Record<string, unknown>
+					| undefined
+				const hasSparseVectors =
+					sparseVectorsConfig && typeof sparseVectorsConfig === "object" && "keywords" in sparseVectorsConfig
+				if (!hasSparseVectors) {
+					console.warn(
+						`[QdrantVectorStore] Collection ${this.collectionName} missing sparse vectors. Recreating with hybrid search support.`,
+					)
+					created = await this._recreateCollectionWithNewDimension(existingVectorSize)
+					await this._createPayloadIndexes()
+					return created
 				}
 
 				if (existingVectorSize === this.vectorSize) {
@@ -250,9 +292,19 @@ export class QdrantVectorStore implements IVectorStore {
 			recreationAttempted = true
 			await this.client.createCollection(this.collectionName, {
 				vectors: {
-					size: this.vectorSize,
-					distance: this.DISTANCE_METRIC,
-					on_disk: true,
+					content: {
+						size: this.vectorSize,
+						distance: this.DISTANCE_METRIC,
+						on_disk: true,
+					},
+					relation: {
+						size: this.vectorSize,
+						distance: this.DISTANCE_METRIC,
+						on_disk: true,
+					},
+				},
+				sparse_vectors: {
+					keywords: {},
 				},
 				hnsw_config: {
 					m: 64,
@@ -375,12 +427,19 @@ export class QdrantVectorStore implements IVectorStore {
 	async upsertPoints(
 		points: Array<{
 			id: string
-			vector: number[]
+			vector: number[] | Record<string, any>
+			sparseVector?: SparseVector
 			payload: Record<string, any>
 		}>,
 	): Promise<void> {
 		try {
 			const processedPoints = points.map((point) => {
+				// Merge sparse vector into the vector object for Qdrant
+				let vector: any = point.vector
+				if (point.sparseVector && typeof vector === "object" && !Array.isArray(vector)) {
+					vector = { ...vector, keywords: point.sparseVector }
+				}
+
 				if (point.payload?.filePath) {
 					const segments = point.payload.filePath.split(path.sep).filter(Boolean)
 					const pathSegments = segments.reduce(
@@ -391,14 +450,15 @@ export class QdrantVectorStore implements IVectorStore {
 						{},
 					)
 					return {
-						...point,
+						id: point.id,
+						vector,
 						payload: {
 							...point.payload,
 							pathSegments,
 						},
 					}
 				}
-				return point
+				return { id: point.id, vector, payload: point.payload }
 			})
 
 			await this.client.upsert(this.collectionName, {
@@ -482,6 +542,7 @@ export class QdrantVectorStore implements IVectorStore {
 
 			const searchRequest = {
 				query: queryVector,
+				using: "content" as const,
 				filter: mergedFilter,
 				score_threshold: minScore ?? DEFAULT_SEARCH_MIN_SCORE,
 				limit: maxResults ?? DEFAULT_MAX_SEARCH_RESULTS,
@@ -512,6 +573,185 @@ export class QdrantVectorStore implements IVectorStore {
 			return filteredPoints as VectorStoreSearchResult[]
 		} catch (error) {
 			console.error("Failed to search points:", error)
+			throw error
+		}
+	}
+
+	/**
+	 * Searches for similar vectors using the relation named vector.
+	 * Finds blocks whose relationship context best matches the query.
+	 */
+	async searchRelationVectors(
+		queryVector: number[],
+		directoryPrefix?: string,
+		minScore?: number,
+		maxResults?: number,
+	): Promise<VectorStoreSearchResult[]> {
+		try {
+			let filter:
+				| {
+						must: Array<{ key: string; match: { value: string } }>
+						must_not?: Array<{ key: string; match: { value: string } }>
+				  }
+				| undefined = undefined
+
+			if (directoryPrefix) {
+				const normalizedPrefix = path.posix.normalize(directoryPrefix.replace(/\\/g, "/"))
+				if (normalizedPrefix !== "." && normalizedPrefix !== "./") {
+					const cleanedPrefix = path.posix.normalize(
+						normalizedPrefix.startsWith("./") ? normalizedPrefix.slice(2) : normalizedPrefix,
+					)
+					const segments = cleanedPrefix.split("/").filter(Boolean)
+					if (segments.length > 0) {
+						filter = {
+							must: segments.map((segment, index) => ({
+								key: `pathSegments.${index}`,
+								match: { value: segment },
+							})),
+						}
+					}
+				}
+			}
+
+			const metadataExclusion = {
+				must_not: [{ key: "type", match: { value: "metadata" } }],
+			}
+
+			const mergedFilter = filter
+				? { ...filter, must_not: [...(filter.must_not || []), ...metadataExclusion.must_not] }
+				: metadataExclusion
+
+			const searchRequest = {
+				query: queryVector,
+				using: "relation" as const,
+				filter: mergedFilter,
+				score_threshold: minScore ?? DEFAULT_SEARCH_MIN_SCORE,
+				limit: maxResults ?? DEFAULT_MAX_SEARCH_RESULTS,
+				params: {
+					hnsw_ef: 128,
+					exact: false,
+				},
+				with_payload: {
+					include: [
+						"filePath",
+						"codeChunk",
+						"startLine",
+						"endLine",
+						"pathSegments",
+						"defines",
+						"refs",
+						"refDensity",
+						"className",
+						"classExtends",
+						"pageRank",
+					],
+				},
+			}
+
+			const operationResult = await this.client.query(this.collectionName, searchRequest)
+			const filteredPoints = operationResult.points.filter((p) => this.isPayloadValid(p.payload))
+
+			return filteredPoints as VectorStoreSearchResult[]
+		} catch (error) {
+			console.error("Failed to search relation vectors:", error)
+			throw error
+		}
+	}
+
+	/**
+	 * Hybrid search combining dense content vectors with sparse keyword vectors
+	 * using Qdrant's native Reciprocal Rank Fusion (RRF).
+	 */
+	async hybridSearch(
+		queryVector: number[],
+		querySparseVector: SparseVector,
+		directoryPrefix?: string,
+		minScore?: number,
+		maxResults?: number,
+	): Promise<VectorStoreSearchResult[]> {
+		try {
+			let filter:
+				| {
+						must: Array<{ key: string; match: { value: string } }>
+						must_not?: Array<{ key: string; match: { value: string } }>
+				  }
+				| undefined = undefined
+
+			if (directoryPrefix) {
+				const normalizedPrefix = path.posix.normalize(directoryPrefix.replace(/\\/g, "/"))
+				if (normalizedPrefix !== "." && normalizedPrefix !== "./") {
+					const cleanedPrefix = path.posix.normalize(
+						normalizedPrefix.startsWith("./") ? normalizedPrefix.slice(2) : normalizedPrefix,
+					)
+					const segments = cleanedPrefix.split("/").filter(Boolean)
+					if (segments.length > 0) {
+						filter = {
+							must: segments.map((segment, index) => ({
+								key: `pathSegments.${index}`,
+								match: { value: segment },
+							})),
+						}
+					}
+				}
+			}
+
+			const metadataExclusion = {
+				must_not: [{ key: "type", match: { value: "metadata" } }],
+			}
+
+			const mergedFilter = filter
+				? { ...filter, must_not: [...(filter.must_not || []), ...metadataExclusion.must_not] }
+				: metadataExclusion
+
+			const limit = maxResults ?? DEFAULT_MAX_SEARCH_RESULTS
+			const prefetchLimit = limit * 3
+
+			const searchRequest = {
+				prefetch: [
+					{
+						query: queryVector,
+						using: "content" as const,
+						limit: prefetchLimit,
+						params: {
+							hnsw_ef: 128,
+							exact: false,
+						},
+					},
+					{
+						query: {
+							indices: querySparseVector.indices,
+							values: querySparseVector.values,
+						} as any,
+						using: "keywords" as const,
+						limit: prefetchLimit,
+					},
+				],
+				query: { fusion: "rrf" as const },
+				filter: mergedFilter,
+				limit,
+				with_payload: {
+					include: [
+						"filePath",
+						"codeChunk",
+						"startLine",
+						"endLine",
+						"pathSegments",
+						"defines",
+						"refs",
+						"refDensity",
+						"className",
+						"classExtends",
+						"pageRank",
+					],
+				},
+			}
+
+			const operationResult = await this.client.query(this.collectionName, searchRequest as any)
+			const filteredPoints = operationResult.points.filter((p) => this.isPayloadValid(p.payload))
+
+			return filteredPoints as VectorStoreSearchResult[]
+		} catch (error) {
+			console.error("Failed to hybrid search:", error)
 			throw error
 		}
 	}
@@ -683,7 +923,11 @@ export class QdrantVectorStore implements IVectorStore {
 				points: [
 					{
 						id: metadataId,
-						vector: new Array(this.vectorSize).fill(0),
+						vector: {
+							content: new Array(this.vectorSize).fill(0),
+							relation: new Array(this.vectorSize).fill(0),
+							keywords: { indices: [], values: [] },
+						} as any,
 						payload: {
 							type: "metadata",
 							indexing_complete: true,
@@ -900,7 +1144,11 @@ export class QdrantVectorStore implements IVectorStore {
 				points: [
 					{
 						id: metadataId,
-						vector: new Array(this.vectorSize).fill(0),
+						vector: {
+							content: new Array(this.vectorSize).fill(0),
+							relation: new Array(this.vectorSize).fill(0),
+							keywords: { indices: [], values: [] },
+						} as any,
 						payload: {
 							type: "metadata",
 							indexing_complete: false,

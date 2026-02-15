@@ -46,8 +46,7 @@ export interface FileTagResult {
 // ─── Import extraction regexes ───
 
 // TypeScript/JavaScript: import { X } from "path", import X from "path", import * as X from "path"
-const TS_IMPORT_REGEX =
-	/import\s+(?:(?:\{([^}]+)\})|(?:\*\s+as\s+(\w+))|(?:(\w+)))\s+from\s+["']([^"']+)["']/g
+const TS_IMPORT_REGEX = /import\s+(?:(?:\{([^}]+)\})|(?:\*\s+as\s+(\w+))|(?:(\w+)))\s+from\s+["']([^"']+)["']/g
 // Python: from X import Y, import X
 const PY_IMPORT_REGEX = /(?:from\s+([\w.]+)\s+import\s+([\w,\s*]+)|import\s+([\w.,\s]+))/g
 // Go: import "path", import ( "path" )
@@ -77,7 +76,15 @@ const IMPORT_PATTERNS: Record<string, ImportPattern> = {
 			const modulePath = match[4]
 			const symbols: string[] = []
 			if (match[1]) {
-				symbols.push(...match[1].split(",").map((s) => s.trim().split(/\s+as\s+/).pop()!.trim()))
+				symbols.push(
+					...match[1].split(",").map((s) =>
+						s
+							.trim()
+							.split(/\s+as\s+/)
+							.pop()!
+							.trim(),
+					),
+				)
 			}
 			if (match[2]) symbols.push(match[2])
 			if (match[3]) symbols.push(match[3])
@@ -267,7 +274,15 @@ export class TagExtractor {
 			for (const capture of captures) {
 				const captureName = capture.name
 				const node = capture.node
-				const name = node.text
+
+				// Strip generic type parameters from captured text so that
+				// refs like "Singleton<GameManager>" become "Singleton" and
+				// match defines correctly in the PageRank graph.
+				let name = node.text
+				const ltIdx = name.indexOf("<")
+				if (ltIdx > 0) {
+					name = name.substring(0, ltIdx)
+				}
 
 				if (!name || name.length === 0) {
 					continue
@@ -402,8 +417,7 @@ export class TagExtractor {
 				}
 
 				// Try to extract extends (heritage/superclass)
-				const superclassNode =
-					node.childForFieldName("superclass") || node.childForFieldName("superClass")
+				const superclassNode = node.childForFieldName("superclass") || node.childForFieldName("superClass")
 				if (superclassNode) {
 					decl.extends = superclassNode.text
 				}
@@ -430,11 +444,7 @@ export class TagExtractor {
 							decl.implements = []
 							for (let j = 0; j < implementsClause.childCount; j++) {
 								const implChild = implementsClause.child(j)
-								if (
-									implChild &&
-									implChild.type !== "implements" &&
-									implChild.type !== ","
-								) {
+								if (implChild && implChild.type !== "implements" && implChild.type !== ",") {
 									decl.implements.push(implChild.text)
 								}
 							}
@@ -459,6 +469,19 @@ export class TagExtractor {
 							?.filter((c: any) => c && c.type !== ",")
 							.map((c: any) => c.text)
 					}
+				}
+
+				// Strip generic type parameters from extends/implements
+				// e.g., "Singleton<GameManager>" → "Singleton"
+				if (decl.extends) {
+					const ltIdx = decl.extends.indexOf("<")
+					if (ltIdx > 0) decl.extends = decl.extends.substring(0, ltIdx)
+				}
+				if (decl.implements) {
+					decl.implements = decl.implements.map((impl) => {
+						const ltIdx = impl.indexOf("<")
+						return ltIdx > 0 ? impl.substring(0, ltIdx) : impl
+					})
 				}
 
 				declarations.push(decl)

@@ -99,6 +99,27 @@ describe("PageRankService", () => {
 			expect(rankA).toBeGreaterThan(rankB)
 		})
 
+		it("should give higher weight to PascalCase names (single-hump, >=8 chars)", async () => {
+			// "Singleton" is a PascalCase name without camelCase transition but >=8 chars → mul=5
+			// "foo" is a short generic name → mul=1
+			const points = [
+				{ id: "a", payload: { defines: ["Singleton"], refs: [], refDensity: 0 } },
+				{ id: "b", payload: { defines: ["foo"], refs: [], refDensity: 0 } },
+				{ id: "c", payload: { defines: [], refs: ["Singleton", "foo"], refDensity: 0.5 } },
+			]
+			const mockQdrant = createMockQdrant(points)
+			const service = new PageRankService(mockQdrant)
+
+			await service.computeRanks()
+
+			const updates = mockQdrant.batchUpdatePayloads.mock.calls[0][0]
+			const rankA = updates.find((u: any) => u.id === "a")?.payload.pageRank
+			const rankB = updates.find((u: any) => u.id === "b")?.payload.pageRank
+
+			// Block A (defines PascalCase "Singleton") should rank higher than Block B (defines "foo")
+			expect(rankA).toBeGreaterThan(rankB)
+		})
+
 		it("should normalize ranks to [0, 1]", async () => {
 			const points = [
 				{ id: "a", payload: { defines: ["foo"], refs: ["bar"], refDensity: 0 } },

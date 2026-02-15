@@ -26,6 +26,10 @@ function nameQualityMul(name: string, definerCount: number): number {
 	// Long camelCase/snake_case names are more meaningful
 	if (name.length >= 8 && (/[a-z][A-Z]/.test(name) || name.includes("_"))) {
 		mul *= 10
+	} else if (name.length >= 8 && /^[A-Z][a-z]/.test(name)) {
+		// Single-hump PascalCase names like "Singleton", "Constants", "Provider"
+		// are meaningful type/class names but lack the [a-z][A-Z] transition
+		mul *= 5
 	}
 
 	// Names starting with _ are likely private/internal
@@ -130,9 +134,7 @@ export class PageRankService {
 			}
 		}
 
-		console.log(
-			`[PageRankService] Graph built: ${graph.order} nodes, ${graph.size} edges`,
-		)
+		console.log(`[PageRankService] Graph built: ${graph.order} nodes, ${graph.size} edges`)
 
 		// 4. Compute PageRank
 		let ranks: Record<string, number>
@@ -166,8 +168,6 @@ export class PageRankService {
 		await this.qdrantClient.batchUpdatePayloads(updates)
 
 		const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
-		console.log(
-			`[PageRankService] PageRank completed in ${elapsed}s. Top score: ${maxRank.toFixed(6)}`,
-		)
+		console.log(`[PageRankService] PageRank completed in ${elapsed}s. Top score: ${maxRank.toFixed(6)}`)
 	}
 }

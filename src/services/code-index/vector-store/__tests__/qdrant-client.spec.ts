@@ -530,9 +530,16 @@ describe("QdrantVectorStore", () => {
 			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledTimes(1)
 			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledWith(expectedCollectionName, {
 				vectors: {
-					size: mockVectorSize,
-					distance: "Cosine", // Assuming 'Cosine' is the DISTANCE_METRIC
-					on_disk: true,
+					content: {
+						size: mockVectorSize,
+						distance: "Cosine",
+						on_disk: true,
+					},
+					relation: {
+						size: mockVectorSize,
+						distance: "Cosine",
+						on_disk: true,
+					},
 				},
 				hnsw_config: {
 					m: 64,
@@ -561,7 +568,8 @@ describe("QdrantVectorStore", () => {
 				config: {
 					params: {
 						vectors: {
-							size: mockVectorSize, // Matching vector size
+							content: { size: mockVectorSize, distance: "Cosine" },
+							relation: { size: mockVectorSize, distance: "Cosine" },
 						},
 					},
 				},
@@ -598,7 +606,8 @@ describe("QdrantVectorStore", () => {
 					config: {
 						params: {
 							vectors: {
-								size: differentVectorSize, // Mismatching vector size
+								content: { size: differentVectorSize, distance: "Cosine" },
+								relation: { size: differentVectorSize, distance: "Cosine" },
 							},
 						},
 					},
@@ -622,9 +631,16 @@ describe("QdrantVectorStore", () => {
 			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledTimes(1)
 			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledWith(expectedCollectionName, {
 				vectors: {
-					size: mockVectorSize, // Should use the new, correct vector size
-					distance: "Cosine",
-					on_disk: true,
+					content: {
+						size: mockVectorSize,
+						distance: "Cosine",
+						on_disk: true,
+					},
+					relation: {
+						size: mockVectorSize,
+						distance: "Cosine",
+						on_disk: true,
+					},
 				},
 				hnsw_config: {
 					m: 64,
@@ -731,7 +747,8 @@ describe("QdrantVectorStore", () => {
 				config: {
 					params: {
 						vectors: {
-							size: differentVectorSize,
+							content: { size: differentVectorSize, distance: "Cosine" },
+							relation: { size: differentVectorSize, distance: "Cosine" },
 						},
 					},
 				},
@@ -772,7 +789,8 @@ describe("QdrantVectorStore", () => {
 					config: {
 						params: {
 							vectors: {
-								size: differentVectorSize,
+								content: { size: differentVectorSize, distance: "Cosine" },
+								relation: { size: differentVectorSize, distance: "Cosine" },
 							},
 						},
 					},
@@ -820,7 +838,8 @@ describe("QdrantVectorStore", () => {
 					config: {
 						params: {
 							vectors: {
-								size: differentVectorSize,
+								content: { size: differentVectorSize, distance: "Cosine" },
+								relation: { size: differentVectorSize, distance: "Cosine" },
 							},
 						},
 					},
@@ -854,7 +873,8 @@ describe("QdrantVectorStore", () => {
 					config: {
 						params: {
 							vectors: {
-								size: differentVectorSize,
+								content: { size: differentVectorSize, distance: "Cosine" },
+								relation: { size: differentVectorSize, distance: "Cosine" },
 							},
 						},
 					},
@@ -864,7 +884,8 @@ describe("QdrantVectorStore", () => {
 					config: {
 						params: {
 							vectors: {
-								size: differentVectorSize,
+								content: { size: differentVectorSize, distance: "Cosine" },
+								relation: { size: differentVectorSize, distance: "Cosine" },
 							},
 						},
 					},
@@ -907,7 +928,8 @@ describe("QdrantVectorStore", () => {
 					config: {
 						params: {
 							vectors: {
-								size: oldVectorSize, // Existing collection has 2048 dimensions
+								content: { size: oldVectorSize, distance: "Cosine" },
+								relation: { size: oldVectorSize, distance: "Cosine" },
 							},
 						},
 					},
@@ -930,9 +952,16 @@ describe("QdrantVectorStore", () => {
 			expect(mockQdrantClientInstance.deleteCollection).toHaveBeenCalledTimes(1)
 			expect(mockQdrantClientInstance.createCollection).toHaveBeenCalledWith(expectedCollectionName, {
 				vectors: {
-					size: newVectorSize, // Should create with new 768 dimensions
-					distance: "Cosine",
-					on_disk: true,
+					content: {
+						size: newVectorSize,
+						distance: "Cosine",
+						on_disk: true,
+					},
+					relation: {
+						size: newVectorSize,
+						distance: "Cosine",
+						on_disk: true,
+					},
 				},
 				hnsw_config: {
 					m: 64,
@@ -950,7 +979,8 @@ describe("QdrantVectorStore", () => {
 				config: {
 					params: {
 						vectors: {
-							size: differentVectorSize,
+							content: { size: differentVectorSize, distance: "Cosine" },
+							relation: { size: differentVectorSize, distance: "Cosine" },
 						},
 					},
 				},

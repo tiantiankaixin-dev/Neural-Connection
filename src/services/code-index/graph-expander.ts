@@ -54,6 +54,7 @@ export interface GraphExpansionConfig {
 	enabled: boolean
 	maxDepth: number
 	maxResults: number
+	maxRelatedPerFile: number
 	weights: GraphExpansionWeights
 	directWeights: DirectHitWeights
 }
@@ -61,7 +62,8 @@ export interface GraphExpansionConfig {
 export const DEFAULT_CONFIG: GraphExpansionConfig = {
 	enabled: true,
 	maxDepth: 1,
-	maxResults: 10,
+	maxResults: 15,
+	maxRelatedPerFile: 2,
 	weights: DEFAULT_WEIGHTS,
 	directWeights: DEFAULT_DIRECT_WEIGHTS,
 }
@@ -101,9 +103,14 @@ export class GraphExpander {
 	 *
 	 * @param directHits Initial vector search results
 	 * @param query Original search query (for keyword supplementation)
+	 * @param queryVector Query embedding vector (for relation vector search)
 	 * @returns Combined and ranked results (direct hits + related code)
 	 */
-	async expand(directHits: VectorStoreSearchResult[], query?: string): Promise<ExpandedSearchResult[]> {
+	async expand(
+		directHits: VectorStoreSearchResult[],
+		query?: string,
+		queryVector?: number[],
+	): Promise<ExpandedSearchResult[]> {
 		if (!this.config.enabled || directHits.length === 0) {
 			console.log(`[GraphExpander] Skipped: enabled=${this.config.enabled}, hits=${directHits.length}`)
 			return directHits
@@ -111,7 +118,7 @@ export class GraphExpander {
 				.map((hit) => ({
 					id: String(hit.id),
 					payload: hit.payload!,
-					score: this.computeDirectHitScore(hit.score, hit.payload!),
+					score: this.computeDirectHitScore(hit.score, hit.payload!, query),
 					isDirectHit: true,
 				}))
 		}
@@ -129,7 +136,7 @@ export class GraphExpander {
 			allResults.push({
 				id,
 				payload: hit.payload,
-				score: this.computeDirectHitScore(hit.score, hit.payload),
+				score: this.computeDirectHitScore(hit.score, hit.payload, query),
 				isDirectHit: true,
 			})
 		}
@@ -178,6 +185,8 @@ export class GraphExpander {
 				console.log(`[GraphExpander] Keyword supplement: identifiers=[${identifiers.join(", ")}]`)
 				let keywordAdded = 0
 
+				const KEYWORD_BASE_SCORE = 0.65
+
 				// Search defines for identifiers
 				const defHits = await this.qdrantClient.findBlocksByDefines(identifiers, 10)
 				for (const hit of defHits) {
@@ -188,7 +197,7 @@ export class GraphExpander {
 					allResults.push({
 						id,
 						payload: hit.payload,
-						score: this.computeDirectHitScore(0.5, hit.payload), // base score for keyword match
+						score: this.computeDirectHitScore(KEYWORD_BASE_SCORE, hit.payload),
 						isDirectHit: true,
 						relationType: "keywordMatch",
 					})
@@ -205,7 +214,25 @@ export class GraphExpander {
 						allResults.push({
 							id,
 							payload: hit.payload,
-							score: this.computeDirectHitScore(0.5, hit.payload),
+							score: this.computeDirectHitScore(KEYWORD_BASE_SCORE, hit.payload),
+							isDirectHit: true,
+							relationType: "keywordMatch",
+						})
+					}
+				}
+
+				// Search classExtends for identifiers (find classes that extend a matched class)
+				for (const ident of identifiers) {
+					const extendsHits = await this.qdrantClient.findBlocksByClassExtends(ident, 5)
+					for (const hit of extendsHits) {
+						const id = String(hit.id)
+						if (seen.has(id) || !hit.payload) continue
+						seen.add(id)
+						keywordAdded++
+						allResults.push({
+							id,
+							payload: hit.payload,
+							score: this.computeDirectHitScore(KEYWORD_BASE_SCORE * 0.9, hit.payload),
 							isDirectHit: true,
 							relationType: "keywordMatch",
 						})
@@ -218,13 +245,70 @@ export class GraphExpander {
 			}
 		}
 
+		// ── Relation vector search: find blocks whose relationship context matches the query ──
+		if (queryVector) {
+			try {
+				const relationHits = await this.qdrantClient.searchRelationVectors(
+					queryVector,
+					undefined, // no directory filter
+					0.35, // lower threshold to catch more relation matches
+					30, // fetch more candidates, will be deduplicated and capped
+				)
+				let relationAdded = 0
+				for (const hit of relationHits) {
+					const id = String(hit.id)
+					if (seen.has(id) || !hit.payload) continue
+					seen.add(id)
+					relationAdded++
+
+					allResults.push({
+						id,
+						payload: hit.payload,
+						score: hit.score, // raw relation vector similarity
+						isDirectHit: false,
+						relationType: "relationVector",
+					})
+				}
+				if (relationAdded > 0) {
+					console.log(`[GraphExpander] Relation vector search added ${relationAdded} new blocks`)
+				}
+			} catch (error) {
+				console.warn("[GraphExpander] Relation vector search failed (may be legacy collection):", error)
+			}
+		}
+
 		console.log(
 			`[GraphExpander] Expansion complete: ${directHits.length} direct + ${allResults.length - directHits.length} related = ${allResults.length} total`,
 		)
 
+		// Phase 2: Rerank all results by applying PageRank/refDensity as a
+		// multiplicative boost. This ensures selection is purely semantic,
+		// while structurally important code (highly referenced) ranks higher
+		// among semantically similar results.
+		const dw = this.config.directWeights
+		for (const result of allResults) {
+			const pr = (result.payload.pageRank as number) || 0
+			const rd = Math.min((result.payload.refDensity as number) || 0, 2) / 2
+			result.score = result.score * (1 + dw.pageRank * pr + dw.refDensity * rd)
+		}
+
 		// Separate direct hits and related, sort each by score, then combine
 		const directs = allResults.filter((r) => r.isDirectHit).sort((a, b) => b.score - a.score)
-		const related = allResults.filter((r) => !r.isDirectHit).sort((a, b) => b.score - a.score)
+		const relatedSorted = allResults.filter((r) => !r.isDirectHit).sort((a, b) => b.score - a.score)
+
+		// Per-file dedup: limit related blocks per file to avoid one file
+		// dominating Related results (e.g., InventoryManager calledBy ×5)
+		const maxPerFile = this.config.maxRelatedPerFile
+		const fileCount = new Map<string, number>()
+		const related: ExpandedSearchResult[] = []
+		for (const r of relatedSorted) {
+			const fp = (r.payload.filePath as string) || ""
+			const count = fileCount.get(fp) || 0
+			if (count < maxPerFile) {
+				related.push(r)
+				fileCount.set(fp, count + 1)
+			}
+		}
 
 		// Allocate slots: direct hits get maxResults, related get maxResults
 		const maxR = this.config.maxResults
@@ -306,6 +390,11 @@ export class GraphExpander {
 		const upperCase = query.match(/\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g)
 		if (upperCase) upperCase.forEach((m) => identifiers.add(m))
 
+		// Match capitalized words that may be class/type names (e.g., Singleton, Manager)
+		// Must be 4+ chars to skip noise like "The", "For"
+		const capitalizedWords = query.match(/\b[A-Z][a-z]{3,}\b/g)
+		if (capitalizedWords) capitalizedWords.forEach((m) => identifiers.add(m))
+
 		return Array.from(identifiers)
 	}
 
@@ -314,20 +403,53 @@ export class GraphExpander {
 	 * Vector similarity is dominant; PageRank and refDensity act as boosters
 	 * to promote structurally important code when semantic scores are close.
 	 */
-	private computeDirectHitScore(vectorScore: number, payload: Payload): number {
+	private computeDirectHitScore(vectorScore: number, payload: Payload, query?: string): number {
 		const dw = this.config.directWeights
 		const pr = (payload.pageRank as number) || 0
 		const rd = Math.min((payload.refDensity as number) || 0, 2) / 2
-		return dw.vectorSim * vectorScore + dw.pageRank * pr + dw.refDensity * rd
+
+		// Query-path relevance boost: reward results whose file path or className
+		// contains words from the query (e.g., query "PlayerController" boosts
+		// files in Scripts/Player/ with className PlayerController)
+		let pathBoost = 0
+		if (query) {
+			const queryLower = query.toLowerCase()
+			// Split query into meaningful words (3+ chars to skip noise like "the", "and")
+			const queryWords = queryLower.split(/\s+/).filter((w) => w.length >= 3)
+			// Split file path into segments
+			const pathSegments = ((payload.filePath as string) || "")
+				.toLowerCase()
+				.split(/[\\/._\-]/)
+				.filter((s) => s.length >= 2)
+			// Split className into words (e.g., "PlayerController" → ["player", "controller"])
+			const classWords = ((payload.className as string) || "")
+				.split(/(?=[A-Z])/)
+				.map((w) => w.toLowerCase())
+				.filter((w) => w.length >= 2)
+			const allTargetWords = [...pathSegments, ...classWords]
+
+			let matches = 0
+			for (const qw of queryWords) {
+				if (allTargetWords.some((tw) => tw.includes(qw) || qw.includes(tw))) {
+					matches++
+				}
+			}
+			// Up to 0.15 boost, scaled by match ratio
+			if (queryWords.length > 0) {
+				pathBoost = Math.min(matches / queryWords.length, 1) * 0.15
+			}
+		}
+
+		// Phase 1: Pure semantic relevance (vector similarity + path match)
+		// PageRank/refDensity are applied later in the reranking phase
+		return vectorScore + pathBoost
 	}
 
 	/**
 	 * Compute the combined score for a related block.
 	 *
-	 * score = w1 * vectorSimilarity
-	 *       + w2 * relationStrength
-	 *       + w3 * normalize(pageRank)
-	 *       + w4 * normalize(refDensity)
+	 * Phase 1: score = w1 * vectorSimilarity + w2 * relationStrength
+	 * (PageRank/refDensity applied uniformly in Phase 2 reranking)
 	 */
 	private computeScore(
 		related: { id: string; payload: Payload; relationType: string },
@@ -338,17 +460,11 @@ export class GraphExpander {
 		// Relation strength based on type
 		const relationWeight = RELATION_WEIGHTS[related.relationType as keyof typeof RELATION_WEIGHTS] || 0.5
 
-		// PageRank (already normalized to [0, 1] by PageRankService)
-		const pr = (related.payload.pageRank as number) || 0
-
-		// Reference density (normalize: typical range 0-2, cap at 1)
-		const rd = Math.min((related.payload.refDensity as number) || 0, 2) / 2
-
 		// Use parent's vector score as a proxy for semantic relevance
 		// (actual re-embedding would be expensive; the parent hit's score indicates
 		//  the query is semantically close to this neighborhood)
 		const vectorSim = parentVectorScore * 0.8 // Slight discount for indirect match
 
-		return w.vectorSim * vectorSim + w.relation * relationWeight + w.pageRank * pr + w.refDensity * rd
+		return w.vectorSim * vectorSim + w.relation * relationWeight
 	}
 }

@@ -11,6 +11,8 @@ import { RooIgnoreController } from "../../../core/ignore/RooIgnoreController"
 import { v5 as uuidv5 } from "uuid"
 import { Ignore } from "ignore"
 import { scannerExtensions } from "../shared/supported-extensions"
+import { buildEmbeddingText, buildRelationText } from "../shared/embedding-text-builder"
+import { generateSparseEmbedding } from "../shared/sparse-embedding"
 import {
 	IFileWatcher,
 	FileProcessingResult,
@@ -565,27 +567,46 @@ export class FileWatcher implements IFileWatcher {
 			// Prepare points for batch processing
 			let pointsToUpsert: PointStruct[] = []
 			if (this.embedder && blocks.length > 0) {
-				const texts = blocks.map((block) => block.content)
-				const { embeddings } = await this.embedder.createEmbeddings(texts)
+				const contentTexts = blocks.map((block) => buildEmbeddingText(block))
+				const relationTexts = blocks.map((block) => buildRelationText(block))
+				const { embeddings: contentEmbeddings } = await this.embedder.createEmbeddings(contentTexts)
+				const { embeddings: relationEmbeddings } = await this.embedder.createEmbeddings(relationTexts)
 
 				pointsToUpsert = blocks.map((block, index) => {
 					const normalizedAbsolutePath = generateNormalizedAbsolutePath(block.file_path, this.workspacePath)
+					const relFilePath = generateRelativeFilePath(normalizedAbsolutePath, this.workspacePath)
 					const stableName = `${normalizedAbsolutePath}:${block.start_line}`
 					const pointId = uuidv5(stableName, QDRANT_CODE_BLOCK_NAMESPACE)
 
+					const defines = block.relations?.defines || []
+					const refs = block.relations?.refs || []
+					const className = block.relations?.classContext?.className || null
+					const classExtends = block.relations?.classContext?.extends || null
+
 					return {
 						id: pointId,
-						vector: embeddings[index],
+						vector: {
+							content: contentEmbeddings[index],
+							relation: relationEmbeddings[index],
+						},
+						sparseVector: generateSparseEmbedding({
+							filePath: relFilePath,
+							content: block.content,
+							defines,
+							refs,
+							className,
+							classExtends,
+						}),
 						payload: {
-							filePath: generateRelativeFilePath(normalizedAbsolutePath, this.workspacePath),
+							filePath: relFilePath,
 							codeChunk: block.content,
 							startLine: block.start_line,
 							endLine: block.end_line,
-							defines: block.relations?.defines || [],
-							refs: block.relations?.refs || [],
+							defines,
+							refs,
 							refDensity: block.relations?.refDensity || 0,
-							className: block.relations?.classContext?.className || null,
-							classExtends: block.relations?.classContext?.extends || null,
+							className,
+							classExtends,
 						},
 					}
 				})

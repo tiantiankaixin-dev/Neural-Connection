@@ -8,6 +8,8 @@ import { getWorkspacePathForContext } from "../../../utils/path"
 import { scannerExtensions } from "../shared/supported-extensions"
 import * as vscode from "vscode"
 import { CodeBlock, ICodeParser, IEmbedder, IVectorStore, IDirectoryScanner } from "../interfaces"
+import { buildEmbeddingText, buildRelationText } from "../shared/embedding-text-builder"
+import { generateSparseEmbedding } from "../shared/sparse-embedding"
 import { createHash } from "crypto"
 import { v5 as uuidv5 } from "uuid"
 import pLimit from "p-limit"
@@ -169,7 +171,7 @@ export class DirectoryScanner implements IDirectoryScanner {
 								const release = await mutex.acquire()
 								try {
 									currentBatchBlocks.push(block)
-									currentBatchTexts.push(trimmedContent)
+									currentBatchTexts.push(buildEmbeddingText(block))
 									addedBlocksFromFile = true
 
 									// Check if batch threshold is met
@@ -405,31 +407,52 @@ export class DirectoryScanner implements IDirectoryScanner {
 				}
 				// --- End Deletion Step ---
 
-				// Create embeddings for batch
-				const { embeddings } = await this.embedder.createEmbeddings(batchTexts)
+				// Create content embeddings for batch
+				const { embeddings: contentEmbeddings } = await this.embedder.createEmbeddings(batchTexts)
 
-				// Prepare points for Qdrant
+				// Create relation embeddings for batch
+				const relationTexts = batchBlocks.map((block) => buildRelationText(block))
+				const { embeddings: relationEmbeddings } = await this.embedder.createEmbeddings(relationTexts)
+
+				// Prepare points for Qdrant with named vectors
 				const points = batchBlocks.map((block, index) => {
 					const normalizedAbsolutePath = generateNormalizedAbsolutePath(block.file_path, scanWorkspace)
+					const relFilePath = generateRelativeFilePath(normalizedAbsolutePath, scanWorkspace)
 
 					// Use segmentHash for unique ID generation to handle multiple segments from same line
 					const pointId = uuidv5(block.segmentHash, QDRANT_CODE_BLOCK_NAMESPACE)
 
+					const defines = block.relations?.defines || []
+					const refs = block.relations?.refs || []
+					const className = block.relations?.classContext?.className || null
+					const classExtends = block.relations?.classContext?.extends || null
+
 					return {
 						id: pointId,
-						vector: embeddings[index],
+						vector: {
+							content: contentEmbeddings[index],
+							relation: relationEmbeddings[index],
+						},
+						sparseVector: generateSparseEmbedding({
+							filePath: relFilePath,
+							content: block.content,
+							defines,
+							refs,
+							className,
+							classExtends,
+						}),
 						payload: {
-							filePath: generateRelativeFilePath(normalizedAbsolutePath, scanWorkspace),
+							filePath: relFilePath,
 							codeChunk: block.content,
 							startLine: block.start_line,
 							endLine: block.end_line,
 							segmentHash: block.segmentHash,
 							// Code graph relation data
-							defines: block.relations?.defines || [],
-							refs: block.relations?.refs || [],
+							defines,
+							refs,
 							refDensity: block.relations?.refDensity || 0,
-							className: block.relations?.classContext?.className || null,
-							classExtends: block.relations?.classContext?.extends || null,
+							className,
+							classExtends,
 						},
 					}
 				})

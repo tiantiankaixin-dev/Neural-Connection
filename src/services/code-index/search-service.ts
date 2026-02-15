@@ -5,6 +5,7 @@ import { IVectorStore } from "./interfaces/vector-store"
 import { CodeIndexConfigManager } from "./config-manager"
 import { CodeIndexStateManager } from "./state-manager"
 import { GraphExpander, ExpandedSearchResult } from "./graph-expander"
+import { generateQuerySparseEmbedding } from "./shared/sparse-embedding"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 
@@ -64,12 +65,25 @@ export class CodeIndexSearchService {
 				normalizedPrefix = path.normalize(directoryPrefix)
 			}
 
-			// Perform vector search
-			const results = await this.vectorStore.search(vector, normalizedPrefix, minScore, maxResults)
+			// Perform hybrid search (dense + sparse) with fallback to dense-only
+			const sparseVector = generateQuerySparseEmbedding(query)
+			let results: VectorStoreSearchResult[]
+			try {
+				results = await this.vectorStore.hybridSearch(
+					vector,
+					sparseVector,
+					normalizedPrefix,
+					minScore,
+					maxResults,
+				)
+			} catch {
+				// Fallback to dense-only search if hybrid fails (e.g., legacy collection)
+				results = await this.vectorStore.search(vector, normalizedPrefix, minScore, maxResults)
+			}
 
-			// Expand with code graph if available (pass query for keyword supplementation)
+			// Expand with code graph if available (pass query + queryVector for relation vector search)
 			if (this.graphExpander) {
-				return await this.graphExpander.expand(results, query)
+				return await this.graphExpander.expand(results, query, vector)
 			}
 
 			return results

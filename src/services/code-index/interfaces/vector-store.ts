@@ -1,9 +1,12 @@
+import type { SparseVector } from "../shared/sparse-embedding"
+
 /**
  * Interface for vector database clients
  */
 export type PointStruct = {
 	id: string
-	vector: number[]
+	vector: number[] | Record<string, number[]>
+	sparseVector?: SparseVector
 	payload: Record<string, any>
 }
 
@@ -80,6 +83,29 @@ export interface IVectorStore {
 	 * Should be called at the start of indexing to indicate work in progress
 	 */
 	markIndexingIncomplete(): Promise<void>
+
+	/**
+	 * Searches for similar vectors using the relation named vector.
+	 * Finds blocks whose relationship context best matches the query.
+	 */
+	searchRelationVectors(
+		queryVector: number[],
+		directoryPrefix?: string,
+		minScore?: number,
+		maxResults?: number,
+	): Promise<VectorStoreSearchResult[]>
+
+	/**
+	 * Hybrid search combining dense content vectors with sparse keyword vectors
+	 * using Reciprocal Rank Fusion (RRF).
+	 */
+	hybridSearch(
+		queryVector: number[],
+		querySparseVector: SparseVector,
+		directoryPrefix?: string,
+		minScore?: number,
+		maxResults?: number,
+	): Promise<VectorStoreSearchResult[]>
 }
 
 export interface VectorStoreSearchResult {
