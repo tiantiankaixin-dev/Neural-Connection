@@ -301,6 +301,14 @@ export class TagExtractor {
 				// Skip captures that don't match def/ref pattern (e.g. @definition.function, @doc)
 
 				if (kind) {
+					// Class references must start with an uppercase letter.
+					// This filters out false positives from member_access_expression
+					// captures like _privateField.x, transform.position, canvas.y
+					// which are instance fields / local variables, not class names.
+					if (kind === "ref" && subKind === "class" && !/^[A-Z]/.test(name)) {
+						continue
+					}
+
 					tags.push({
 						name,
 						kind,

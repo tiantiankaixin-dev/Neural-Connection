@@ -43,6 +43,10 @@ export const csharpTagsQuery = `
  )
 ) @reference.send
 
+(member_access_expression
+ expression: (identifier) @name.reference.class
+) @reference.class
+
 (namespace_declaration
  name: (identifier) @name.definition.module
 ) @definition.module

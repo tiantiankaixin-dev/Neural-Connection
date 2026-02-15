@@ -65,20 +65,27 @@ export class CodeIndexSearchService {
 				normalizedPrefix = path.normalize(directoryPrefix)
 			}
 
-			// Perform hybrid search (dense + sparse) with fallback to dense-only
+			// Perform hybrid search (dense + sparse) with fallback to dense-only.
+			// Skip hybrid when sparse vector is empty (e.g., non-Latin queries like
+			// Chinese/Japanese) — RRF with an empty sparse branch compresses scores.
 			const sparseVector = generateQuerySparseEmbedding(query)
 			let results: VectorStoreSearchResult[]
-			try {
-				results = await this.vectorStore.hybridSearch(
-					vector,
-					sparseVector,
-					normalizedPrefix,
-					minScore,
-					maxResults,
-				)
-			} catch {
-				// Fallback to dense-only search if hybrid fails (e.g., legacy collection)
+			if (sparseVector.indices.length === 0) {
+				// No keyword tokens extracted → pure dense search
 				results = await this.vectorStore.search(vector, normalizedPrefix, minScore, maxResults)
+			} else {
+				try {
+					results = await this.vectorStore.hybridSearch(
+						vector,
+						sparseVector,
+						normalizedPrefix,
+						minScore,
+						maxResults,
+					)
+				} catch {
+					// Fallback to dense-only search if hybrid fails (e.g., legacy collection)
+					results = await this.vectorStore.search(vector, normalizedPrefix, minScore, maxResults)
+				}
 			}
 
 			// Expand with code graph if available (pass query + queryVector for relation vector search)

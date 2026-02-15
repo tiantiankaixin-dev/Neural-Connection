@@ -1,13 +1,13 @@
 # Available Tools
 
-## senu_romun
+## yineca_ceho
 
 Parameters:
 - summary (required): Put your COMPLETE response here in Markdown format (supports tables, code blocks, lists)
 - reason (optional)
 
-ALWAYS call senu_romun at the end of EVERY response.
+ALWAYS call yineca_ceho at the end of EVERY response.
 
 ## Format
 
-{"tool": "senu_romun", "arguments": {"summary": "Your full Markdown response here"}}
+{"tool": "yineca_ceho", "arguments": {"summary": "Your full Markdown response here"}}

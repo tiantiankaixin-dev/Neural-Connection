@@ -46,7 +46,7 @@ export interface DirectHitWeights {
 
 export const DEFAULT_DIRECT_WEIGHTS: DirectHitWeights = {
 	vectorSim: 0.7,
-	pageRank: 0.2,
+	pageRank: 0.5,
 	refDensity: 0.1,
 }
 
@@ -54,6 +54,7 @@ export interface GraphExpansionConfig {
 	enabled: boolean
 	maxDepth: number
 	maxResults: number
+	maxDirectPerFile: number
 	maxRelatedPerFile: number
 	weights: GraphExpansionWeights
 	directWeights: DirectHitWeights
@@ -63,6 +64,7 @@ export const DEFAULT_CONFIG: GraphExpansionConfig = {
 	enabled: true,
 	maxDepth: 1,
 	maxResults: 15,
+	maxDirectPerFile: 2,
 	maxRelatedPerFile: 2,
 	weights: DEFAULT_WEIGHTS,
 	directWeights: DEFAULT_DIRECT_WEIGHTS,
@@ -251,7 +253,7 @@ export class GraphExpander {
 				const relationHits = await this.qdrantClient.searchRelationVectors(
 					queryVector,
 					undefined, // no directory filter
-					0.35, // lower threshold to catch more relation matches
+					0.32, // lower threshold to catch relation matches after PascalCase ref filtering
 					30, // fetch more candidates, will be deduplicated and capped
 				)
 				let relationAdded = 0
@@ -292,21 +294,60 @@ export class GraphExpander {
 			result.score = result.score * (1 + dw.pageRank * pr + dw.refDensity * rd)
 		}
 
-		// Separate direct hits and related, sort each by score, then combine
-		const directs = allResults.filter((r) => r.isDirectHit).sort((a, b) => b.score - a.score)
+		// Separate direct hits and related, sort each by score, then combine.
+		// Apply per-file count limit + line-range overlap dedup to directs.
+		// Without a per-file cap, popular files (e.g., GameManager with 3+
+		// blocks) consume too many direct slots, reducing file diversity.
+		const directsSorted = allResults.filter((r) => r.isDirectHit).sort((a, b) => b.score - a.score)
+		const directFileCount = new Map<string, number>()
+		const directRanges = new Map<string, Array<{ start: number; end: number }>>()
+		const directs: ExpandedSearchResult[] = []
+		const maxDPF = this.config.maxDirectPerFile
+		for (const r of directsSorted) {
+			const fp = (r.payload.filePath as string) || ""
+			const count = directFileCount.get(fp) || 0
+			if (count >= maxDPF) continue
+
+			const start = (r.payload.startLine as number) || 0
+			const end = (r.payload.endLine as number) || 0
+			const accepted = directRanges.get(fp) || []
+			if (start > 0 && end > 0 && GraphExpander.hasSignificantOverlap(start, end, accepted)) {
+				continue
+			}
+			directs.push(r)
+			directFileCount.set(fp, count + 1)
+			if (start > 0 && end > 0) {
+				accepted.push({ start, end })
+				directRanges.set(fp, accepted)
+			}
+		}
 		const relatedSorted = allResults.filter((r) => !r.isDirectHit).sort((a, b) => b.score - a.score)
 
-		// Per-file dedup: limit related blocks per file to avoid one file
-		// dominating Related results (e.g., InventoryManager calledBy ×5)
+		// Per-file dedup + line-range overlap dedup: limit related blocks per
+		// file AND skip blocks whose line range overlaps >50% with an already-
+		// accepted block from the same file.
 		const maxPerFile = this.config.maxRelatedPerFile
 		const fileCount = new Map<string, number>()
+		const fileRanges = new Map<string, Array<{ start: number; end: number }>>()
 		const related: ExpandedSearchResult[] = []
 		for (const r of relatedSorted) {
 			const fp = (r.payload.filePath as string) || ""
 			const count = fileCount.get(fp) || 0
-			if (count < maxPerFile) {
-				related.push(r)
-				fileCount.set(fp, count + 1)
+			if (count >= maxPerFile) continue
+
+			// Line-range overlap check
+			const start = (r.payload.startLine as number) || 0
+			const end = (r.payload.endLine as number) || 0
+			const accepted = fileRanges.get(fp) || []
+			if (start > 0 && end > 0 && GraphExpander.hasSignificantOverlap(start, end, accepted)) {
+				continue
+			}
+
+			related.push(r)
+			fileCount.set(fp, count + 1)
+			if (start > 0 && end > 0) {
+				accepted.push({ start, end })
+				fileRanges.set(fp, accepted)
 			}
 		}
 
@@ -443,6 +484,30 @@ export class GraphExpander {
 		// Phase 1: Pure semantic relevance (vector similarity + path match)
 		// PageRank/refDensity are applied later in the reranking phase
 		return vectorScore + pathBoost
+	}
+
+	/**
+	 * Check if a line range [start, end] overlaps >50% with any accepted range.
+	 * Used to avoid returning near-duplicate code blocks from the same file.
+	 */
+	static hasSignificantOverlap(
+		start: number,
+		end: number,
+		accepted: Array<{ start: number; end: number }>,
+		threshold = 0.5,
+	): boolean {
+		const len = end - start + 1
+		for (const a of accepted) {
+			const overlapStart = Math.max(start, a.start)
+			const overlapEnd = Math.min(end, a.end)
+			if (overlapEnd < overlapStart) continue
+			const overlapLen = overlapEnd - overlapStart + 1
+			const minLen = Math.min(len, a.end - a.start + 1)
+			if (minLen > 0 && overlapLen / minLen > threshold) {
+				return true
+			}
+		}
+		return false
 	}
 
 	/**

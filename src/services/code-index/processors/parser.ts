@@ -443,13 +443,26 @@ export class CodeParser implements ICodeParser {
 					),
 				]
 
-				const blockRefs = [
-					...new Set(
-						tagResult.tags
-							.filter((t) => t.kind === "ref" && t.line >= block.start_line && t.line <= block.end_line)
-							.map((t) => t.name),
-					),
-				]
+				const refSet = new Set(
+					tagResult.tags
+						.filter((t) => t.kind === "ref" && t.line >= block.start_line && t.line <= block.end_line)
+						.map((t) => t.name),
+				)
+
+				// Add import symbols as refs to the block that covers the import
+				// line, or to the first block as fallback. This creates PageRank
+				// edges for import/using dependencies (especially valuable for
+				// TS/JS where imports name specific symbols like class names).
+				for (const imp of tagResult.imports) {
+					if (imp.line >= block.start_line && imp.line <= block.end_line) {
+						refSet.add(imp.symbol)
+					} else if (block === blocks[0] && imp.line < block.start_line) {
+						// Import is above the first block (common: imports at top of file)
+						refSet.add(imp.symbol)
+					}
+				}
+
+				const blockRefs = [...refSet]
 
 				const lineCount = block.end_line - block.start_line + 1
 				const refDensity = lineCount > 0 ? blockRefs.length / lineCount : 0

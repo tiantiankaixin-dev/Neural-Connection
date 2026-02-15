@@ -278,7 +278,7 @@ describe("GraphExpander", () => {
 	 * Phase 2 (reranking — reference density boost):
 	 *   pr = payload.pageRank || 0
 	 *   rd = min(payload.refDensity || 0, 2) / 2
-	 *   finalScore = phase1 * (1 + dw.pageRank(0.2) * pr + dw.refDensity(0.1) * rd)
+	 *   finalScore = phase1 * (1 + dw.pageRank(0.5) * pr + dw.refDensity(0.1) * rd)
 	 */
 	describe("scoring — exact formula verification", () => {
 		// Helper: compute expected score manually using the two-phase formula
@@ -295,7 +295,7 @@ describe("GraphExpander", () => {
 				extends: 0.5,
 			}
 			const w = { vectorSim: 0.4, relation: 0.25 }
-			const dw = { pageRank: 0.2, refDensity: 0.1 }
+			const dw = { pageRank: 0.5, refDensity: 0.1 }
 			const vectorSim = parentVectorScore * 0.8
 			const relationWeight = RELATION_WEIGHTS_MAP[relationType]
 			const pr = pageRank
@@ -341,8 +341,8 @@ describe("GraphExpander", () => {
 			const expected = expectedScore(parentScore, "calls", pr, rd)
 			expect(target.score).toBeCloseTo(expected, 10)
 			// Phase 1: 0.4*(0.9*0.8) + 0.25*1.0 = 0.288 + 0.25 = 0.538
-			// Phase 2: 0.538 * (1 + 0.2*0.6 + 0.1*0.2) = 0.538 * 1.14 = 0.61332
-			expect(target.score).toBeCloseTo(0.61332, 10)
+			// Phase 2: 0.538 * (1 + 0.5*0.6 + 0.1*0.2) = 0.538 * 1.32 = 0.71016
+			expect(target.score).toBeCloseTo(0.71016, 10)
 		})
 
 		it("should compute exact score for 'calledBy' relation type", async () => {
@@ -380,8 +380,8 @@ describe("GraphExpander", () => {
 			const expected = expectedScore(parentScore, "calledBy", pr, rd)
 			expect(caller.score).toBeCloseTo(expected, 10)
 			// Phase 1: 0.4*(0.85*0.8) + 0.25*0.9 = 0.272 + 0.225 = 0.497
-			// Phase 2: 0.497 * (1 + 0.2*0.3 + 0.1*0.5) = 0.497 * 1.11 = 0.55167
-			expect(caller.score).toBeCloseTo(0.55167, 10)
+			// Phase 2: 0.497 * (1 + 0.5*0.3 + 0.1*0.5) = 0.497 * 1.2 = 0.5964
+			expect(caller.score).toBeCloseTo(0.5964, 10)
 		})
 
 		it("should compute exact score for 'sameClass' relation type", async () => {
@@ -466,8 +466,8 @@ describe("GraphExpander", () => {
 			const expected = expectedScore(parentScore, "extends", pr, rd)
 			expect(parentBlock.score).toBeCloseTo(expected, 10)
 			// Phase 1: 0.4*(0.8*0.8) + 0.25*0.5 = 0.256 + 0.125 = 0.381
-			// Phase 2: 0.381 * (1 + 0.2*1.0 + 0.1*0.4) = 0.381 * 1.24 = 0.47244
-			expect(parentBlock.score).toBeCloseTo(0.47244, 10)
+			// Phase 2: 0.381 * (1 + 0.5*1.0 + 0.1*0.4) = 0.381 * 1.54 = 0.58674
+			expect(parentBlock.score).toBeCloseTo(0.58674, 10)
 		})
 
 		it("should cap refDensity at 2.0 before normalizing", async () => {
@@ -748,7 +748,7 @@ describe("GraphExpander", () => {
 				},
 			])
 
-			// Score with default directWeights (pageRank=0.2)
+			// Score with default directWeights (pageRank=0.5)
 			const r1 = await expander.expand(hits)
 			const score1 = r1.find((r) => r.id === "target")!.score
 
@@ -1103,8 +1103,250 @@ describe("GraphExpander", () => {
 			expect(extResult).toBeDefined()
 			expect(extResult!.relationType).toBe("keywordMatch")
 			// Base score = 0.65 * 0.9 = 0.585, then Phase 2 reranking applies
-			// Phase 2: 0.585 * (1 + 0.2*0.5 + 0.1*(0.3/2)) = 0.585 * 1.115 = 0.652275
-			expect(extResult!.score).toBeCloseTo(0.585 * (1 + 0.2 * 0.5 + 0.1 * (Math.min(0.3, 2) / 2)), 5)
+			// Phase 2: 0.585 * (1 + 0.5*0.5 + 0.1*(0.3/2)) = 0.585 * 1.265 = 0.740025
+			expect(extResult!.score).toBeCloseTo(0.585 * (1 + 0.5 * 0.5 + 0.1 * (Math.min(0.3, 2) / 2)), 5)
+		})
+	})
+
+	describe("hasSignificantOverlap", () => {
+		it("should return false for empty accepted list", () => {
+			expect(GraphExpander.hasSignificantOverlap(1, 10, [])).toBe(false)
+		})
+
+		it("should return false for non-overlapping ranges", () => {
+			const accepted = [{ start: 1, end: 10 }]
+			expect(GraphExpander.hasSignificantOverlap(20, 30, accepted)).toBe(false)
+		})
+
+		it("should return true for identical ranges", () => {
+			const accepted = [{ start: 1, end: 10 }]
+			expect(GraphExpander.hasSignificantOverlap(1, 10, accepted)).toBe(true)
+		})
+
+		it("should return true for >50% overlap", () => {
+			// accepted: 1-10 (10 lines), candidate: 5-14 (10 lines), overlap: 5-10 (6 lines) = 60%
+			const accepted = [{ start: 1, end: 10 }]
+			expect(GraphExpander.hasSignificantOverlap(5, 14, accepted)).toBe(true)
+		})
+
+		it("should return false for <50% overlap", () => {
+			// accepted: 1-10 (10 lines), candidate: 8-20 (13 lines), overlap: 8-10 (3 lines) = 3/10 = 30%
+			const accepted = [{ start: 1, end: 10 }]
+			expect(GraphExpander.hasSignificantOverlap(8, 20, accepted)).toBe(false)
+		})
+
+		it("should return true when subset of accepted range", () => {
+			// accepted: 1-20, candidate: 5-10 — candidate is fully inside, 6/6 = 100%
+			const accepted = [{ start: 1, end: 20 }]
+			expect(GraphExpander.hasSignificantOverlap(5, 10, accepted)).toBe(true)
+		})
+
+		it("should check against multiple accepted ranges", () => {
+			const accepted = [
+				{ start: 1, end: 10 },
+				{ start: 50, end: 60 },
+			]
+			// No overlap with first, but overlaps with second
+			expect(GraphExpander.hasSignificantOverlap(55, 65, accepted)).toBe(true)
+			// No overlap with either
+			expect(GraphExpander.hasSignificantOverlap(25, 35, accepted)).toBe(false)
+		})
+
+		it("should respect custom threshold", () => {
+			// accepted: 1-10, candidate: 7-16 — overlap: 7-10 (4 lines), minLen=10, ratio=0.4
+			const accepted = [{ start: 1, end: 10 }]
+			// Default threshold 0.5 → false
+			expect(GraphExpander.hasSignificantOverlap(7, 16, accepted)).toBe(false)
+			// Custom threshold 0.3 → true
+			expect(GraphExpander.hasSignificantOverlap(7, 16, accepted, 0.3)).toBe(true)
+		})
+	})
+
+	describe("expand() - line-range overlap dedup", () => {
+		it("should dedup overlapping related blocks from the same file", async () => {
+			const hits = [
+				makeHit("direct-1", 0.9, {
+					filePath: "a.ts",
+					codeChunk: "code",
+					startLine: 1,
+					endLine: 5,
+					defines: ["foo"],
+					refs: [],
+				}),
+			]
+
+			// Two related blocks from same file with overlapping line ranges
+			mockQdrant.findBlocksByRefs.mockResolvedValue([
+				{
+					id: "rel-1",
+					payload: {
+						filePath: "b.ts",
+						codeChunk: "block1",
+						startLine: 10,
+						endLine: 25,
+						pageRank: 0.1,
+						refDensity: 0,
+					},
+				},
+				{
+					id: "rel-2",
+					payload: {
+						filePath: "b.ts",
+						codeChunk: "block2",
+						startLine: 12,
+						endLine: 27,
+						pageRank: 0.1,
+						refDensity: 0,
+					},
+				},
+			])
+
+			const results = await expander.expand(hits)
+
+			// rel-2 overlaps >50% with rel-1 (lines 12-25 out of 12-27, 14/16 = 87%)
+			// so only rel-1 (higher score due to sorted order) should survive
+			const relatedFromB = results.filter((r) => !r.isDirectHit && r.payload.filePath === "b.ts")
+			expect(relatedFromB.length).toBe(1)
+			expect(relatedFromB[0].id).toBe("rel-1")
+		})
+
+		it("should dedup overlapping direct hit blocks from the same file", async () => {
+			const hits = [
+				makeHit("d1", 0.9, {
+					filePath: "a.ts",
+					codeChunk: "block1",
+					startLine: 1,
+					endLine: 20,
+					defines: [],
+					refs: [],
+				}),
+				makeHit("d2", 0.85, {
+					filePath: "a.ts",
+					codeChunk: "block2",
+					startLine: 3,
+					endLine: 22,
+					defines: [],
+					refs: [],
+				}),
+			]
+
+			const results = await expander.expand(hits)
+
+			// d2 (3-22) overlaps heavily with d1 (1-20): overlap 3-20 = 18 lines, min len = 20, 90%
+			const directsFromA = results.filter((r) => r.isDirectHit && r.payload.filePath === "a.ts")
+			expect(directsFromA.length).toBe(1)
+			expect(directsFromA[0].id).toBe("d1")
+		})
+
+		it("should keep non-overlapping blocks from the same file", async () => {
+			const hits = [
+				makeHit("d1", 0.9, {
+					filePath: "a.ts",
+					codeChunk: "block1",
+					startLine: 1,
+					endLine: 20,
+					defines: [],
+					refs: [],
+				}),
+				makeHit("d2", 0.85, {
+					filePath: "a.ts",
+					codeChunk: "block2",
+					startLine: 50,
+					endLine: 70,
+					defines: [],
+					refs: [],
+				}),
+			]
+
+			const results = await expander.expand(hits)
+
+			const directsFromA = results.filter((r) => r.isDirectHit && r.payload.filePath === "a.ts")
+			expect(directsFromA.length).toBe(2)
+		})
+	})
+
+	describe("maxDirectPerFile", () => {
+		it("should cap direct hit blocks per file at maxDirectPerFile=2", async () => {
+			const hits = [
+				makeHit("d1", 0.95, {
+					filePath: "GameManager.ts",
+					codeChunk: "block1",
+					startLine: 1,
+					endLine: 30,
+					defines: ["GameManager"],
+					refs: [],
+				}),
+				makeHit("d2", 0.9, {
+					filePath: "GameManager.ts",
+					codeChunk: "block2",
+					startLine: 40,
+					endLine: 70,
+					defines: ["ChangeState"],
+					refs: [],
+				}),
+				makeHit("d3", 0.85, {
+					filePath: "GameManager.ts",
+					codeChunk: "block3",
+					startLine: 80,
+					endLine: 110,
+					defines: ["TogglePause"],
+					refs: [],
+				}),
+				makeHit("d4", 0.8, {
+					filePath: "Other.ts",
+					codeChunk: "other",
+					startLine: 1,
+					endLine: 20,
+					defines: ["Other"],
+					refs: [],
+				}),
+			]
+
+			const results = await expander.expand(hits)
+
+			const directsFromGM = results.filter((r) => r.isDirectHit && r.payload.filePath === "GameManager.ts")
+			const directsFromOther = results.filter((r) => r.isDirectHit && r.payload.filePath === "Other.ts")
+			// maxDirectPerFile=2 should cap GameManager at 2 blocks
+			expect(directsFromGM.length).toBe(2)
+			// Other.ts should still appear (not squeezed out)
+			expect(directsFromOther.length).toBe(1)
+		})
+
+		it("should keep highest-scored blocks when per-file limit applies", async () => {
+			const hits = [
+				makeHit("d1", 0.95, {
+					filePath: "a.ts",
+					codeChunk: "best",
+					startLine: 1,
+					endLine: 20,
+					defines: [],
+					refs: [],
+				}),
+				makeHit("d2", 0.7, {
+					filePath: "a.ts",
+					codeChunk: "mid",
+					startLine: 30,
+					endLine: 50,
+					defines: [],
+					refs: [],
+				}),
+				makeHit("d3", 0.6, {
+					filePath: "a.ts",
+					codeChunk: "low",
+					startLine: 60,
+					endLine: 80,
+					defines: [],
+					refs: [],
+				}),
+			]
+
+			const results = await expander.expand(hits)
+
+			const directsFromA = results.filter((r) => r.isDirectHit && r.payload.filePath === "a.ts")
+			expect(directsFromA.length).toBe(2)
+			// Should keep the top 2 by score
+			expect(directsFromA[0].payload.codeChunk).toBe("best")
+			expect(directsFromA[1].payload.codeChunk).toBe("mid")
 		})
 	})
 })

@@ -304,6 +304,164 @@ from typing import List, Dict`
 		})
 	})
 
+	// ─── C# ───
+
+	describe("C#", () => {
+		let csParser: any
+		let csLanguage: any
+
+		beforeAll(async () => {
+			try {
+				csLanguage = await loadLang("c_sharp")
+				csParser = await makeParser(csLanguage)
+			} catch {
+				// wasm file might not exist in test env
+			}
+		})
+
+		it("should extract class definitions and method definitions from C# code", () => {
+			if (!csParser) return
+			const code = `public class GameManager : Singleton<GameManager>
+{
+    protected override void OnSingletonAwake()
+    {
+        GameEvents.OnPlayerDied += HandlePlayerDied;
+    }
+
+    public void ChangeState(GameState newState)
+    {
+        GameEvents.TriggerGameStateChanged(newState);
+    }
+
+    private void HandlePlayerDied()
+    {
+        ChangeState(GameState.GameOver);
+    }
+}`
+			const result = extractor.extract("/test/GameManager.cs", code, csParser, csLanguage)
+
+			const defs = result.tags.filter((t) => t.kind === "def")
+			const defNames = defs.map((t) => t.name)
+			expect(defNames).toContain("GameManager")
+			expect(defNames).toContain("OnSingletonAwake")
+			expect(defNames).toContain("ChangeState")
+			expect(defNames).toContain("HandlePlayerDied")
+		})
+
+		it("should capture static class access as refs in member_access_expression", () => {
+			if (!csParser) return
+			const code = `public class AudioManager : Singleton<AudioManager>
+{
+    protected override void OnSingletonAwake()
+    {
+        GameEvents.OnPlaySFX += PlaySFX;
+        GameEvents.OnPlayMusic += PlayMusic;
+    }
+
+    private void LoadVolumeSettings()
+    {
+        masterVolume = SaveSystem.LoadPrefFloat(Constants.PREF_MASTER_VOLUME, 1f);
+    }
+
+    public void SetMusicVolume(float volume)
+    {
+        SaveSystem.SavePref(Constants.PREF_MUSIC_VOLUME, volume);
+    }
+}`
+			const result = extractor.extract("/test/AudioManager.cs", code, csParser, csLanguage)
+
+			const refs = result.tags.filter((t) => t.kind === "ref")
+			const refNames = refs.map((t) => t.name)
+
+			// Static class access patterns: ClassName.Method/Property
+			// These are critical for PageRank edges in Singleton-pattern C# projects
+			expect(refNames).toContain("GameEvents")
+			expect(refNames).toContain("SaveSystem")
+			expect(refNames).toContain("Constants")
+		})
+
+		it("should capture Singleton.Instance access pattern as ref", () => {
+			if (!csParser) return
+			const code = `public class PlayerInteraction : MonoBehaviour
+{
+    private void HandleItemPickup()
+    {
+        if (InventoryManager.Instance != null && InventoryManager.Instance.AddItem(item, 1))
+        {
+            GameEvents.TriggerPlaySFX("ItemPickup");
+            Destroy(gameObject);
+        }
+    }
+
+    public void HandlePause()
+    {
+        GameManager.Instance.TogglePause();
+    }
+}`
+			const result = extractor.extract("/test/PlayerInteraction.cs", code, csParser, csLanguage)
+
+			const refs = result.tags.filter((t) => t.kind === "ref")
+			const refNames = refs.map((t) => t.name)
+
+			// ClassName.Instance access — the class name must be captured as ref
+			expect(refNames).toContain("InventoryManager")
+			expect(refNames).toContain("GameManager")
+			expect(refNames).toContain("GameEvents")
+		})
+
+		it("should NOT capture lowercase/underscore identifiers in member_access_expression", () => {
+			if (!csParser) return
+			const code = `public class PlayerCamera : MonoBehaviour
+{
+    private AudioSource _musicSource;
+    private Transform _playerModel;
+
+    private void Update()
+    {
+        float vol = _musicSource.volume;
+        Vector3 pos = transform.position;
+        canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+        _playerModel.gameObject.SetActive(true);
+        Debug.Log("test");
+        GameManager.Instance.ChangeState(GameState.Playing);
+        SaveSystem.SavePref("key", 1f);
+    }
+}`
+			const result = extractor.extract("/test/PlayerCamera.cs", code, csParser, csLanguage)
+
+			const refs = result.tags.filter((t) => t.kind === "ref")
+			const refNames = refs.map((t) => t.name)
+
+			// PascalCase class names MUST be captured
+			expect(refNames).toContain("GameManager")
+			expect(refNames).toContain("SaveSystem")
+			expect(refNames).toContain("GameState")
+			expect(refNames).toContain("RenderMode")
+			expect(refNames).toContain("Debug")
+
+			// Lowercase / underscore identifiers must NOT be captured as class refs
+			expect(refNames).not.toContain("_musicSource")
+			expect(refNames).not.toContain("transform")
+			expect(refNames).not.toContain("canvas")
+			expect(refNames).not.toContain("_playerModel")
+			expect(refNames).not.toContain("vol")
+		})
+
+		it("should extract class extends from base_list", () => {
+			if (!csParser) return
+			const code = `public class UIManager : Singleton<UIManager>
+{
+    private void HandleGameStateChanged(GameState newState) { }
+}`
+			const result = extractor.extract("/test/UIManager.cs", code, csParser, csLanguage)
+
+			expect(result.classDeclarations.length).toBeGreaterThanOrEqual(1)
+			const uiClass = result.classDeclarations.find((c) => c.name === "UIManager")
+			expect(uiClass).toBeDefined()
+			expect(uiClass!.extends).toBe("Singleton")
+		})
+	})
+
 	// ─── Cross-language: tags query compilation smoke test ───
 
 	describe("tags query compilation", () => {
