@@ -1,6 +1,7 @@
 import * as vscode from "vscode"
 import { ContextProxy } from "../../core/config/ContextProxy"
 import { VectorStoreSearchResult } from "./interfaces"
+import { SearchTuningConfig } from "./search-config"
 import { IndexingState } from "./interfaces/manager"
 import { CodeIndexConfigManager } from "./config-manager"
 import { CodeIndexStateManager } from "./state-manager"
@@ -276,12 +277,16 @@ export class CodeIndexManager {
 		}
 	}
 
-	public async searchIndex(query: string, directoryPrefix?: string): Promise<VectorStoreSearchResult[]> {
+	public async searchIndex(
+		query: string,
+		directoryPrefix?: string,
+		tuning?: SearchTuningConfig,
+	): Promise<VectorStoreSearchResult[]> {
 		if (!this.isFeatureEnabled) {
 			return []
 		}
 		this.assertInitialized()
-		return this._searchService!.searchIndex(query, directoryPrefix)
+		return this._searchService!.searchIndex(query, directoryPrefix, tuning)
 	}
 
 	/**

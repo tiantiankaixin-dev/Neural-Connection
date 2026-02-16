@@ -708,9 +708,13 @@ export async function presentAssistantMessage(cline: Task) {
 			}
 
 			// Progressive tool disclosure: intercept calls to stripped tools
-			if (block.name && isStrippedTool(block.name, cline.discoveredTools)) {
-				cline.discoveredTools.add(block.name)
-				const schemaText = getFullToolSchemaText(block.name)
+			// Use originalName (the schema/alias name the model actually called) for progressive
+			// disclosure checks, since the schema cache and PRIORITIZED_TOOLS use schema names
+			// (e.g., "codebase_search_broad"), not canonical names (e.g., "codebase_search").
+			const disclosureName = block.originalName ?? block.name
+			if (disclosureName && isStrippedTool(disclosureName, cline.discoveredTools)) {
+				cline.discoveredTools.add(disclosureName)
+				const schemaText = getFullToolSchemaText(disclosureName)
 				pushToolResult(schemaText)
 				break
 			}

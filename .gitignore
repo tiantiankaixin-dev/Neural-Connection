@@ -56,3 +56,7 @@ plans/
 
 roo-cli-*.tar.gz*
 testgame/
+
+# TypeScript compilation output in src/
+src/**/*.js
+src/**/*.js.map

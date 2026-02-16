@@ -353,6 +353,8 @@ export const ALWAYS_AVAILABLE_TOOLS: ToolName[] = [
 export const TOOL_ALIASES: Record<string, ToolName> = {
 	write_file: "write_to_file",
 	search_and_replace: "edit",
+	codebase_search_precise: "codebase_search",
+	codebase_search_broad: "codebase_search",
 } as const
 
 export type DiffResult =

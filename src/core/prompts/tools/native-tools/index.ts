@@ -5,7 +5,7 @@ import applyPatch from "./apply_patch"
 import askFollowupQuestion from "./ask_followup_question"
 import attemptCompletion from "./attempt_completion"
 import browserAction from "./browser_action"
-import codebaseSearch from "./codebase_search"
+import { codebaseSearchPrecise, codebaseSearchBroad } from "./codebase_search"
 import editTool from "./edit"
 import executeCommand from "./execute_command"
 import generateImage from "./generate_image"
@@ -48,7 +48,8 @@ export function getNativeTools(options: NativeToolsOptions = {}): OpenAI.Chat.Ch
 	}
 
 	return [
-		codebaseSearch, // RAG semantic search - placed first for model primacy bias
+		codebaseSearchBroad, // RAG semantic search (broad) - placed first for model primacy bias
+		codebaseSearchPrecise, // RAG semantic search (precise)
 		accessMcpResource,
 		apply_diff,
 		applyPatch,

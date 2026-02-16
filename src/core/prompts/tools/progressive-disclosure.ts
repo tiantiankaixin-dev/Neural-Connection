@@ -16,7 +16,8 @@ import type OpenAI from "openai"
 // Tools that are ALWAYS fully exposed with enhanced descriptions
 // Includes codebase_search (RAG priority) + essential conversation tools
 const PRIORITIZED_TOOLS = new Set([
-	"codebase_search",
+	"codebase_search_broad",
+	"codebase_search_precise",
 	"attempt_completion",
 	"ask_followup_question",
 	"update_todo_list",

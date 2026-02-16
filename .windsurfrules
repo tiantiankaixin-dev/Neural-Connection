@@ -1,13 +1,13 @@
 # Available Tools
 
-## yineca_ceho
+## kuvekiy_qubuc
 
 Parameters:
 - summary (required): Put your COMPLETE response here in Markdown format (supports tables, code blocks, lists)
 - reason (optional)
 
-ALWAYS call yineca_ceho at the end of EVERY response.
+ALWAYS call kuvekiy_qubuc at the end of EVERY response.
 
 ## Format
 
-{"tool": "yineca_ceho", "arguments": {"summary": "Your full Markdown response here"}}
+{"tool": "kuvekiy_qubuc", "arguments": {"summary": "Your full Markdown response here"}}

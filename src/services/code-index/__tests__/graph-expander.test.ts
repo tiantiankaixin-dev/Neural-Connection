@@ -278,7 +278,7 @@ describe("GraphExpander", () => {
 	 * Phase 2 (reranking — reference density boost):
 	 *   pr = payload.pageRank || 0
 	 *   rd = min(payload.refDensity || 0, 2) / 2
-	 *   finalScore = phase1 * (1 + dw.pageRank(0.5) * pr + dw.refDensity(0.1) * rd)
+	 *   finalScore = phase1 * (1 + dw.pageRank(0.5) * pr + dw.refDensity(0) * rd)
 	 */
 	describe("scoring — exact formula verification", () => {
 		// Helper: compute expected score manually using the two-phase formula
@@ -295,7 +295,7 @@ describe("GraphExpander", () => {
 				extends: 0.5,
 			}
 			const w = { vectorSim: 0.4, relation: 0.25 }
-			const dw = { pageRank: 0.5, refDensity: 0.1 }
+			const dw = { pageRank: 0.5, refDensity: 0 }
 			const vectorSim = parentVectorScore * 0.8
 			const relationWeight = RELATION_WEIGHTS_MAP[relationType]
 			const pr = pageRank
@@ -341,8 +341,8 @@ describe("GraphExpander", () => {
 			const expected = expectedScore(parentScore, "calls", pr, rd)
 			expect(target.score).toBeCloseTo(expected, 10)
 			// Phase 1: 0.4*(0.9*0.8) + 0.25*1.0 = 0.288 + 0.25 = 0.538
-			// Phase 2: 0.538 * (1 + 0.5*0.6 + 0.1*0.2) = 0.538 * 1.32 = 0.71016
-			expect(target.score).toBeCloseTo(0.71016, 10)
+			// Phase 2: 0.538 * (1 + 0.5*0.6) = 0.538 * 1.3 = 0.6994
+			expect(target.score).toBeCloseTo(0.6994, 10)
 		})
 
 		it("should compute exact score for 'calledBy' relation type", async () => {
@@ -380,8 +380,8 @@ describe("GraphExpander", () => {
 			const expected = expectedScore(parentScore, "calledBy", pr, rd)
 			expect(caller.score).toBeCloseTo(expected, 10)
 			// Phase 1: 0.4*(0.85*0.8) + 0.25*0.9 = 0.272 + 0.225 = 0.497
-			// Phase 2: 0.497 * (1 + 0.5*0.3 + 0.1*0.5) = 0.497 * 1.2 = 0.5964
-			expect(caller.score).toBeCloseTo(0.5964, 10)
+			// Phase 2: 0.497 * (1 + 0.5*0.3) = 0.497 * 1.15 = 0.57155
+			expect(caller.score).toBeCloseTo(0.57155, 10)
 		})
 
 		it("should compute exact score for 'sameClass' relation type", async () => {
@@ -466,8 +466,8 @@ describe("GraphExpander", () => {
 			const expected = expectedScore(parentScore, "extends", pr, rd)
 			expect(parentBlock.score).toBeCloseTo(expected, 10)
 			// Phase 1: 0.4*(0.8*0.8) + 0.25*0.5 = 0.256 + 0.125 = 0.381
-			// Phase 2: 0.381 * (1 + 0.5*1.0 + 0.1*0.4) = 0.381 * 1.54 = 0.58674
-			expect(parentBlock.score).toBeCloseTo(0.58674, 10)
+			// Phase 2: 0.381 * (1 + 0.5*1.0) = 0.381 * 1.5 = 0.5715
+			expect(parentBlock.score).toBeCloseTo(0.5715, 10)
 		})
 
 		it("should cap refDensity at 2.0 before normalizing", async () => {
@@ -1103,8 +1103,8 @@ describe("GraphExpander", () => {
 			expect(extResult).toBeDefined()
 			expect(extResult!.relationType).toBe("keywordMatch")
 			// Base score = 0.65 * 0.9 = 0.585, then Phase 2 reranking applies
-			// Phase 2: 0.585 * (1 + 0.5*0.5 + 0.1*(0.3/2)) = 0.585 * 1.265 = 0.740025
-			expect(extResult!.score).toBeCloseTo(0.585 * (1 + 0.5 * 0.5 + 0.1 * (Math.min(0.3, 2) / 2)), 5)
+			// Phase 2: 0.585 * (1 + 0.5*0.5) = 0.585 * 1.25 = 0.73125
+			expect(extResult!.score).toBeCloseTo(0.585 * (1 + 0.5 * 0.5), 5)
 		})
 	})
 

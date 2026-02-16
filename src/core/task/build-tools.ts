@@ -9,11 +9,7 @@ import type { ClineProvider } from "../webview/ClineProvider"
 import { getRooDirectoriesForCwd } from "../../services/roo-config/index.js"
 
 import { getNativeTools, getMcpServerTools } from "../prompts/tools/native-tools"
-import {
-	filterNativeToolsForMode,
-	filterMcpToolsForMode,
-	resolveToolAlias,
-} from "../prompts/tools/filter-tools-for-mode"
+import { filterNativeToolsForMode, filterMcpToolsForMode } from "../prompts/tools/filter-tools-for-mode"
 import { applyProgressiveDisclosure } from "../prompts/tools/progressive-disclosure"
 
 interface BuildToolsOptions {
@@ -108,7 +104,6 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 	const { CodeIndexManager } = await import("../../services/code-index/manager")
 	const codeIndexManager = CodeIndexManager.getInstance(provider.context, cwd)
 
-
 	// Build settings object for tool filtering.
 	const filterSettings = {
 		todoListEnabled: apiConfiguration?.todoListEnabled ?? true,
@@ -156,7 +151,6 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 	// Combine filtered tools (for backward compatibility and for allowedFunctionNames)
 	const filteredTools = [...filteredNativeTools, ...filteredMcpTools, ...nativeCustomTools]
 
-
 	// If includeAllToolsWithRestrictions is true, return ALL tools but provide
 	// allowed names based on mode filtering
 	if (includeAllToolsWithRestrictions) {
@@ -164,10 +158,9 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 		const allTools = [...nativeTools, ...mcpTools, ...nativeCustomTools]
 
 		// Extract names of tools that are allowed based on mode filtering.
-		// Resolve any alias names to canonical names to ensure consistency with allTools
-		// (which uses canonical names). This prevents Gemini errors when tools are renamed
-		// to aliases in filteredTools but allTools contains the original canonical names.
-		const allowedFunctionNames = filteredTools.map((tool) => resolveToolAlias(getToolName(tool)))
+		// Use the actual schema name (which may be an alias like "codebase_search_broad")
+		// so it matches the tool definitions in allTools.
+		const allowedFunctionNames = filteredTools.map((tool) => getToolName(tool))
 
 		return {
 			tools: allTools,

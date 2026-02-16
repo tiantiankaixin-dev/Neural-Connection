@@ -167,5 +167,18 @@ describe("sparse-embedding", () => {
 			expect(sv1.indices).toEqual(sv2.indices)
 			expect(sv1.values).toEqual(sv2.values)
 		})
+
+		it("should produce empty vector for pure non-Latin queries (Chinese)", () => {
+			// Pure Chinese queries have no Latin identifiers and would cause
+			// RRF score compression if they produced non-empty sparse vectors
+			const sv = generateQuerySparseEmbedding("项目 架构 设计")
+			expect(sv.indices.length).toBe(0)
+		})
+
+		it("should produce non-empty vector for mixed Chinese+English queries", () => {
+			// Mixed queries should still capture the Latin identifiers
+			const sv = generateQuerySparseEmbedding("GameManager 类 定义")
+			expect(sv.indices.length).toBeGreaterThan(0)
+		})
 	})
 })

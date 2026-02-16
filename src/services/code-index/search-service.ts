@@ -6,6 +6,7 @@ import { CodeIndexConfigManager } from "./config-manager"
 import { CodeIndexStateManager } from "./state-manager"
 import { GraphExpander, ExpandedSearchResult } from "./graph-expander"
 import { generateQuerySparseEmbedding } from "./shared/sparse-embedding"
+import { SearchTuningConfig } from "./search-config"
 import { TelemetryService } from "@roo-code/telemetry"
 import { TelemetryEventName } from "@roo-code/types"
 
@@ -37,13 +38,17 @@ export class CodeIndexSearchService {
 	 * @returns Array of search results
 	 * @throws Error if the service is not properly configured or ready
 	 */
-	public async searchIndex(query: string, directoryPrefix?: string): Promise<VectorStoreSearchResult[]> {
+	public async searchIndex(
+		query: string,
+		directoryPrefix?: string,
+		tuning?: SearchTuningConfig,
+	): Promise<VectorStoreSearchResult[]> {
 		if (!this.configManager.isFeatureEnabled || !this.configManager.isFeatureConfigured) {
 			throw new Error("Code index feature is disabled or not configured.")
 		}
 
-		const minScore = this.configManager.currentSearchMinScore
-		const maxResults = this.configManager.currentSearchMaxResults
+		const minScore = tuning?.minScore ?? this.configManager.currentSearchMinScore
+		const maxResults = tuning?.maxVectorResults ?? this.configManager.currentSearchMaxResults
 
 		const currentState = this.stateManager.getCurrentStatus().systemStatus
 		if (currentState !== "Indexed" && currentState !== "Indexing") {
@@ -90,6 +95,7 @@ export class CodeIndexSearchService {
 
 			// Expand with code graph if available (pass query + queryVector for relation vector search)
 			if (this.graphExpander) {
+				this.graphExpander.applyTuning(tuning)
 				return await this.graphExpander.expand(results, query, vector)
 			}
 

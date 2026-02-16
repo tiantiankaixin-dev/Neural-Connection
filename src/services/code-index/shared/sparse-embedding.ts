@@ -211,11 +211,15 @@ export function generateQuerySparseEmbedding(query: string): SparseVector {
 		}
 	}
 
-	// Also add raw words (for natural language parts of query)
+	// Also add raw words (for natural language parts of query).
+	// Only include words containing Latin characters — non-Latin tokens
+	// (Chinese, Japanese, Korean) will never match indexed code identifiers
+	// and would cause RRF score compression if they make the sparse vector
+	// non-empty while producing zero matches.
 	const words = query
 		.toLowerCase()
 		.split(/\s+/)
-		.filter((w) => w.length >= 2)
+		.filter((w) => w.length >= 2 && /[a-z]/.test(w))
 	for (const word of words) {
 		addToken(word, 0.5)
 	}

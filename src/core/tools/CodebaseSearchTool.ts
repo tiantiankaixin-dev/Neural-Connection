@@ -6,7 +6,8 @@ import { CodeIndexManager } from "../../services/code-index/manager"
 import { getWorkspacePath } from "../../utils/path"
 import { formatResponse } from "../prompts/responses"
 import { VectorStoreSearchResult } from "../../services/code-index/interfaces"
-import { ExpandedSearchResult } from "../../services/code-index/graph-expander"
+import { GraphExpander, ExpandedSearchResult } from "../../services/code-index/graph-expander"
+import { SearchMode, resolveSearchConfig } from "../../services/code-index/search-config"
 import type { ToolUse } from "../../shared/tools"
 
 import { BaseTool, ToolCallbacks } from "./BaseTool"
@@ -19,9 +20,24 @@ interface CodebaseSearchParams {
 export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 	readonly name = "codebase_search" as const
 
+	/**
+	 * Mode is derived from the tool alias name (codebase_search_precise / codebase_search_broad).
+	 * Stored per-call by the overridden handle() method.
+	 */
+	private _currentMode: SearchMode = "broad"
+
+	override async handle(task: Task, block: ToolUse<"codebase_search">, callbacks: ToolCallbacks): Promise<void> {
+		// Derive mode from the original tool name (alias) chosen by the model
+		const alias = block.originalName ?? block.name
+		this._currentMode = alias === "codebase_search_precise" ? "precise" : "broad"
+		return super.handle(task, block, callbacks)
+	}
+
 	async execute(params: CodebaseSearchParams, task: Task, callbacks: ToolCallbacks): Promise<void> {
 		const { askApproval, handleError, pushToolResult } = callbacks
 		const { query: rawQuery, path: directoryPrefix } = params
+		const mode: SearchMode = this._currentMode
+		const resolved = resolveSearchConfig(mode)
 
 		const workspacePath = task.cwd && task.cwd.trim() !== "" ? task.cwd : getWorkspacePath()
 
@@ -81,7 +97,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 			// Search with each query and merge results (dedup by ID, keep highest score)
 			const mergedMap = new Map<string | number, VectorStoreSearchResult>()
 			for (const q of queries) {
-				const results = await manager.searchIndex(q, directoryPrefix)
+				const results = await manager.searchIndex(q, directoryPrefix, resolved)
 				if (results) {
 					for (const r of results) {
 						const existing = mergedMap.get(r.id)
@@ -170,14 +186,53 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 			}
 
 			// Split into direct/related, skip absorbed, sort by score descending
-			const directHits = allResults
+			const directHitsSorted = allResults
 				.map((r, i) => ({ r, i }))
 				.filter(({ r, i }) => r.isDirectHit !== false && !absorbed.has(i))
 				.sort((a, b) => b.r.score - a.r.score)
-			const relatedCode = allResults
+			const relatedCodeSorted = allResults
 				.map((r, i) => ({ r, i }))
 				.filter(({ r, i }) => r.isDirectHit === false && !absorbed.has(i))
 				.sort((a, b) => b.r.score - a.r.score)
+
+			// Global per-file limit: after merging results from multiple queries,
+			// cap blocks per file to prevent over-representation.
+			// Without this, a file matched by N queries can appear up to
+			// N * maxDirectPerFile times in the merged output.
+			const GLOBAL_MAX_DIRECT_PER_FILE = resolved.globalMaxDirectPerFile
+			const GLOBAL_MAX_RELATED_PER_FILE = resolved.globalMaxRelatedPerFile
+
+			const applyGlobalPerFileLimit = <T extends { r: EnrichedResult }>(items: T[], maxPerFile: number): T[] => {
+				const fileCount = new Map<string, number>()
+				const fileRanges = new Map<string, Array<{ start: number; end: number }>>()
+				return items.filter(({ r }) => {
+					const count = fileCount.get(r.filePath) || 0
+					if (count >= maxPerFile) return false
+
+					// Skip blocks whose line range overlaps >50% with an already-accepted
+					// block from the same file (e.g., PlayerInteraction 7-41 vs 20-45)
+					const start = r.startLine || 0
+					const end = r.endLine || 0
+					const accepted = fileRanges.get(r.filePath) || []
+					if (
+						start > 0 &&
+						end > 0 &&
+						GraphExpander.hasSignificantOverlap(start, end, accepted, resolved.overlapThreshold)
+					) {
+						return false
+					}
+
+					fileCount.set(r.filePath, count + 1)
+					if (start > 0 && end > 0) {
+						accepted.push({ start, end })
+						fileRanges.set(r.filePath, accepted)
+					}
+					return true
+				})
+			}
+
+			const directHits = applyGlobalPerFileLimit(directHitsSorted, GLOBAL_MAX_DIRECT_PER_FILE)
+			const relatedCode = applyGlobalPerFileLimit(relatedCodeSorted, GLOBAL_MAX_RELATED_PER_FILE)
 
 			// ── Format output with metadata enrichment ──
 			const formatBlock = (r: EnrichedResult, isRelated: boolean): string => {

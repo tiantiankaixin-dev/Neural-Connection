@@ -318,7 +318,10 @@ export function filterNativeToolsForMode(
 		// Handle both ChatCompletionTool and ChatCompletionCustomTool
 		if ("function" in tool && tool.function) {
 			const toolName = tool.function.name
-			if (allowedToolNames.has(toolName)) {
+			// Check both the schema name and its canonical name (for alias-based tools
+			// like codebase_search_broad -> codebase_search)
+			const canonicalName = resolveToolAlias(toolName)
+			if (allowedToolNames.has(toolName) || allowedToolNames.has(canonicalName)) {
 				// Check if this tool should be renamed to an alias
 				const aliasName = aliasRenames.get(toolName)
 				if (aliasName) {

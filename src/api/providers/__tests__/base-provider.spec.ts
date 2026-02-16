@@ -140,7 +140,7 @@ describe("BaseProvider", () => {
 			expect(result.properties.level1.properties.level2.properties.level3.additionalProperties).toBe(false)
 		})
 
-		it("should convert nullable types to non-nullable", () => {
+		it("should preserve nullable types as-is", () => {
 			const schema = {
 				type: "object",
 				properties: {
@@ -150,7 +150,28 @@ describe("BaseProvider", () => {
 
 			const result = provider.testConvertToolSchemaForOpenAI(schema)
 
-			expect(result.properties.name.type).toBe("string")
+			expect(result.properties.name.type).toEqual(["string", "null"])
+		})
+
+		it("should recursively process nullable object types", () => {
+			const schema = {
+				type: "object",
+				properties: {
+					config: {
+						type: ["object", "null"],
+						properties: {
+							value: { type: ["number", "null"] },
+						},
+					},
+				},
+			}
+
+			const result = provider.testConvertToolSchemaForOpenAI(schema)
+
+			expect(result.properties.config.type).toEqual(["object", "null"])
+			expect(result.properties.config.additionalProperties).toBe(false)
+			expect(result.properties.config.required).toEqual(["value"])
+			expect(result.properties.config.properties.value.type).toEqual(["number", "null"])
 		})
 
 		it("should return non-object schemas unchanged", () => {

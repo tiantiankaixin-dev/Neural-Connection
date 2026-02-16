@@ -54,14 +54,20 @@ export abstract class BaseProvider implements ApiHandler {
 	/**
 	 * Converts tool schemas to be compatible with OpenAI's strict mode by:
 	 * - Ensuring all properties are in the required array (strict mode requirement)
-	 * - Converting nullable types (["type", "null"]) to non-nullable ("type")
+	 * - Preserving nullable types (["type", "null"]) so the model can pass null
 	 * - Adding additionalProperties: false to all object schemas (required by OpenAI Responses API)
-	 * - Recursively processing nested objects and arrays
-	 *
-	 * This matches the behavior of ensureAllRequired in openai-native.ts
+	 * - Recursively processing nested objects and arrays (including nullable objects)
 	 */
 	protected convertToolSchemaForOpenAI(schema: any): any {
-		if (!schema || typeof schema !== "object" || schema.type !== "object") {
+		if (!schema || typeof schema !== "object") {
+			return schema
+		}
+
+		// Accept both "object" and ["object", "null"] as object schemas
+		const schemaType = schema.type
+		const isObjectType = schemaType === "object" || (Array.isArray(schemaType) && schemaType.includes("object"))
+
+		if (!isObjectType) {
 			return schema
 		}
 
@@ -78,24 +84,27 @@ export abstract class BaseProvider implements ApiHandler {
 			// OpenAI strict mode requires ALL properties to be in required array
 			result.required = allKeys
 
-			// Recursively process nested objects and convert nullable types
+			// Recursively process nested objects (preserve nullable types as-is)
 			const newProps = { ...result.properties }
 			for (const key of allKeys) {
 				const prop = newProps[key]
+				if (!prop) continue
 
-				// Handle nullable types by removing null
-				if (prop && Array.isArray(prop.type) && prop.type.includes("null")) {
-					const nonNullTypes = prop.type.filter((t: string) => t !== "null")
-					prop.type = nonNullTypes.length === 1 ? nonNullTypes[0] : nonNullTypes
-				}
+				const propType = prop.type
+				const isNestedObject = propType === "object" || (Array.isArray(propType) && propType.includes("object"))
+				const isArray = propType === "array" || (Array.isArray(propType) && propType.includes("array"))
 
-				// Recursively process nested objects
-				if (prop && prop.type === "object") {
+				if (isNestedObject) {
 					newProps[key] = this.convertToolSchemaForOpenAI(prop)
-				} else if (prop && prop.type === "array" && prop.items?.type === "object") {
-					newProps[key] = {
-						...prop,
-						items: this.convertToolSchemaForOpenAI(prop.items),
+				} else if (isArray && prop.items) {
+					const itemsType = prop.items.type
+					const isItemsObject =
+						itemsType === "object" || (Array.isArray(itemsType) && itemsType.includes("object"))
+					if (isItemsObject) {
+						newProps[key] = {
+							...prop,
+							items: this.convertToolSchemaForOpenAI(prop.items),
+						}
 					}
 				}
 			}

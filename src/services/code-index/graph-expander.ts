@@ -11,6 +11,7 @@
  */
 import { QdrantVectorStore } from "./vector-store/qdrant-client"
 import { VectorStoreSearchResult, Payload } from "./interfaces"
+import { SearchTuningConfig, resolveSearchConfig } from "./search-config"
 
 // ─── Relation type weights ───
 
@@ -47,7 +48,7 @@ export interface DirectHitWeights {
 export const DEFAULT_DIRECT_WEIGHTS: DirectHitWeights = {
 	vectorSim: 0.7,
 	pageRank: 0.5,
-	refDensity: 0.1,
+	refDensity: 0,
 }
 
 export interface GraphExpansionConfig {
@@ -84,12 +85,14 @@ export interface ExpandedSearchResult {
 
 export class GraphExpander {
 	private config: GraphExpansionConfig
+	private tuning: Required<SearchTuningConfig>
 
 	constructor(
 		private readonly qdrantClient: QdrantVectorStore,
 		config?: Partial<GraphExpansionConfig>,
 	) {
 		this.config = { ...DEFAULT_CONFIG, ...config }
+		this.tuning = resolveSearchConfig()
 	}
 
 	/**
@@ -97,6 +100,21 @@ export class GraphExpander {
 	 */
 	updateConfig(config: Partial<GraphExpansionConfig>): void {
 		this.config = { ...this.config, ...config }
+	}
+
+	/**
+	 * Apply per-search tuning overrides. Resets to RECOMMENDED_DEFAULTS
+	 * for any field not specified in `overrides`.
+	 */
+	applyTuning(overrides?: SearchTuningConfig): void {
+		this.tuning = resolveSearchConfig(undefined, overrides)
+		// Sync GraphExpansionConfig fields that overlap with tuning
+		this.config.maxDepth = this.tuning.maxDepth
+		this.config.maxResults = this.tuning.maxExpandedResults
+		this.config.maxDirectPerFile = this.tuning.maxDirectPerFile
+		this.config.maxRelatedPerFile = this.tuning.maxRelatedPerFile
+		this.config.directWeights.pageRank = this.tuning.pageRankWeight
+		this.config.directWeights.refDensity = this.tuning.refDensityWeight
 	}
 
 	/**
@@ -187,7 +205,7 @@ export class GraphExpander {
 				console.log(`[GraphExpander] Keyword supplement: identifiers=[${identifiers.join(", ")}]`)
 				let keywordAdded = 0
 
-				const KEYWORD_BASE_SCORE = 0.65
+				const KEYWORD_BASE_SCORE = this.tuning.keywordBaseScore
 
 				// Search defines for identifiers
 				const defHits = await this.qdrantClient.findBlocksByDefines(identifiers, 10)
@@ -253,8 +271,8 @@ export class GraphExpander {
 				const relationHits = await this.qdrantClient.searchRelationVectors(
 					queryVector,
 					undefined, // no directory filter
-					0.32, // lower threshold to catch relation matches after PascalCase ref filtering
-					30, // fetch more candidates, will be deduplicated and capped
+					this.tuning.relationVectorThreshold,
+					this.tuning.relationVectorLimit,
 				)
 				let relationAdded = 0
 				for (const hit of relationHits) {
@@ -475,9 +493,8 @@ export class GraphExpander {
 					matches++
 				}
 			}
-			// Up to 0.15 boost, scaled by match ratio
 			if (queryWords.length > 0) {
-				pathBoost = Math.min(matches / queryWords.length, 1) * 0.15
+				pathBoost = Math.min(matches / queryWords.length, 1) * this.tuning.pathBoostMax
 			}
 		}
 
