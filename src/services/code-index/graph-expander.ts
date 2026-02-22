@@ -390,33 +390,44 @@ export class GraphExpander {
 		const results: Array<{ id: string; payload: Payload; relationType: string }> = []
 		const payload = hit.payload
 
-		// 1. refs → find definers (what does this block call/reference?)
-		const refs = (payload.refs as string[]) || []
-		if (refs.length > 0) {
-			const definers = await this.qdrantClient.findBlocksByDefines(refs, 10)
-			for (const d of definers) {
-				if (!d.payload) continue
-				results.push({ id: String(d.id), payload: d.payload, relationType: "calls" })
-			}
-		}
+		// Collect refs from this block AND all same-class sibling blocks.
+		// Vector search may return a chunk whose refs don't cover all class dependencies
+		// (e.g., field type declarations in chunk A vs method bodies in chunk B).
+		// By gathering refs from all chunks of the same class, we ensure comprehensive
+		// relationship expansion — critical for finding files like PlayerMovement.cs
+		// when the vector-matched chunk happens to be Awake() rather than the field declarations.
+		const allRefs = new Set<string>((payload.refs as string[]) || [])
 
-		// 2. defines → find referencers (who calls/references this block?)
-		const defines = (payload.defines as string[]) || []
-		if (defines.length > 0) {
-			const referencers = await this.qdrantClient.findBlocksByRefs(defines, 10)
-			for (const r of referencers) {
-				if (!r.payload) continue
-				results.push({ id: String(r.id), payload: r.payload, relationType: "calledBy" })
-			}
-		}
-
-		// 3. className → same class methods
+		// 1. className → same class blocks (run FIRST to collect comprehensive refs)
 		const className = payload.className as string | null
 		if (className) {
 			const sameClass = await this.qdrantClient.findBlocksByClassName(className, 10)
 			for (const s of sameClass) {
 				if (!s.payload) continue
 				results.push({ id: String(s.id), payload: s.payload, relationType: "sameClass" })
+				// Merge refs from sibling blocks for comprehensive expansion
+				const siblingRefs = (s.payload.refs as string[]) || []
+				siblingRefs.forEach((r) => allRefs.add(r))
+			}
+		}
+
+		// 2. combined refs → find definers (what does this CLASS call/reference?)
+		if (allRefs.size > 0) {
+			// Higher limit (30) because merged refs from all class chunks can be large
+			const definers = await this.qdrantClient.findBlocksByDefines([...allRefs], 30)
+			for (const d of definers) {
+				if (!d.payload) continue
+				results.push({ id: String(d.id), payload: d.payload, relationType: "calls" })
+			}
+		}
+
+		// 3. defines → find referencers (who calls/references this block?)
+		const defines = (payload.defines as string[]) || []
+		if (defines.length > 0) {
+			const referencers = await this.qdrantClient.findBlocksByRefs(defines, 10)
+			for (const r of referencers) {
+				if (!r.payload) continue
+				results.push({ id: String(r.id), payload: r.payload, relationType: "calledBy" })
 			}
 		}
 

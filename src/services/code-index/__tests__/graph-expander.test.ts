@@ -927,7 +927,7 @@ describe("GraphExpander", () => {
 	})
 
 	describe("findBlocksByDefines/Refs limit parameter", () => {
-		it("should pass limit=10 for refs→definers expansion", async () => {
+		it("should pass limit=30 for refs→definers expansion", async () => {
 			const hits = [
 				makeHit("1", 0.9, {
 					filePath: "a.ts",
@@ -941,7 +941,7 @@ describe("GraphExpander", () => {
 
 			await expander.expand(hits)
 
-			expect(mockQdrant.findBlocksByDefines).toHaveBeenCalledWith(["someSymbol"], 10)
+			expect(mockQdrant.findBlocksByDefines).toHaveBeenCalledWith(["someSymbol"], 30)
 		})
 
 		it("should pass limit=10 for defines→referencers expansion", async () => {

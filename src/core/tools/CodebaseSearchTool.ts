@@ -273,11 +273,12 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 
 				// Truncate large merged blocks to prevent host-side context truncation.
 				// Show class structure (top) + recent methods (bottom) with omission marker.
-				const MAX_CODE_LINES = 120
+				// Precise mode uses a much higher budget so models rarely need read_file.
+				const MAX_CODE_LINES = mode === "precise" ? 500 : 120
 				const codeLines = r.codeChunk.split("\n")
 				if (codeLines.length > MAX_CODE_LINES) {
-					const SHOW_FIRST = 80
-					const SHOW_LAST = 20
+					const SHOW_FIRST = mode === "precise" ? 350 : 80
+					const SHOW_LAST = mode === "precise" ? 100 : 20
 					const omitted = codeLines.length - SHOW_FIRST - SHOW_LAST
 					const firstPart = codeLines.slice(0, SHOW_FIRST).join("\n")
 					const lastPart = codeLines.slice(-SHOW_LAST).join("\n")
@@ -300,7 +301,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				}
 
 				const MERGE_MIN_BLOCKS = 2
-				const MAX_GAP_FILL = Infinity // Merge all same-file blocks into complete files (truncated in formatBlock)
+				const MAX_GAP_FILL = 10 // Merge blocks within 10 lines of each other
 				const merged: EnrichedResult[] = []
 
 				for (const [, blocks] of byFile) {
@@ -323,6 +324,12 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 
 					if (!fileLines) {
 						merged.push(...blocks)
+						continue
+					}
+
+					// Single-block: no merging needed (MERGE_MIN_BLOCKS=2 prevents this path)
+					if (blocks.length === 1) {
+						merged.push(blocks[0])
 						continue
 					}
 
@@ -363,14 +370,49 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				resolved.maxTotalDirectHits,
 			)
 
+			// ── Budget-aware output assembly ──
+			// Prevents host-side truncation by enforcing a total character budget.
+			// Highest-scoring results get full content; lower ones are progressively
+			// truncated or omitted entirely when the budget runs out.
+			const TOTAL_OUTPUT_BUDGET = mode === "precise" ? 40000 : 15000
+			const RELATED_RESERVE = mode === "precise" ? 5000 : 3000
+			let remaining = TOTAL_OUTPUT_BUDGET
+
 			if (mergedDirectHits.length > 0) {
 				output += `\n=== Direct Hits ===\n\n`
-				output += mergedDirectHits.map((r) => formatBlock(r, false)).join("\n")
+				remaining -= 25 // header
+				let directSkipped = 0
+				for (const r of mergedDirectHits) {
+					const formatted = formatBlock(r, false)
+					if (formatted.length <= remaining - RELATED_RESERVE) {
+						output += formatted + "\n"
+						remaining -= formatted.length + 1
+					} else if (remaining - RELATED_RESERVE > 500) {
+						// Truncate this block to fit the remaining budget
+						const budget = remaining - RELATED_RESERVE - 100
+						output += formatted.slice(0, budget) + "\n// ... [output budget reached] ...\n\n"
+						remaining = RELATED_RESERVE
+					} else {
+						directSkipped++
+					}
+				}
+				if (directSkipped > 0) {
+					output += `\n[${directSkipped} lower-scoring direct hits omitted to stay within output budget]\n`
+				}
 			}
 
-			if (relatedCode.length > 0) {
+			if (relatedCode.length > 0 && remaining > 200) {
 				output += `\n=== Related Code ===\n\n`
-				output += relatedCode.map(({ r }) => formatBlock(r, true)).join("\n")
+				remaining -= 25
+				for (const { r } of relatedCode) {
+					const formatted = formatBlock(r, true)
+					if (formatted.length <= remaining) {
+						output += formatted + "\n"
+						remaining -= formatted.length + 1
+					} else {
+						break // Stop adding related when budget is exhausted
+					}
+				}
 			}
 
 			pushToolResult(output)
