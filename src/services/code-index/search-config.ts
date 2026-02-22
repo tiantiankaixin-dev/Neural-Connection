@@ -65,6 +65,21 @@ export interface SearchTuningConfig {
 
 	/** Line-range overlap ratio (0–1) above which blocks are deduplicated. */
 	overlapThreshold?: number
+
+	/** Global cap on total Direct Hit blocks after all filtering. */
+	maxTotalDirectHits?: number
+
+	/** Global cap on total Related Code blocks after all filtering. */
+	maxTotalRelatedCode?: number
+
+	// ── Mode-specific behavior flags ──
+
+	/** Enable post-scoring minScore filter on direct hits (precise only). */
+	enablePostScoreFilter?: boolean
+
+	/** Use PascalCase identifier matching for path boost/penalty (precise only).
+	 *  When false, uses original word-based path boost (no penalty). */
+	useIdentifierPathLogic?: boolean
 }
 
 // ─── Search mode type ───
@@ -94,21 +109,41 @@ export const RECOMMENDED_DEFAULTS: Required<SearchTuningConfig> = {
 	globalMaxDirectPerFile: 2,
 	globalMaxRelatedPerFile: 3,
 	overlapThreshold: 0.5,
+
+	// Global total caps
+	maxTotalDirectHits: 15,
+	maxTotalRelatedCode: 5,
+
+	// Mode-specific behavior flags
+	enablePostScoreFilter: false,
+	useIdentifierPathLogic: false,
 }
 
 // ─── Mode presets (only fields that differ from RECOMMENDED_DEFAULTS) ───
 
 export const PRECISE_PRESET: SearchTuningConfig = {
-	minScore: 0.55, // 0.6 → 0.55：略微放宽相似度，获取更多相关代码块
-	maxDirectPerFile: 6, // 4 → 6：进一步增加每文件代码块数
-	maxExpandedResults: 20, // 12 → 20：大幅增加总结果数
-	maxDepth: 2, // 新增：允许2层图遍历，获取依赖类
-	maxRelatedPerFile: 2, // 新增：每文件返回2个关联代码块
-	globalMaxDirectPerFile: 6, // 全局限制对齐
-	globalMaxRelatedPerFile: 2, // 全局关联代码块限制
+	minScore: 0.35,
+	maxVectorResults: 150,
+	maxExpandedResults: 50,
+	pathBoostMax: 0.3, // precise 用更高的路径权重
+
+	maxDirectPerFile: 30, // mergeBlocks 会将同文件块合并为 1 个
+	maxRelatedPerFile: 2,
+	relationVectorThreshold: 0.35,
+	relationVectorLimit: 50,
+
+	globalMaxDirectPerFile: 30,
+	globalMaxRelatedPerFile: 2,
+	maxTotalDirectHits: 20,
+	maxTotalRelatedCode: 8,
+
+	// precise-only behavior
+	enablePostScoreFilter: true, // 启用 post-scoring minScore 过滤
+	useIdentifierPathLogic: false, // 使用原始词级路径匹配（无惩罚），PascalCase 逻辑已证明有副作用
 }
 
 export const BROAD_PRESET: SearchTuningConfig = {
+	// Broad = original behavior, no precise-specific logic
 	minScore: 0.2,
 	maxVectorResults: 100,
 	maxExpandedResults: 30,

@@ -270,7 +270,7 @@ export class GraphExpander {
 			try {
 				const relationHits = await this.qdrantClient.searchRelationVectors(
 					queryVector,
-					undefined, // no directory filter
+					undefined,
 					this.tuning.relationVectorThreshold,
 					this.tuning.relationVectorLimit,
 				)
@@ -281,10 +281,13 @@ export class GraphExpander {
 					seen.add(id)
 					relationAdded++
 
+					// Apply discount factor to relation vector results so they rank below direct hits
+					// This prevents semantically related but off-topic code from dominating results
+					const RELATION_VECTOR_DISCOUNT = 0.7
 					allResults.push({
 						id,
 						payload: hit.payload,
-						score: hit.score, // raw relation vector similarity
+						score: hit.score * RELATION_VECTOR_DISCOUNT,
 						isDirectHit: false,
 						relationType: "relationVector",
 					})
@@ -316,7 +319,11 @@ export class GraphExpander {
 		// Apply per-file count limit + line-range overlap dedup to directs.
 		// Without a per-file cap, popular files (e.g., GameManager with 3+
 		// blocks) consume too many direct slots, reducing file diversity.
-		const directsSorted = allResults.filter((r) => r.isDirectHit).sort((a, b) => b.score - a.score)
+		const usePostFilter = this.tuning.enablePostScoreFilter
+		const postMinScore = this.tuning.minScore
+		const directsSorted = allResults
+			.filter((r) => r.isDirectHit && (!usePostFilter || r.score >= postMinScore))
+			.sort((a, b) => b.score - a.score)
 		const directFileCount = new Map<string, number>()
 		const directRanges = new Map<string, Array<{ start: number; end: number }>>()
 		const directs: ExpandedSearchResult[] = []
@@ -467,38 +474,70 @@ export class GraphExpander {
 		const pr = (payload.pageRank as number) || 0
 		const rd = Math.min((payload.refDensity as number) || 0, 2) / 2
 
-		// Query-path relevance boost: reward results whose file path or className
-		// contains words from the query (e.g., query "PlayerController" boosts
-		// files in Scripts/Player/ with className PlayerController)
+		// Query-path relevance boost logic.
+		// Two modes controlled by useIdentifierPathLogic config flag:
+		//   true  (precise): PascalCase identifier matching with boost/penalty
+		//   false (broad):   Original word-based matching with boost only (no penalty)
 		let pathBoost = 0
 		if (query) {
-			const queryLower = query.toLowerCase()
-			// Split query into meaningful words (3+ chars to skip noise like "the", "and")
-			const queryWords = queryLower.split(/\s+/).filter((w) => w.length >= 3)
-			// Split file path into segments
-			const pathSegments = ((payload.filePath as string) || "")
-				.toLowerCase()
-				.split(/[\\/._\-]/)
-				.filter((s) => s.length >= 2)
-			// Split className into words (e.g., "PlayerController" → ["player", "controller"])
-			const classWords = ((payload.className as string) || "")
-				.split(/(?=[A-Z])/)
-				.map((w) => w.toLowerCase())
-				.filter((w) => w.length >= 2)
-			const allTargetWords = [...pathSegments, ...classWords]
+			if (this.tuning.useIdentifierPathLogic) {
+				// Precise mode: PascalCase identifier matching with penalty
+				const identifiers = GraphExpander.extractIdentifiers(query)
+				if (identifiers.length > 0) {
+					const pathSegments = ((payload.filePath as string) || "")
+						.toLowerCase()
+						.split(/[\\/._\-]/)
+						.filter((s) => s.length >= 2)
+					const classWords = ((payload.className as string) || "")
+						.split(/(?=[A-Z])/)
+						.map((w) => w.toLowerCase())
+						.filter((w) => w.length >= 2)
+					const allTargetWords = [...pathSegments, ...classWords]
 
-			let matches = 0
-			for (const qw of queryWords) {
-				if (allTargetWords.some((tw) => tw.includes(qw) || qw.includes(tw))) {
-					matches++
+					let identifierMatches = 0
+					for (const id of identifiers) {
+						const idLower = id.toLowerCase()
+						// Only check tw.includes(idLower): target word must contain the full identifier.
+						// The reverse (idLower.includes(tw)) is too permissive — e.g., "playercontroller".includes("controller")
+						// would incorrectly boost TabController when searching for PlayerController.
+						if (allTargetWords.some((tw) => tw.includes(idLower))) {
+							identifierMatches++
+						}
+					}
+
+					if (identifierMatches > 0) {
+						pathBoost = Math.min(identifierMatches / identifiers.length, 1) * this.tuning.pathBoostMax
+					} else {
+						pathBoost = -this.tuning.pathBoostMax
+					}
 				}
-			}
-			if (queryWords.length > 0) {
-				pathBoost = Math.min(matches / queryWords.length, 1) * this.tuning.pathBoostMax
+			} else {
+				// Broad mode: original word-based matching (boost only, no penalty)
+				const queryLower = query.toLowerCase()
+				const queryWords = queryLower.split(/\s+/).filter((w) => w.length >= 3)
+				const pathSegments = ((payload.filePath as string) || "")
+					.toLowerCase()
+					.split(/[\\/._\-]/)
+					.filter((s) => s.length >= 2)
+				const classWords = ((payload.className as string) || "")
+					.split(/(?=[A-Z])/)
+					.map((w) => w.toLowerCase())
+					.filter((w) => w.length >= 2)
+				const allTargetWords = [...pathSegments, ...classWords]
+
+				let matches = 0
+				for (const qw of queryWords) {
+					if (allTargetWords.some((tw) => tw.includes(qw) || qw.includes(tw))) {
+						matches++
+					}
+				}
+				if (queryWords.length > 0) {
+					pathBoost = Math.min(matches / queryWords.length, 1) * this.tuning.pathBoostMax
+				}
 			}
 		}
 
-		// Phase 1: Pure semantic relevance (vector similarity + path match)
+		// Phase 1: Pure semantic relevance (vector similarity + path boost)
 		// PageRank/refDensity are applied later in the reranking phase
 		return vectorScore + pathBoost
 	}

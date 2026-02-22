@@ -2,7 +2,7 @@ import type OpenAI from "openai"
 
 const QUERY_PARAMETER_DESCRIPTION = `Array of meaning-based search queries from different angles. Always provide 2-4 diverse queries for comprehensive results.`
 
-const PATH_PARAMETER_DESCRIPTION = `Optional subdirectory (relative to the workspace) to limit the search scope`
+const PATH_PARAMETER_DESCRIPTION = `Optional path filter. Leave empty or omit for GLOBAL search (recommended). Only specify if you're certain the code is in a specific subdirectory.`
 
 const SHARED_PARAMETERS = {
 	type: "object" as const,
@@ -17,7 +17,7 @@ const SHARED_PARAMETERS = {
 			description: PATH_PARAMETER_DESCRIPTION,
 		},
 	},
-	required: ["query", "path"] as const,
+	required: ["query"] as const,
 	additionalProperties: false as const,
 }
 
@@ -39,9 +39,11 @@ export const codebaseSearchPrecise = {
 
 Provide 2-4 queries targeting the same symbol from different angles for best results.
 
+**IMPORTANT:** Always search globally (omit path) unless you are 100% certain the symbol only exists in a specific directory.
+
 Examples:
-{ "query": ["GameManager class definition", "GameManager singleton implementation"], "path": "Scripts" }
-{ "query": ["PlayerController class", "PlayerController MonoBehaviour"], "path": "Scripts/Player" }`,
+{ "query": ["GameManager class definition", "GameManager singleton implementation"] }
+{ "query": ["PlayerController class", "PlayerController MonoBehaviour"] }`,
 		strict: true,
 		parameters: SHARED_PARAMETERS,
 	},
@@ -67,9 +69,11 @@ export const codebaseSearchBroad = {
 
 Provide 2-4 diverse queries covering different aspects of what you're looking for.
 
+**IMPORTANT:** Always search globally (omit path) to discover all related code across the codebase.
+
 Examples:
-{ "query": ["player movement and physics", "character controller input handling", "player jump and gravity"], "path": "Scripts/Player" }
-{ "query": ["game state management", "scene lifecycle and transitions"], "path": null }`,
+{ "query": ["player movement and physics", "character controller input handling", "player jump and gravity"] }
+{ "query": ["game state management", "scene lifecycle and transitions"] }`,
 		strict: true,
 		parameters: SHARED_PARAMETERS,
 	},

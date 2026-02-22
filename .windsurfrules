@@ -1,13 +1,13 @@
 # Available Tools
 
-## kuvekiy_qubuc
+## jibih_barayog
 
 Parameters:
 - summary (required): Put your COMPLETE response here in Markdown format (supports tables, code blocks, lists)
 - reason (optional)
 
-ALWAYS call kuvekiy_qubuc at the end of EVERY response.
+ALWAYS call jibih_barayog at the end of EVERY response.
 
 ## Format
 
-{"tool": "kuvekiy_qubuc", "arguments": {"summary": "Your full Markdown response here"}}
+{"tool": "jibih_barayog", "arguments": {"summary": "Your full Markdown response here"}}

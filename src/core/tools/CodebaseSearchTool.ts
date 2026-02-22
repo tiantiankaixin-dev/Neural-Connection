@@ -118,6 +118,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 
 			interface EnrichedResult {
 				filePath: string
+				absolutePath: string
 				score: number
 				startLine: number
 				endLine: number
@@ -128,6 +129,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				className?: string | null
 				classExtends?: string | null
 				defines?: string[]
+				refs?: string[] // 添加 refs 字段显示关系信息
 			}
 
 			const allResults: EnrichedResult[] = []
@@ -142,6 +144,9 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 
 				allResults.push({
 					filePath: relativePath,
+					absolutePath: path.isAbsolute(p.filePath as string)
+						? (p.filePath as string)
+						: path.resolve(workspacePath, p.filePath as string),
 					score: result.score,
 					startLine: p.startLine,
 					endLine: p.endLine,
@@ -152,6 +157,7 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 					className: p.className as string | null | undefined,
 					classExtends: p.classExtends as string | null | undefined,
 					defines: p.defines as string[] | undefined,
+					refs: p.refs as string[] | undefined,
 				})
 			})
 
@@ -231,12 +237,21 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				})
 			}
 
-			const directHits = applyGlobalPerFileLimit(directHitsSorted, GLOBAL_MAX_DIRECT_PER_FILE)
-			const relatedCode = applyGlobalPerFileLimit(relatedCodeSorted, GLOBAL_MAX_RELATED_PER_FILE)
+			const directHitsFiltered = applyGlobalPerFileLimit(directHitsSorted, GLOBAL_MAX_DIRECT_PER_FILE)
+			const relatedCodeFiltered = applyGlobalPerFileLimit(relatedCodeSorted, GLOBAL_MAX_RELATED_PER_FILE)
+
+			// Apply global total caps (prevents multi-query merge from producing 40+ results)
+			const directHits = directHitsFiltered.slice(0, resolved.maxTotalDirectHits)
+			const relatedCode = relatedCodeFiltered.slice(0, resolved.maxTotalRelatedCode)
 
 			// ── Format output with metadata enrichment ──
 			const formatBlock = (r: EnrichedResult, isRelated: boolean): string => {
+				// Check if this block covers most of the file (>200 lines = likely complete)
+				const lineCount = r.endLine - r.startLine + 1
+				const isLikelyComplete = lineCount > 200
+
 				let header = `File: ${r.filePath}  Score: ${r.score.toFixed(2)}  Lines: ${r.startLine}-${r.endLine}`
+				if (isLikelyComplete) header += `  [COMPLETE FILE - DO NOT read_file]`
 				if (r.pageRank) header += `  PR: ${r.pageRank.toFixed(3)}`
 				if (isRelated && r.relationType) header += `  [${r.relationType}]`
 
@@ -249,18 +264,108 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				if (r.defines && r.defines.length > 0) {
 					meta.push(`Defines: ${r.defines.join(", ")}`)
 				}
+				if (r.refs && r.refs.length > 0) {
+					meta.push(`Refs: ${r.refs.join(", ")}`)
+				}
 
 				let block = header + "\n"
 				if (meta.length > 0) block += meta.join("\n") + "\n"
-				block += `Code: ${r.codeChunk}\n`
+
+				// Truncate large merged blocks to prevent host-side context truncation.
+				// Show class structure (top) + recent methods (bottom) with omission marker.
+				const MAX_CODE_LINES = 120
+				const codeLines = r.codeChunk.split("\n")
+				if (codeLines.length > MAX_CODE_LINES) {
+					const SHOW_FIRST = 80
+					const SHOW_LAST = 20
+					const omitted = codeLines.length - SHOW_FIRST - SHOW_LAST
+					const firstPart = codeLines.slice(0, SHOW_FIRST).join("\n")
+					const lastPart = codeLines.slice(-SHOW_LAST).join("\n")
+					block += `Code: ${firstPart}\n\n// ... [${omitted} lines omitted — full content indexed, do NOT read_file] ...\n\n${lastPart}\n`
+				} else {
+					block += `Code: ${r.codeChunk}\n`
+				}
 				return block
 			}
 
-			let output = `Query: ${queries.join(" | ")}\n`
+			let output = `Query: ${queries.join(" | ")}  [mode=${mode}]\n`
 
-			if (directHits.length > 0) {
+			// ── Block merging helper: merge adjacent blocks from the same file ──
+			const mergeBlocks = async (results: EnrichedResult[]): Promise<EnrichedResult[]> => {
+				const byFile = new Map<string, EnrichedResult[]>()
+				for (const r of results) {
+					const arr = byFile.get(r.filePath) || []
+					arr.push(r)
+					byFile.set(r.filePath, arr)
+				}
+
+				const MERGE_MIN_BLOCKS = 2
+				const MAX_GAP_FILL = Infinity // Merge all same-file blocks into complete files (truncated in formatBlock)
+				const merged: EnrichedResult[] = []
+
+				for (const [, blocks] of byFile) {
+					if (blocks.length < MERGE_MIN_BLOCKS) {
+						merged.push(...blocks)
+						continue
+					}
+					blocks.sort((a, b) => a.startLine - b.startLine)
+
+					let fileLines: string[] | null = null
+					try {
+						const filePath = blocks[0].absolutePath
+						console.log(`[mergeBlocks] Reading file for merge: ${filePath} (${blocks.length} blocks)`)
+						const uri = vscode.Uri.file(filePath)
+						const bytes = await vscode.workspace.fs.readFile(uri)
+						fileLines = Buffer.from(bytes).toString("utf-8").split(/\r?\n/)
+					} catch (err) {
+						console.error(`[mergeBlocks] Failed to read file: ${blocks[0].absolutePath}`, err)
+					}
+
+					if (!fileLines) {
+						merged.push(...blocks)
+						continue
+					}
+
+					let cur = { ...blocks[0] }
+					for (let i = 1; i < blocks.length; i++) {
+						const next = blocks[i]
+						const gap = next.startLine - cur.endLine - 1
+						// gap < 0 means overlapping blocks → always merge
+						// gap >= 0 means gap between blocks → merge if within MAX_GAP_FILL
+						if (gap <= MAX_GAP_FILL) {
+							const mergedCode = fileLines.slice(cur.startLine - 1, next.endLine).join("\n")
+							const allDefines = [...(cur.defines || []), ...(next.defines || [])]
+							const allRefs = [...(cur.refs || []), ...(next.refs || [])]
+							cur = {
+								...cur,
+								endLine: next.endLine,
+								codeChunk: mergedCode,
+								score: Math.max(cur.score, next.score),
+								defines: [...new Set(allDefines)],
+								refs: [...new Set(allRefs)],
+							}
+						} else {
+							merged.push(cur)
+							cur = { ...next }
+						}
+					}
+					merged.push(cur)
+				}
+				return merged.sort((a, b) => b.score - a.score)
+			}
+
+			// ── Merge Direct Hits only, then cap ──
+			// Merge same-file blocks into complete files (e.g., 30 blocks → 1 block).
+			// Related Code stays as individual small blocks to save output space.
+			// Large merged blocks are truncated in formatBlock to prevent context overflow.
+			const mergedDirectHits = (await mergeBlocks(directHitsFiltered.map(({ r }) => r))).slice(
+				0,
+				resolved.maxTotalDirectHits,
+			)
+
+			if (mergedDirectHits.length > 0) {
 				output += `\n=== Direct Hits ===\n\n`
-				output += directHits.map(({ r }) => formatBlock(r, false)).join("\n")
+				output += mergedDirectHits.map((r) => formatBlock(r, false)).join("\n")
 			}
 
 			if (relatedCode.length > 0) {
