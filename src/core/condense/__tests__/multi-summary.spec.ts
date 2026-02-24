@@ -777,6 +777,7 @@ describe("Multi-Summary Model", () => {
 
 			it("should return null on LLM error", async () => {
 				mockApiHandler.createMessage.mockImplementation(async function* () {
+					yield "" // satisfy require-yield
 					throw new Error("API error")
 				})
 

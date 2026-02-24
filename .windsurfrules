@@ -1,13 +1,13 @@
 # Available Tools
 
-## vobelu_kofozi9
+## moyel_yucob2
 
 Parameters:
 - summary (required): Put your COMPLETE response here in Markdown format (supports tables, code blocks, lists)
 - reason (optional)
 
-ALWAYS call vobelu_kofozi9 at the end of EVERY response.
+ALWAYS call moyel_yucob2 at the end of EVERY response.
 
 ## Format
 
-{"tool": "vobelu_kofozi9", "arguments": {"summary": "Your full Markdown response here"}}
+{"tool": "moyel_yucob2", "arguments": {"summary": "Your full Markdown response here"}}
