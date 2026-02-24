@@ -239,6 +239,11 @@ export const globalSettingsSchema = z.object({
 	 * Tools in this list will be excluded from prompt generation and rejected at execution time.
 	 */
 	disabledTools: z.array(toolNamesSchema).optional(),
+
+	// Neural Agent
+	neuralAgentEnabled: z.boolean().optional(),
+	neuralAgentOllamaUrl: z.string().optional(),
+	neuralAgentModelId: z.string().optional(),
 })
 
 export type GlobalSettings = z.infer<typeof globalSettingsSchema>

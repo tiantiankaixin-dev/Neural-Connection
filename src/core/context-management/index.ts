@@ -4,7 +4,13 @@ import crypto from "crypto"
 import { TelemetryService } from "@roo-code/telemetry"
 
 import { ApiHandler, ApiHandlerCreateMessageMetadata } from "../../api"
-import { MAX_CONDENSE_THRESHOLD, MIN_CONDENSE_THRESHOLD, summarizeConversation, SummarizeResponse } from "../condense"
+import {
+	MAX_CONDENSE_THRESHOLD,
+	MIN_CONDENSE_THRESHOLD,
+	summarizeConversation,
+	SummarizeResponse,
+	autoUpdateGlobalSummary,
+} from "../condense"
 import { ApiMessage } from "../task-persistence/apiMessages"
 import { ANTHROPIC_DEFAULT_MAX_TOKENS } from "@roo-code/types"
 import { RooIgnoreController } from "../ignore/RooIgnoreController"
@@ -325,7 +331,21 @@ export async function manageContext({
 				errorDetails = result.errorDetails
 				cost = result.cost
 			} else {
-				return { ...result, prevContextTokens }
+				// Auto-update Global Summary Q: promotes single summary to Q,
+				// or merges multiple visible summaries into a new Global Q.
+				// Uses minimal LLM context (only merge instruction + summary texts).
+				try {
+					const globalUpdate = await autoUpdateGlobalSummary(result.messages, apiHandler)
+					return {
+						...result,
+						messages: globalUpdate.messages,
+						cost: result.cost + globalUpdate.cost,
+						prevContextTokens,
+					}
+				} catch (globalError) {
+					console.error("[manageContext] autoUpdateGlobalSummary failed, using partial summary:", globalError)
+					return { ...result, prevContextTokens }
+				}
 			}
 		}
 	}

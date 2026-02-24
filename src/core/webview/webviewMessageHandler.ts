@@ -665,6 +665,21 @@ export const webviewMessageHandler = async (
 						if (!value) {
 							continue
 						}
+					} else if (
+						key === "neuralAgentEnabled" ||
+						key === "neuralAgentOllamaUrl" ||
+						key === "neuralAgentModelId"
+					) {
+						// Sync Neural Agent settings to the service singleton
+						const { NeuralAgentService } = await import("../../services/neural-agent")
+						const neuralAgent = NeuralAgentService.getInstance()
+						if (key === "neuralAgentEnabled") {
+							neuralAgent.toggle(!!value)
+						} else if (key === "neuralAgentOllamaUrl") {
+							neuralAgent.setOllamaConfig(value as string, undefined)
+						} else if (key === "neuralAgentModelId") {
+							neuralAgent.setOllamaConfig(undefined, value as string)
+						}
 					}
 
 					await provider.contextProxy.setValue(key as keyof RooCodeSettings, newValue)
@@ -3581,6 +3596,458 @@ export const webviewMessageHandler = async (
 				provider.log(`Error opening folder picker: ${errorMessage}`)
 			}
 
+			break
+		}
+
+		// ── Neural Agent messages ────────────────────────────────────────
+		case "neuralAgentToggle": {
+			const { NeuralAgentService } = await import("../../services/neural-agent")
+			const neuralAgent = NeuralAgentService.getInstance()
+			neuralAgent.onStatusChange((status) => {
+				provider.postMessageToWebview({ type: "neuralAgentStatus", payload: status })
+			})
+			neuralAgent.toggle(!!message.bool)
+			if (message.bool) {
+				await neuralAgent.checkLocalAiConnection()
+			}
+			provider.postMessageToWebview({
+				type: "neuralAgentStatus",
+				payload: neuralAgent.getStatus(),
+			})
+			break
+		}
+		case "neuralAgentFetchModels": {
+			const naFetchState = await provider.getState()
+			const configuredUrl = (naFetchState.neuralAgentOllamaUrl || "http://localhost:11434").replace(/\/+$/, "")
+			const foundModels: Array<{ id: string; sourceUrl: string; platform: string }> = []
+			const seenIds = new Set<string>()
+
+			// Helper: add models with dedup
+			const addModels = (names: string[], sourceUrl: string, platform: string) => {
+				for (const name of names) {
+					if (name && !seenIds.has(name)) {
+						seenIds.add(name)
+						foundModels.push({ id: name, sourceUrl, platform })
+					}
+				}
+			}
+
+			// Define all endpoints to probe
+			const endpoints: Array<{ url: string; path: string; format: "ollama" | "openai"; platform: string }> = [
+				{ url: configuredUrl, path: "/api/tags", format: "ollama", platform: "Ollama" },
+				{ url: configuredUrl, path: "/v1/models", format: "openai", platform: "OpenAI 兼容" },
+			]
+
+			// Also probe common local ports (skip if already in configured URL)
+			const localPorts = [
+				{ port: 11434, path: "/api/tags", format: "ollama" as const, platform: "Ollama" },
+				{ port: 1234, path: "/v1/models", format: "openai" as const, platform: "LM Studio" },
+				{ port: 1337, path: "/v1/models", format: "openai" as const, platform: "Jan" },
+				{ port: 8080, path: "/v1/models", format: "openai" as const, platform: "LocalAI" },
+				{ port: 4891, path: "/v1/models", format: "openai" as const, platform: "GPT4All" },
+			]
+			for (const lp of localPorts) {
+				const lpUrl = `http://localhost:${lp.port}`
+				if (configuredUrl !== lpUrl) {
+					endpoints.push({ url: lpUrl, path: lp.path, format: lp.format, platform: lp.platform })
+				}
+			}
+
+			// Probe all endpoints
+			for (const ep of endpoints) {
+				try {
+					const resp = await fetch(`${ep.url}${ep.path}`, { signal: AbortSignal.timeout(3000) })
+					if (!resp.ok) continue
+					const data = await resp.json()
+					if (ep.format === "ollama" && data.models) {
+						const names = (data as { models: Array<{ name?: string; model?: string }> }).models
+							.map((m) => m.name || m.model)
+							.filter(Boolean) as string[]
+						addModels(names, ep.url, ep.platform)
+					} else if (ep.format === "openai" && data.data) {
+						const ids = (data as { data: Array<{ id?: string }> }).data
+							.map((m) => m.id)
+							.filter(Boolean) as string[]
+						addModels(ids, ep.url, ep.platform)
+					}
+				} catch {
+					// Endpoint not available
+				}
+			}
+
+			provider.postMessageToWebview({
+				type: "neuralAgentModels",
+				payload: { models: foundModels },
+			})
+			break
+		}
+		case "neuralAgentShowModelDetail": {
+			const model = message.values as {
+				id: string
+				size: string
+				vram: string
+				description: string
+				speed: string
+				quality: string
+				category: string
+				stars?: number
+			}
+			if (!model?.id) break
+
+			const categoryLabels: Record<string, string> = {
+				code: "代码专用",
+				general: "通用",
+				reasoning: "推理增强",
+			}
+
+			const panel = vscode.window.createWebviewPanel(
+				"neuralAgentModelDetail",
+				`模型详情 - ${model.id}`,
+				vscode.ViewColumn.One,
+				{ enableScripts: true },
+			)
+
+			panel.webview.html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+	:root {
+		--bg: var(--vscode-editor-background, #1e1e1e);
+		--fg: var(--vscode-editor-foreground, #cccccc);
+		--border: var(--vscode-panel-border, #3c3c3c);
+		--accent: var(--vscode-button-background, #0e639c);
+		--accent-hover: var(--vscode-button-hoverBackground, #1177bb);
+		--accent-fg: var(--vscode-button-foreground, #ffffff);
+		--muted: var(--vscode-descriptionForeground, #858585);
+		--card-bg: var(--vscode-editorWidget-background, #252526);
+		--green: #4ec9b0;
+		--yellow: #dcdcaa;
+		--red: #f14c4c;
+	}
+	* { margin: 0; padding: 0; box-sizing: border-box; }
+	body {
+		font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, sans-serif);
+		background: var(--bg);
+		color: var(--fg);
+		padding: 40px;
+		line-height: 1.6;
+	}
+	.container { max-width: 720px; margin: 0 auto; }
+	.header { margin-bottom: 32px; }
+	.model-id {
+		font-size: 28px;
+		font-weight: 700;
+		font-family: var(--vscode-editor-font-family, monospace);
+		margin-bottom: 8px;
+	}
+	.stars { color: #f5c842; font-size: 20px; margin-left: 12px; }
+	.badge {
+		display: inline-block;
+		padding: 3px 10px;
+		border-radius: 12px;
+		font-size: 12px;
+		font-weight: 600;
+		background: var(--accent);
+		color: var(--accent-fg);
+		margin-right: 8px;
+	}
+	.desc {
+		font-size: 16px;
+		color: var(--muted);
+		margin-top: 12px;
+		line-height: 1.8;
+	}
+	.stats-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+		gap: 16px;
+		margin: 28px 0;
+	}
+	.stat-card {
+		background: var(--card-bg);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 16px;
+		text-align: center;
+	}
+	.stat-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+	.stat-value { font-size: 22px; font-weight: 700; }
+	.stat-value.green { color: var(--green); }
+	.stat-value.yellow { color: var(--yellow); }
+	.stat-value.red { color: var(--red); }
+	.section { margin: 28px 0; }
+	.section-title { font-size: 16px; font-weight: 600; margin-bottom: 12px; }
+	.info-table { width: 100%; border-collapse: collapse; }
+	.info-table td {
+		padding: 10px 14px;
+		border-bottom: 1px solid var(--border);
+		font-size: 14px;
+	}
+	.info-table td:first-child {
+		color: var(--muted);
+		width: 140px;
+		font-weight: 500;
+	}
+	.platform-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 12px;
+	}
+	.platform-card {
+		background: var(--card-bg);
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		padding: 14px;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		transition: border-color 0.15s;
+	}
+	.platform-card:hover { border-color: var(--accent); }
+	.platform-header { display: flex; align-items: center; gap: 8px; }
+	.platform-icon { font-size: 18px; }
+	.platform-name { font-weight: 600; font-size: 14px; }
+	.platform-port { font-size: 11px; color: var(--muted); margin-left: auto; }
+	.platform-cmd { font-size: 12px; color: var(--muted); line-height: 1.5; }
+	.platform-cmd code {
+		background: rgba(255,255,255,0.08);
+		padding: 2px 6px;
+		border-radius: 3px;
+		font-family: var(--vscode-editor-font-family, monospace);
+		font-size: 11px;
+	}
+	.btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		padding: 10px 24px;
+		border-radius: 6px;
+		font-size: 14px;
+		font-weight: 600;
+		border: none;
+		cursor: pointer;
+		transition: background 0.15s;
+	}
+	.btn-primary { background: var(--accent); color: var(--accent-fg); }
+	.btn-primary:hover { background: var(--accent-hover); }
+	.btn-secondary { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+	.btn-secondary:hover { background: var(--card-bg); }
+	.btn svg { width: 16px; height: 16px; }
+	.platform-card .btn { width: 100%; justify-content: center; padding: 8px 12px; font-size: 13px; }
+	.tip {
+		margin-top: 24px;
+		padding: 12px 16px;
+		background: var(--card-bg);
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		font-size: 13px;
+		color: var(--muted);
+		line-height: 1.7;
+	}
+	.tip code {
+		background: rgba(255,255,255,0.08);
+		padding: 2px 6px;
+		border-radius: 3px;
+		font-family: var(--vscode-editor-font-family, monospace);
+	}
+</style>
+</head>
+<body>
+<div class="container">
+	<div class="header">
+		<div class="model-id">
+			${model.id}
+			${model.stars ? `<span class="stars">${"★".repeat(model.stars)}</span>` : ""}
+		</div>
+		<div>
+			<span class="badge">${categoryLabels[model.category] || model.category}</span>
+		</div>
+		<div class="desc">${model.description}</div>
+	</div>
+
+	<div class="stats-grid">
+		<div class="stat-card">
+			<div class="stat-label">模型大小</div>
+			<div class="stat-value">${model.size}</div>
+		</div>
+		<div class="stat-card">
+			<div class="stat-label">显存需求</div>
+			<div class="stat-value">${model.vram}</div>
+		</div>
+		<div class="stat-card">
+			<div class="stat-label">推理速度</div>
+			<div class="stat-value ${model.speed === "快" ? "green" : model.speed === "中" ? "yellow" : "red"}">${model.speed}</div>
+		</div>
+		<div class="stat-card">
+			<div class="stat-label">输出质量</div>
+			<div class="stat-value ${model.quality === "高" ? "green" : model.quality === "中" ? "yellow" : "red"}">${model.quality}</div>
+		</div>
+	</div>
+
+	<div class="section">
+		<div class="section-title">详细信息</div>
+		<table class="info-table">
+			<tr><td>模型 ID</td><td><code>${model.id}</code></td></tr>
+			<tr><td>分类</td><td>${categoryLabels[model.category] || model.category}</td></tr>
+			<tr><td>文件大小</td><td>${model.size}（量化后）</td></tr>
+			<tr><td>推荐显存</td><td>${model.vram}</td></tr>
+			<tr><td>推理速度</td><td>${model.speed}</td></tr>
+			<tr><td>输出质量</td><td>${model.quality}</td></tr>
+			<tr><td>量化格式</td><td>Q4_K_M（默认）</td></tr>
+			<tr><td>适用场景</td><td>${model.category === "code" ? "代码补全、参数纠错、架构分析" : model.category === "reasoning" ? "复杂推理、数学、逻辑分析" : "通用对话、文本生成、翻译"}</td></tr>
+		</table>
+	</div>
+
+	<div class="section">
+		<div class="section-title">选择平台下载模型</div>
+		<div class="platform-grid">
+			<div class="platform-card" data-platform="ollama">
+				<div class="platform-header">
+					<span class="platform-icon">🦙</span>
+					<span class="platform-name">Ollama</span>
+					<span class="platform-port">端口 11434</span>
+				</div>
+				<div class="platform-cmd"><code>ollama pull ${model.id}</code></div>
+				<button class="btn btn-primary btn-download" data-platform="ollama">
+					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+					通过 Ollama 下载
+				</button>
+			</div>
+			<div class="platform-card" data-platform="lmstudio">
+				<div class="platform-header">
+					<span class="platform-icon">🖥️</span>
+					<span class="platform-name">LM Studio</span>
+					<span class="platform-port">端口 1234</span>
+				</div>
+				<div class="platform-cmd"><code>lms get ${model.id}</code></div>
+				<button class="btn btn-primary btn-download" data-platform="lmstudio">
+					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+					通过 LM Studio 下载
+				</button>
+			</div>
+			<div class="platform-card" data-platform="jan">
+				<div class="platform-header">
+					<span class="platform-icon">🤖</span>
+					<span class="platform-name">Jan</span>
+					<span class="platform-port">端口 1337</span>
+				</div>
+				<div class="platform-cmd">在 Jan 应用的模型市场搜索 <code>${model.id}</code></div>
+				<button class="btn btn-secondary btn-download" data-platform="jan">
+					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+					打开 Jan 下载
+				</button>
+			</div>
+			<div class="platform-card" data-platform="localai">
+				<div class="platform-header">
+					<span class="platform-icon">🐳</span>
+					<span class="platform-name">LocalAI</span>
+					<span class="platform-port">端口 8080</span>
+				</div>
+				<div class="platform-cmd"><code>local-ai run ${model.id}</code></div>
+				<button class="btn btn-primary btn-download" data-platform="localai">
+					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+					通过 LocalAI 下载
+				</button>
+			</div>
+			<div class="platform-card" data-platform="gpt4all">
+				<div class="platform-header">
+					<span class="platform-icon">🔒</span>
+					<span class="platform-name">GPT4All</span>
+					<span class="platform-port">端口 4891</span>
+				</div>
+				<div class="platform-cmd">在 GPT4All 应用的模型列表搜索 <code>${model.id}</code></div>
+				<button class="btn btn-secondary btn-download" data-platform="gpt4all">
+					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+					打开 GPT4All 下载
+				</button>
+			</div>
+		</div>
+	</div>
+
+	<div class="tip">
+		<strong>💡 使用提示：</strong><br/>
+		1. 点击下载按钮将在终端中执行对应平台的下载命令。<br/>
+		2. 需要先安装对应的模型运行平台（可在资源中心一键安装）。<br/>
+		3. 下载完成后，确保平台服务正在运行，然后在设置中填入服务地址。
+	</div>
+</div>
+
+<script>
+	const vscode = acquireVsCodeApi();
+	document.querySelectorAll('.btn-download').forEach(btn => {
+		btn.addEventListener('click', () => {
+			vscode.postMessage({
+				command: 'download',
+				modelId: '${model.id}',
+				platform: btn.getAttribute('data-platform'),
+			});
+		});
+	});
+</script>
+</body>
+</html>`
+
+			const platformDownloadCmds: Record<string, (id: string) => string> = {
+				ollama: (id) => `ollama pull ${id}`,
+				lmstudio: (id) => `lms get ${id}`,
+				localai: (id) => `local-ai run ${id}`,
+				jan: (_id) => `echo "请在 Jan 应用的模型市场中搜索并下载该模型"`,
+				gpt4all: (_id) => `echo "请在 GPT4All 应用的模型列表中搜索并下载该模型"`,
+			}
+
+			panel.webview.onDidReceiveMessage(async (msg) => {
+				if (msg.command === "download" && msg.modelId && msg.platform) {
+					const cmdFn = platformDownloadCmds[msg.platform]
+					const cmd = cmdFn ? cmdFn(msg.modelId) : `ollama pull ${msg.modelId}`
+					const platformNames: Record<string, string> = {
+						ollama: "Ollama",
+						lmstudio: "LM Studio",
+						jan: "Jan",
+						localai: "LocalAI",
+						gpt4all: "GPT4All",
+					}
+					const displayName = platformNames[msg.platform] || msg.platform
+					const downloadTerminal = vscode.window.createTerminal(`${displayName} 下载 ${msg.modelId}`)
+					downloadTerminal.show()
+					downloadTerminal.sendText(cmd)
+				}
+			})
+			break
+		}
+		case "neuralAgentInstallPlatform": {
+			const platformName = message.platformName as string | undefined
+			const installCmd = message.installCmd as { windows: string; macos: string; linux: string } | undefined
+			if (platformName && installCmd) {
+				const os = process.platform
+				const cmd = os === "win32" ? installCmd.windows : os === "darwin" ? installCmd.macos : installCmd.linux
+				const terminal = vscode.window.createTerminal(`安装 ${platformName}`)
+				terminal.show()
+				terminal.sendText(cmd)
+			}
+			break
+		}
+		case "neuralAgentGetStatus": {
+			const { NeuralAgentService } = await import("../../services/neural-agent")
+			const neuralAgent = NeuralAgentService.getInstance()
+			// Wire up status push callback
+			neuralAgent.onStatusChange((status) => {
+				provider.postMessageToWebview({ type: "neuralAgentStatus", payload: status })
+			})
+			// Hydrate from persisted settings on first status request
+			const naState = await provider.getState()
+			if (naState.neuralAgentOllamaUrl || naState.neuralAgentModelId) {
+				neuralAgent.setOllamaConfig(naState.neuralAgentOllamaUrl, naState.neuralAgentModelId)
+			}
+			if (naState.neuralAgentEnabled && !neuralAgent.enabled) {
+				neuralAgent.toggle(true)
+				await neuralAgent.checkLocalAiConnection()
+			}
+			provider.postMessageToWebview({
+				type: "neuralAgentStatus",
+				payload: neuralAgent.getStatus(),
+			})
 			break
 		}
 

@@ -529,7 +529,7 @@ describe("isToolAllowedForMode", () => {
 		expect(isToolAllowedForMode("write_to_file", "markdown-editor", customModes, toolRequirements)).toBe(false)
 	})
 
-	describe("customTools (opt-in tools)", () => {
+	describe("edit group tools (all available by default)", () => {
 		const customModesWithEditGroup: ModeConfig[] = [
 			{
 				slug: "test-custom-tools",
@@ -539,29 +539,14 @@ describe("isToolAllowedForMode", () => {
 			},
 		]
 
-		it("disallows customTools by default (not in includedTools)", () => {
-			// search_and_replace is a customTool in the edit group, should be disallowed by default
-			expect(isToolAllowedForMode("search_and_replace", "test-custom-tools", customModesWithEditGroup)).toBe(
-				false,
-			)
+		it("allows all edit tools by default when mode has edit group", () => {
+			// All edit tools (including former customTools) are now regular tools
+			expect(isToolAllowedForMode("search_and_replace", "test-custom-tools", customModesWithEditGroup)).toBe(true)
+			expect(isToolAllowedForMode("edit", "test-custom-tools", customModesWithEditGroup)).toBe(true)
+			expect(isToolAllowedForMode("multi_edit", "test-custom-tools", customModesWithEditGroup)).toBe(true)
 		})
 
-		it("allows customTools when included in includedTools", () => {
-			// search_and_replace should be allowed when explicitly included
-			expect(
-				isToolAllowedForMode(
-					"search_and_replace",
-					"test-custom-tools",
-					customModesWithEditGroup,
-					undefined,
-					undefined,
-					undefined,
-					["search_and_replace"],
-				),
-			).toBe(true)
-		})
-
-		it("disallows customTools even in includedTools if mode doesn't have the group", () => {
+		it("disallows edit tools if mode doesn't have the edit group", () => {
 			const customModesWithoutEdit: ModeConfig[] = [
 				{
 					slug: "no-edit-mode",
@@ -571,22 +556,12 @@ describe("isToolAllowedForMode", () => {
 				},
 			]
 
-			// Even if included, should be disallowed because the mode doesn't have edit group
-			expect(
-				isToolAllowedForMode(
-					"search_and_replace",
-					"no-edit-mode",
-					customModesWithoutEdit,
-					undefined,
-					undefined,
-					undefined,
-					["search_and_replace"],
-				),
-			).toBe(false)
+			expect(isToolAllowedForMode("search_and_replace", "no-edit-mode", customModesWithoutEdit)).toBe(false)
+			expect(isToolAllowedForMode("edit", "no-edit-mode", customModesWithoutEdit)).toBe(false)
+			expect(isToolAllowedForMode("multi_edit", "no-edit-mode", customModesWithoutEdit)).toBe(false)
 		})
 
-		it("allows regular tools in the same group as customTools", () => {
-			// apply_diff (regular tool) should be allowed even without includedTools
+		it("allows all regular tools in the edit group", () => {
 			expect(isToolAllowedForMode("apply_diff", "test-custom-tools", customModesWithEditGroup)).toBe(true)
 			expect(isToolAllowedForMode("write_to_file", "test-custom-tools", customModesWithEditGroup)).toBe(true)
 		})

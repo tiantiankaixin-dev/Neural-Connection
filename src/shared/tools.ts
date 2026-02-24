@@ -87,6 +87,21 @@ export const toolParamNames = [
 	// read_file legacy format parameter (backward compatibility)
 	"files",
 	"line_ranges",
+	// find_by_name parameters
+	"pattern",
+	"extensions",
+	"excludes",
+	"max_depth",
+	"type",
+	"full_path",
+	// task_memory parameters
+	"task_memory_id",
+	"title",
+	"description",
+	"previous_context_summary",
+	"task_summary",
+	"key_files",
+	"tags",
 ] as const
 
 export type ToolParamName = (typeof toolParamNames)[number]
@@ -123,6 +138,66 @@ export type NativeToolArgs = {
 	update_todo_list: { todos: string }
 	use_mcp_tool: { server_name: string; tool_name: string; arguments?: Record<string, unknown> }
 	write_to_file: { path: string; content: string }
+	find_by_name: {
+		path: string
+		pattern: string
+		extensions?: string[] | null
+		excludes?: string[] | null
+		max_depth?: number | null
+		type?: "file" | "directory" | "any" | null
+		full_path?: boolean | null
+	}
+	command_status: {
+		terminal_id: number
+		output_limit?: number | null
+		wait_seconds?: number | null
+	}
+	read_terminal: {
+		terminal_id: number
+		output_limit?: number | null
+	}
+	read_url_content: {
+		url: string
+		max_length?: number | null
+	}
+	search_web: {
+		query: string
+		domain?: string | null
+		max_results?: number | null
+	}
+	multi_edit: {
+		file_path: string
+		edits: Array<{
+			old_string: string
+			new_string: string
+			replace_all?: boolean | null
+		}>
+		explanation: string
+	}
+	read_notebook: {
+		path: string
+	}
+	edit_notebook: {
+		absolute_path: string
+		new_source: string
+		cell_number?: number
+		cell_type?: "code" | "markdown"
+		edit_mode?: "replace" | "insert"
+		cell_id?: string
+	}
+	view_content_chunk: {
+		document_id: string
+		position: number
+	}
+	create_memory: {
+		Action: "create" | "update" | "delete"
+		Id?: string | null
+		Title?: string | null
+		Content?: string | null
+		CorpusNames?: string[] | null
+		Tags?: string[] | null
+		UserTriggered: boolean
+	}
 	// Add more tools as they are migrated to native protocol
 }
 
@@ -303,22 +378,51 @@ export const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
 	skill: "load skill",
 	generate_image: "generate images",
 	custom_tool: "use custom tools",
+	find_by_name: "find files by name",
+	command_status: "check command status",
+	read_terminal: "read terminal output",
+	read_url_content: "read web content",
+	search_web: "search the web",
+	multi_edit: "multi-edit files",
+	read_notebook: "read notebooks",
+	edit_notebook: "edit notebooks",
+	view_content_chunk: "view content chunks",
+	create_memory: "manage memories",
+	task_memory: "manage task memory",
 } as const
 
 // Define available tool groups.
 export const TOOL_GROUPS: Record<ToolGroup, ToolGroupConfig> = {
 	read: {
-		tools: ["read_file", "search_files", "list_files", "codebase_search"],
+		tools: [
+			"read_file",
+			"search_files",
+			"list_files",
+			"find_by_name",
+			"codebase_search",
+			"read_notebook",
+			"read_url_content",
+			"view_content_chunk",
+		],
 	},
 	edit: {
-		tools: ["apply_diff", "write_to_file", "generate_image"],
-		customTools: ["edit", "search_replace", "edit_file", "apply_patch"],
+		tools: [
+			"apply_diff",
+			"write_to_file",
+			"generate_image",
+			"edit_notebook",
+			"edit",
+			"multi_edit",
+			"search_replace",
+			"edit_file",
+			"apply_patch",
+		],
 	},
 	browser: {
-		tools: ["browser_action"],
+		tools: ["browser_action", "search_web"],
 	},
 	command: {
-		tools: ["execute_command", "read_command_output"],
+		tools: ["execute_command", "command_status", "read_terminal", "read_command_output"],
 	},
 	mcp: {
 		tools: ["use_mcp_tool", "access_mcp_resource"],
@@ -338,6 +442,8 @@ export const ALWAYS_AVAILABLE_TOOLS: ToolName[] = [
 	"update_todo_list",
 	"run_slash_command",
 	"skill",
+	"create_memory",
+	"task_memory",
 ] as const
 
 /**

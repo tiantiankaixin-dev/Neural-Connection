@@ -42,7 +42,8 @@
 		"experimental": "实验性",
 		"language": "语言",
 		"about": "关于 Roo Code",
-		"skills": "Skills"
+		"skills": "Skills",
+		"neuralAgent": "Neural Agent"
 	},
 	"about": {
 		"bugReport": {

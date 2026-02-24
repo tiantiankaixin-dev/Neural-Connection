@@ -30,6 +30,7 @@ import {
 	ArrowLeft,
 	GitCommitVertical,
 	GraduationCap,
+	Brain,
 } from "lucide-react"
 
 import {
@@ -79,6 +80,7 @@ import { Section } from "./Section"
 import PromptsSettings from "./PromptsSettings"
 import { SlashCommandsSettings } from "./SlashCommandsSettings"
 import { SkillsSettings } from "./SkillsSettings"
+import { NeuralAgentSettings } from "./NeuralAgentSettings"
 import { UISettings } from "./UISettings"
 import ModesView from "../modes/ModesView"
 import McpView from "../mcp/McpView"
@@ -112,6 +114,7 @@ export const sectionNames = [
 	"worktrees",
 	"prompts",
 	"ui",
+	"neuralAgent",
 	"experimental",
 	"language",
 	"about",
@@ -212,6 +215,9 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>(({ onDone, t
 		includeCurrentTime,
 		includeCurrentCost,
 		maxGitStatusFiles,
+		neuralAgentEnabled,
+		neuralAgentOllamaUrl,
+		neuralAgentModelId,
 	} = cachedState
 
 	const apiConfiguration = useMemo(() => cachedState.apiConfiguration ?? {}, [cachedState.apiConfiguration])
@@ -437,6 +443,9 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>(({ onDone, t
 					openRouterImageGenerationSelectedModel,
 					experiments,
 					customSupportPrompts,
+					neuralAgentEnabled,
+					neuralAgentOllamaUrl,
+					neuralAgentModelId,
 				},
 			})
 
@@ -537,6 +546,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>(({ onDone, t
 			{ id: "prompts", icon: MessageSquare },
 			{ id: "worktrees", icon: GitBranch },
 			{ id: "ui", icon: Glasses },
+			{ id: "neuralAgent", icon: Brain },
 			{ id: "experimental", icon: FlaskConical },
 			{ id: "language", icon: Globe },
 			{ id: "about", icon: Info },
@@ -921,6 +931,15 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>(({ onDone, t
 							<UISettings
 								reasoningBlockCollapsed={reasoningBlockCollapsed ?? true}
 								enterBehavior={enterBehavior ?? "send"}
+								setCachedStateField={setCachedStateField}
+							/>
+						)}
+
+						{/* Neural Agent Section */}
+						{renderTab === "neuralAgent" && (
+							<NeuralAgentSettings
+								neuralAgentOllamaUrl={neuralAgentOllamaUrl}
+								neuralAgentModelId={neuralAgentModelId}
 								setCachedStateField={setCachedStateField}
 							/>
 						)}

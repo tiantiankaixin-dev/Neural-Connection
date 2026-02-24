@@ -27,6 +27,12 @@ export const toolNames = [
 	"apply_patch",
 	"search_files",
 	"list_files",
+	"find_by_name",
+	"multi_edit",
+	"read_notebook",
+	"edit_notebook",
+	"view_content_chunk",
+	"create_memory",
 	"browser_action",
 	"use_mcp_tool",
 	"access_mcp_resource",
@@ -40,6 +46,11 @@ export const toolNames = [
 	"skill",
 	"generate_image",
 	"custom_tool",
+	"command_status",
+	"read_terminal",
+	"read_url_content",
+	"search_web",
+	"task_memory",
 ] as const
 
 export const toolNamesSchema = z.enum(toolNames)

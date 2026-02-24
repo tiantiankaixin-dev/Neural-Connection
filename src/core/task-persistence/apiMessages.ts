@@ -38,6 +38,9 @@ export type ApiMessage = Anthropic.MessageParam & {
 	truncationParent?: string
 	// Identifies a message as a truncation boundary marker
 	isTruncationMarker?: boolean
+	// Identifies the global summary Q message (merged from all completed sub-task summaries)
+	// Only ONE global summary should be visible at a time; old ones get tagged with new Q's condenseParent
+	isGlobalSummary?: boolean
 }
 
 export async function readApiMessages({

@@ -7,7 +7,6 @@ import { t } from "../../i18n"
 import { ApiHandler, ApiHandlerCreateMessageMetadata } from "../../api"
 import { ApiMessage } from "../task-persistence/apiMessages"
 import { maybeRemoveImageBlocks } from "../../api/transform/image-cleaning"
-import { findLast } from "../../shared/array"
 import { supportPrompt } from "../../shared/support-prompt"
 import { RooIgnoreController } from "../ignore/RooIgnoreController"
 import { generateFoldedFileContext } from "./foldedFileContext"
@@ -233,6 +232,13 @@ export type SummarizeConversationOptions = {
 	filesReadByRoo?: string[]
 	cwd?: string
 	rooIgnoreController?: RooIgnoreController
+	/** If provided, the summary heading will include the sub-task title for multi-summary model */
+	subtaskTitle?: string
+	/** If provided, override the default "since last summary" boundary.
+	 * Summarize and tag messages from this index onward (inclusive).
+	 * Intermediate summaries within the range are also tagged (replaced by the new comprehensive summary).
+	 * Used by task_memory to create a full-quality summary from ALL sub-task messages. */
+	summarizeFromIndex?: number
 }
 
 /**
@@ -275,8 +281,13 @@ export async function summarizeConversation(options: SummarizeConversationOption
 
 	const response: SummarizeResponse = { messages, cost: 0, summary: "" }
 
-	// Get messages to summarize (all messages since the last summary, if any)
-	const messagesToSummarize = getMessagesSinceLastSummary(messages)
+	// Determine which messages to summarize:
+	// - If summarizeFromIndex is set, use that range (for full-quality sub-task summarization)
+	// - Otherwise, use the default "since last summary" logic
+	const messagesToSummarize =
+		options.summarizeFromIndex !== undefined
+			? messages.slice(options.summarizeFromIndex)
+			: getMessagesSinceLastSummary(messages)
 
 	if (messagesToSummarize.length <= 1) {
 		const error =
@@ -287,11 +298,14 @@ export async function summarizeConversation(options: SummarizeConversationOption
 	}
 
 	// Check if there's a recent summary in the messages (edge case)
-	const recentSummaryExists = messagesToSummarize.some((message: ApiMessage) => message.isSummary)
+	// Skip this check when summarizeFromIndex is set (we intentionally include intermediate summaries)
+	if (options.summarizeFromIndex === undefined) {
+		const recentSummaryExists = messagesToSummarize.some((message: ApiMessage) => message.isSummary)
 
-	if (recentSummaryExists && messagesToSummarize.length <= 2) {
-		const error = t("common:errors.condensed_recently")
-		return { ...response, error }
+		if (recentSummaryExists && messagesToSummarize.length <= 2) {
+			const error = t("common:errors.condensed_recently")
+			return { ...response, error }
+		}
 	}
 
 	// Use custom prompt if provided and non-empty, otherwise use the default CONDENSE prompt
@@ -398,8 +412,9 @@ export async function summarizeConversation(options: SummarizeConversationOption
 	const commandBlocks = firstMessage ? extractCommandBlocks(firstMessage) : ""
 
 	// Build the summary content as separate text blocks
+	const headingPrefix = options.subtaskTitle ? `Sub-Task Summary: ${options.subtaskTitle}` : "Conversation Summary"
 	const summaryContent: Anthropic.Messages.ContentBlockParam[] = [
-		{ type: "text", text: `## Conversation Summary\n${summary}` },
+		{ type: "text", text: `## ${headingPrefix}\n${summary}` },
 	]
 
 	// Add command blocks (active workflows) in their own system-reminder block if present
@@ -463,24 +478,49 @@ ${commandBlocks}
 		condenseId, // Unique ID for this summary, used to track which messages it replaces
 	}
 
-	// NON-DESTRUCTIVE CONDENSE:
-	// Tag ALL existing messages with condenseParent so they are filtered out when
-	// the effective history is computed. The summary message is the only message
-	// that will be visible to the API after condensing (fresh start model).
+	// NON-DESTRUCTIVE CONDENSE (Multi-Summary Model):
+	// Tag only messages SINCE THE LAST SUMMARY with condenseParent.
+	// Previous summaries are preserved so the model can see all sub-task summaries.
 	//
 	// Storage structure after condense:
-	// [msg1(parent=X), msg2(parent=X), ..., msgN(parent=X), summary(id=X)]
+	// [prev_summary_1, msg_a(parent=X), msg_b(parent=X), ..., new_summary(id=X)]
 	//
 	// Effective for API (filtered by getEffectiveApiHistory):
-	// [summary]  ← Fresh start!
+	// [prev_summary_1, new_summary]  ← All summaries visible!
 
-	// Tag ALL messages with condenseParent
-	const newMessages = messages.map((msg) => {
-		// If message already has a condenseParent, we leave it - nested condense is handled by filtering
-		if (!msg.condenseParent) {
-			return { ...msg, condenseParent: condenseId }
+	// Determine the tagging boundary:
+	// - If summarizeFromIndex is set, tag from that index (including intermediate summaries)
+	// - Otherwise, tag from the last summary + 1 (preserving previous summaries)
+	let tagStartIndex: number
+	if (options.summarizeFromIndex !== undefined) {
+		tagStartIndex = options.summarizeFromIndex
+	} else {
+		let lastSummaryIdx = -1
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].isSummary) {
+				lastSummaryIdx = i
+				break
+			}
 		}
-		return msg
+		tagStartIndex = lastSummaryIdx >= 0 ? lastSummaryIdx + 1 : 0
+	}
+
+	// Tag messages from tagStartIndex onward with condenseParent.
+	// When summarizeFromIndex is set, intermediate summaries within the range are also tagged
+	// (they get replaced by the new comprehensive summary).
+	const newMessages = messages.map((msg, index) => {
+		if (index < tagStartIndex) {
+			return msg
+		}
+		// When using default boundary, skip already-tagged messages and summary messages
+		if (options.summarizeFromIndex === undefined && (msg.condenseParent || msg.isSummary)) {
+			return msg
+		}
+		// When using summarizeFromIndex, skip already-tagged messages (but DO tag intermediate summaries)
+		if (options.summarizeFromIndex !== undefined && msg.condenseParent) {
+			return msg
+		}
+		return { ...msg, condenseParent: condenseId }
 	})
 
 	// Append the summary message at the end
@@ -507,6 +547,220 @@ ${commandBlocks}
 
 	const newContextTokens = messageTokens + toolTokens
 	return { messages: newMessages, summary, cost, newContextTokens, condenseId }
+}
+
+/**
+ * Generates a global summary Q by merging multiple sub-task summaries via LLM.
+ *
+ * @param summaries - Array of {title, summary} for each completed sub-task
+ * @param apiHandler - The API handler for LLM calls
+ * @returns The merged global summary text, or null if generation fails
+ */
+export async function generateGlobalSummaryText(
+	summaries: Array<{ title: string; summary: string }>,
+	apiHandler: ApiHandler,
+): Promise<{ text: string; cost: number } | null> {
+	if (summaries.length === 0) {
+		return null
+	}
+
+	// Single summary: just return it directly (no LLM call needed)
+	if (summaries.length === 1) {
+		return { text: summaries[0].summary, cost: 0 }
+	}
+
+	const formattedSummaries = summaries.map((s, i) => `### Sub-Task ${i + 1}: ${s.title}\n${s.summary}`).join("\n\n")
+
+	const mergePrompt = `Below are summaries of completed sub-tasks in chronological order.
+Merge them into a single comprehensive global summary that captures:
+1. The overall progress and key decisions made
+2. Important technical details, patterns, and architecture decisions
+3. Current state of the work and what has been accomplished
+4. Key files that were modified or created
+
+Sub-Task Summaries:
+${formattedSummaries}
+
+Generate a concise but comprehensive global summary. Do NOT use headers or bullet points for the top level - write flowing prose with technical details. Keep it under 2000 words.`
+
+	const requestMessages: Anthropic.MessageParam[] = [{ role: "user", content: mergePrompt }]
+
+	const systemPrompt =
+		"You are a technical summarizer. Merge the provided sub-task summaries into one comprehensive global summary that preserves all important context for continuing the work."
+
+	try {
+		let text = ""
+		let cost = 0
+
+		const stream = apiHandler.createMessage(systemPrompt, requestMessages)
+
+		for await (const chunk of stream) {
+			if (chunk.type === "text") {
+				text += chunk.text
+			} else if (chunk.type === "usage") {
+				cost = chunk.totalCost ?? 0
+			}
+		}
+
+		text = text.trim()
+		if (text.length === 0) {
+			return null
+		}
+
+		return { text, cost }
+	} catch (error) {
+		console.error("[generateGlobalSummaryText] Failed to generate global summary:", error)
+		return null
+	}
+}
+
+/**
+ * Auto-updates the Global Summary Q after auto-condense creates a new summary.
+ * Called automatically by manageContext after summarizeConversation succeeds.
+ *
+ * - If only 1 visible summary: promotes it to Global Q (no LLM call)
+ * - If 2+ visible summaries: merges them into a new Global Q via LLM
+ *
+ * The LLM merge call uses minimal context: only a merge instruction and summary texts.
+ *
+ * @param messages - The messages after summarizeConversation has run
+ * @param apiHandler - The API handler for LLM calls
+ * @returns Updated messages with Global Q, and additional cost
+ */
+export async function autoUpdateGlobalSummary(
+	messages: ApiMessage[],
+	apiHandler: ApiHandler,
+): Promise<{ messages: ApiMessage[]; cost: number }> {
+	// Build ID sets matching getEffectiveApiHistory logic
+	const existingSummaryIds = new Set<string>()
+	const summaryPositions = new Map<string, number>()
+	const existingTruncationIds = new Set<string>()
+
+	for (let i = 0; i < messages.length; i++) {
+		const msg = messages[i]
+		if (msg.isSummary && msg.condenseId) {
+			existingSummaryIds.add(msg.condenseId)
+			summaryPositions.set(msg.condenseId, i)
+		}
+		if (msg.isTruncationMarker && msg.truncationId) {
+			existingTruncationIds.add(msg.truncationId)
+		}
+	}
+
+	// Find visible summaries using the same logic as getEffectiveApiHistory
+	const visibleSummaries: Array<{ index: number; msg: ApiMessage }> = []
+	for (let i = 0; i < messages.length; i++) {
+		const msg = messages[i]
+		if (!msg.isSummary) continue
+		// Hidden by condenseParent?
+		if (msg.condenseParent && existingSummaryIds.has(msg.condenseParent)) {
+			const parentPos = summaryPositions.get(msg.condenseParent)
+			if (parentPos !== undefined && i < parentPos) {
+				continue
+			}
+		}
+		// Hidden by truncationParent?
+		if (msg.truncationParent && existingTruncationIds.has(msg.truncationParent)) {
+			continue
+		}
+		visibleSummaries.push({ index: i, msg })
+	}
+
+	if (visibleSummaries.length === 0) {
+		return { messages, cost: 0 }
+	}
+
+	// Case 1: Single visible summary → promote to Global Q (no LLM call)
+	if (visibleSummaries.length === 1) {
+		const { index, msg } = visibleSummaries[0]
+		if (msg.isGlobalSummary) {
+			return { messages, cost: 0 } // already a Global Q
+		}
+		const updated = [...messages]
+		const cloned: ApiMessage = { ...msg, isGlobalSummary: true }
+		// Update heading in content
+		if (Array.isArray(cloned.content)) {
+			const content = [...(cloned.content as Anthropic.Messages.ContentBlockParam[])]
+			if (content.length > 0 && content[0].type === "text") {
+				const tb = content[0] as Anthropic.Messages.TextBlockParam
+				content[0] = {
+					type: "text",
+					text: tb.text.replace(
+						/^## (Conversation Summary|Sub-Task Summary:[^\n]*)/,
+						"## Global Task Summary",
+					),
+				}
+			}
+			cloned.content = content
+		}
+		updated[index] = cloned
+		return { messages: updated, cost: 0 }
+	}
+
+	// Case 2: 2+ visible summaries → merge into new Global Q via LLM
+	const summaryInputs: Array<{ title: string; summary: string }> = visibleSummaries.map(({ msg }, i) => {
+		let text = ""
+		if (Array.isArray(msg.content)) {
+			const blocks = msg.content as Anthropic.Messages.ContentBlockParam[]
+			const firstTextBlock = blocks.find((b): b is Anthropic.Messages.TextBlockParam => b.type === "text")
+			text = firstTextBlock?.text ?? ""
+		} else if (typeof msg.content === "string") {
+			text = msg.content
+		}
+		const headingMatch = text.match(/^## (?:Global Task Summary|Conversation Summary|Sub-Task Summary: ([^\n]*))\n/)
+		const title = headingMatch?.[1] || `Summary ${i + 1}`
+		const cleanText = text.replace(/^## [^\n]*\n/, "").trim()
+		return { title, summary: cleanText }
+	})
+
+	const globalResult = await generateGlobalSummaryText(summaryInputs, apiHandler)
+	if (!globalResult) {
+		return { messages, cost: 0 }
+	}
+
+	const newQId = crypto.randomUUID()
+	const lastTs = messages[messages.length - 1]?.ts ?? Date.now()
+
+	// Preserve auxiliary content blocks (command, folded files, env) from the latest summary
+	const latestSummary = visibleSummaries[visibleSummaries.length - 1].msg
+	const auxiliaryBlocks: Anthropic.Messages.ContentBlockParam[] = []
+	if (Array.isArray(latestSummary.content)) {
+		const blocks = latestSummary.content as Anthropic.Messages.ContentBlockParam[]
+		let skippedFirst = false
+		for (const block of blocks) {
+			if (!skippedFirst && block.type === "text") {
+				skippedFirst = true
+				continue
+			}
+			auxiliaryBlocks.push(block)
+		}
+	}
+
+	// Tag all visible summaries with new Q's condenseId
+	const visibleIndices = new Set(visibleSummaries.map((vs) => vs.index))
+	const updatedMessages = messages.map((msg, index) => {
+		if (visibleIndices.has(index)) {
+			return { ...msg, condenseParent: newQId }
+		}
+		return msg
+	})
+
+	// Append new Global Q
+	const qContent: Anthropic.Messages.ContentBlockParam[] = [
+		{ type: "text", text: `## Global Task Summary\n${globalResult.text}` },
+		...auxiliaryBlocks,
+	]
+	const qMessage: ApiMessage = {
+		role: "user",
+		content: qContent,
+		ts: lastTs + 1,
+		isSummary: true,
+		isGlobalSummary: true,
+		condenseId: newQId,
+	}
+	updatedMessages.push(qMessage)
+
+	return { messages: updatedMessages, cost: globalResult.cost }
 }
 
 /**
@@ -544,79 +798,25 @@ export function getMessagesSinceLastSummary(messages: ApiMessage[]): ApiMessage[
  * @returns The filtered history that should be sent to the API
  */
 export function getEffectiveApiHistory(messages: ApiMessage[]): ApiMessage[] {
-	// Find the most recent summary message
-	const lastSummary = findLast(messages, (msg) => msg.isSummary === true)
+	// Multi-Summary Model: keep ALL summary messages visible, filter out condensed/truncated messages.
+	// This supports task_memory sub-task condensing where each sub-task gets its own summary
+	// and the model sees: [summary_1, summary_2, ..., summary_N, current_raw_messages]
+	//
+	// Backward compatible with old "Fresh Start" data: if old condensation tagged ALL messages
+	// (including previous summaries) with condenseParent, those summaries are correctly hidden
+	// because their condenseParent points to a newer summary that exists.
 
-	if (lastSummary) {
-		// Fresh start model: return only messages from the summary onwards
-		const summaryIndex = messages.indexOf(lastSummary)
-		let messagesFromSummary = messages.slice(summaryIndex)
-
-		// Collect all tool_use IDs from assistant messages in the result
-		// This is needed to filter out orphan tool_result blocks that reference
-		// tool_use IDs from messages that were condensed away
-		const toolUseIds = new Set<string>()
-		for (const msg of messagesFromSummary) {
-			if (msg.role === "assistant" && Array.isArray(msg.content)) {
-				for (const block of msg.content) {
-					if (block.type === "tool_use" && (block as Anthropic.Messages.ToolUseBlockParam).id) {
-						toolUseIds.add((block as Anthropic.Messages.ToolUseBlockParam).id)
-					}
-				}
-			}
-		}
-
-		// Filter out orphan tool_result blocks from user messages
-		messagesFromSummary = messagesFromSummary
-			.map((msg) => {
-				if (msg.role === "user" && Array.isArray(msg.content)) {
-					const filteredContent = msg.content.filter((block) => {
-						if (block.type === "tool_result") {
-							return toolUseIds.has((block as Anthropic.Messages.ToolResultBlockParam).tool_use_id)
-						}
-						return true
-					})
-					// If all content was filtered out, mark for removal
-					if (filteredContent.length === 0) {
-						return null
-					}
-					// If some content was filtered, return updated message
-					if (filteredContent.length !== msg.content.length) {
-						return { ...msg, content: filteredContent }
-					}
-				}
-				return msg
-			})
-			.filter((msg): msg is ApiMessage => msg !== null)
-
-		// Still need to filter out any truncated messages within this range
-		const existingTruncationIds = new Set<string>()
-		for (const msg of messagesFromSummary) {
-			if (msg.isTruncationMarker && msg.truncationId) {
-				existingTruncationIds.add(msg.truncationId)
-			}
-		}
-
-		return messagesFromSummary.filter((msg) => {
-			// Filter out truncated messages if their truncation marker exists
-			if (msg.truncationParent && existingTruncationIds.has(msg.truncationParent)) {
-				return false
-			}
-			return true
-		})
-	}
-
-	// No summary - filter based on condenseParent and truncationParent as before
-	// This handles the case of orphaned condenseParent tags (summary was deleted via rewind)
-
-	// Collect all condenseIds of summaries that exist in the current history
+	// Collect all condenseIds of summaries that exist in the current history, and their positions
 	const existingSummaryIds = new Set<string>()
+	const summaryPositions = new Map<string, number>()
 	// Collect all truncationIds of truncation markers that exist in the current history
 	const existingTruncationIds = new Set<string>()
 
-	for (const msg of messages) {
+	for (let i = 0; i < messages.length; i++) {
+		const msg = messages[i]
 		if (msg.isSummary && msg.condenseId) {
 			existingSummaryIds.add(msg.condenseId)
+			summaryPositions.set(msg.condenseId, i)
 		}
 		if (msg.isTruncationMarker && msg.truncationId) {
 			existingTruncationIds.add(msg.truncationId)
@@ -624,12 +824,18 @@ export function getEffectiveApiHistory(messages: ApiMessage[]): ApiMessage[] {
 	}
 
 	// Filter out messages whose condenseParent points to an existing summary
-	// or whose truncationParent points to an existing truncation marker.
-	// Messages with orphaned parents (summary/marker was deleted) are included.
-	return messages.filter((msg) => {
-		// Filter out condensed messages if their summary exists
+	// AND that appear BEFORE their summary in the array (position-aware).
+	// Messages AFTER their summary are kept for backward compatibility with old data
+	// where ALL messages were tagged with condenseParent (including post-summary ones).
+	// Messages with orphaned parents (summary/marker was deleted) are included (rewind support).
+	let effective = messages.filter((msg, index) => {
+		// Filter out condensed messages if their summary exists AND message is before the summary
 		if (msg.condenseParent && existingSummaryIds.has(msg.condenseParent)) {
-			return false
+			const summaryPos = summaryPositions.get(msg.condenseParent)
+			if (summaryPos !== undefined && index < summaryPos) {
+				return false
+			}
+			// Message is after its summary → keep (backward compat with old tagging)
 		}
 		// Filter out truncated messages if their truncation marker exists
 		if (msg.truncationParent && existingTruncationIds.has(msg.truncationParent)) {
@@ -637,6 +843,44 @@ export function getEffectiveApiHistory(messages: ApiMessage[]): ApiMessage[] {
 		}
 		return true
 	})
+
+	// Handle orphan tool_result blocks: tool_use was condensed away but tool_result remains.
+	// Collect all tool_use IDs from assistant messages in the effective set.
+	const toolUseIds = new Set<string>()
+	for (const msg of effective) {
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			for (const block of msg.content) {
+				if (block.type === "tool_use" && (block as Anthropic.Messages.ToolUseBlockParam).id) {
+					toolUseIds.add((block as Anthropic.Messages.ToolUseBlockParam).id)
+				}
+			}
+		}
+	}
+
+	// Filter out orphan tool_result blocks from user messages
+	effective = effective
+		.map((msg) => {
+			if (msg.role === "user" && Array.isArray(msg.content)) {
+				const filteredContent = msg.content.filter((block) => {
+					if (block.type === "tool_result") {
+						return toolUseIds.has((block as Anthropic.Messages.ToolResultBlockParam).tool_use_id)
+					}
+					return true
+				})
+				// If all content was filtered out, mark for removal
+				if (filteredContent.length === 0) {
+					return null
+				}
+				// If some content was filtered, return updated message
+				if (filteredContent.length !== msg.content.length) {
+					return { ...msg, content: filteredContent }
+				}
+			}
+			return msg
+		})
+		.filter((msg): msg is ApiMessage => msg !== null)
+
+	return effective
 }
 
 /**

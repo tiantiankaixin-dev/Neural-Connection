@@ -35,6 +35,7 @@ export const commandIds = [
 	"popoutButtonClicked",
 	"cloudButtonClicked",
 	"settingsButtonClicked",
+	"neuralAgentButtonClicked",
 
 	"openInNewTab",
 

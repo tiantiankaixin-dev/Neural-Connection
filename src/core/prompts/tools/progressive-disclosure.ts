@@ -47,6 +47,18 @@ const TOOL_BRIEFS: Record<string, string> = {
 	search_replace: "Search and replace in a file",
 	edit_file: "Edit a file using search/replace",
 	apply_patch: "Apply a patch in codex format",
+	// Cascade-style tools
+	find_by_name: "Search for files and directories by name within a specified directory using glob patterns",
+	command_status: "Check the status of a previously started terminal command by its ID",
+	read_terminal: "Reads the contents of a terminal given its process ID",
+	read_url_content: "Read content from a URL",
+	search_web: "Performs a web search to get relevant web documents",
+	multi_edit: "Performs multiple edits to a single file in one operation",
+	read_notebook: "Read and parse a Jupyter notebook file",
+	edit_notebook: "Completely replaces the contents of a specific cell in a Jupyter notebook",
+	view_content_chunk: "View a specific chunk of a web or knowledge base document content",
+	create_memory: "Save important context relevant to the USER and their task to a memory database",
+	task_memory: "Autonomous task lifecycle memory — track task start/end and search past task history",
 }
 
 // Cache full tool definitions so we can return them when a stripped tool is "discovered"

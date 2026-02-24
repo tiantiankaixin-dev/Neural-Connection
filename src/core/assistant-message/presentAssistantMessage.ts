@@ -15,16 +15,27 @@ import { AskIgnoredError } from "../task/AskIgnoredError"
 import { Task } from "../task/Task"
 
 import { listFilesTool } from "../tools/ListFilesTool"
+import { findByNameTool } from "../tools/FindByNameTool"
 import { readFileTool } from "../tools/ReadFileTool"
 import { readCommandOutputTool } from "../tools/ReadCommandOutputTool"
 import { writeToFileTool } from "../tools/WriteToFileTool"
 import { editTool } from "../tools/EditTool"
+import { multiEditTool } from "../tools/MultiEditTool"
 import { searchReplaceTool } from "../tools/SearchReplaceTool"
 import { editFileTool } from "../tools/EditFileTool"
 import { applyPatchTool } from "../tools/ApplyPatchTool"
 import { searchFilesTool } from "../tools/SearchFilesTool"
 import { browserActionTool } from "../tools/BrowserActionTool"
 import { executeCommandTool } from "../tools/ExecuteCommandTool"
+import { commandStatusTool } from "../tools/CommandStatusTool"
+import { readTerminalTool } from "../tools/ReadTerminalTool"
+import { readUrlContentTool } from "../tools/ReadUrlContentTool"
+import { readNotebookTool } from "../tools/ReadNotebookTool"
+import { editNotebookTool } from "../tools/EditNotebookTool"
+import { viewContentChunkTool } from "../tools/ViewContentChunkTool"
+import { createMemoryTool } from "../tools/CreateMemoryTool"
+import { taskMemoryTool } from "../tools/TaskMemoryTool"
+import { searchWebTool } from "../tools/SearchWebTool"
 import { useMcpToolTool } from "../tools/UseMcpToolTool"
 import { accessMcpResourceTool } from "../tools/accessMcpResourceTool"
 import { askFollowupQuestionTool } from "../tools/AskFollowupQuestionTool"
@@ -760,6 +771,14 @@ export async function presentAssistantMessage(cline: Task) {
 						pushToolResult,
 					})
 					break
+				case "multi_edit":
+					await checkpointSaveAndMark(cline)
+					await multiEditTool.handle(cline, block as ToolUse<"multi_edit">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
 				case "edit_file":
 					await checkpointSaveAndMark(cline)
 					await editFileTool.handle(cline, block as ToolUse<"edit_file">, {
@@ -791,6 +810,13 @@ export async function presentAssistantMessage(cline: Task) {
 						pushToolResult,
 					})
 					break
+				case "find_by_name":
+					await findByNameTool.handle(cline, block as ToolUse<"find_by_name">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
 				case "codebase_search":
 					await codebaseSearchTool.handle(cline, block as ToolUse<"codebase_search">, {
 						askApproval,
@@ -816,6 +842,70 @@ export async function presentAssistantMessage(cline: Task) {
 					break
 				case "execute_command":
 					await executeCommandTool.handle(cline, block as ToolUse<"execute_command">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "command_status":
+					await commandStatusTool.handle(cline, block as ToolUse<"command_status">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "read_terminal":
+					await readTerminalTool.handle(cline, block as ToolUse<"read_terminal">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "read_url_content":
+					await readUrlContentTool.handle(cline, block as ToolUse<"read_url_content">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "read_notebook":
+					await readNotebookTool.handle(cline, block as ToolUse<"read_notebook">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "edit_notebook":
+					await checkpointSaveAndMark(cline)
+					await editNotebookTool.handle(cline, block as ToolUse<"edit_notebook">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "view_content_chunk":
+					await viewContentChunkTool.handle(cline, block as ToolUse<"view_content_chunk">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "create_memory":
+					await createMemoryTool.handle(cline, block as ToolUse<"create_memory">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "task_memory":
+					await taskMemoryTool.handle(cline, block as ToolUse<"task_memory">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				case "search_web":
+					await searchWebTool.handle(cline, block as ToolUse<"search_web">, {
 						askApproval,
 						handleError,
 						pushToolResult,

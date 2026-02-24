@@ -42,6 +42,7 @@
 		"ui": "UI",
 		"experimental": "Experimental",
 		"language": "Language",
+		"neuralAgent": "Neural Agent",
 		"about": "About Roo Code"
 	},
 	"about": {

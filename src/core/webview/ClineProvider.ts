@@ -2165,6 +2165,9 @@ export class ClineProvider
 			featureRoomoteControlEnabled,
 			isBrowserSessionActive,
 			lockApiConfigAcrossModes,
+			neuralAgentEnabled,
+			neuralAgentOllamaUrl,
+			neuralAgentModelId,
 		} = await this.getState()
 
 		let cloudOrganizations: CloudOrganizationMembership[] = []
@@ -2332,6 +2335,9 @@ export class ClineProvider
 				}
 			})(),
 			debug: vscode.workspace.getConfiguration(Package.name).get<boolean>("debug", false),
+			neuralAgentEnabled: neuralAgentEnabled ?? false,
+			neuralAgentOllamaUrl,
+			neuralAgentModelId,
 		}
 	}
 
@@ -2576,6 +2582,9 @@ export class ClineProvider
 					return false
 				}
 			})(),
+			neuralAgentEnabled: stateValues.neuralAgentEnabled ?? false,
+			neuralAgentOllamaUrl: stateValues.neuralAgentOllamaUrl,
+			neuralAgentModelId: stateValues.neuralAgentModelId,
 		}
 	}
 

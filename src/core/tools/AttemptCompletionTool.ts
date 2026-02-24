@@ -10,6 +10,7 @@ import type { ToolUse } from "../../shared/tools"
 import { t } from "../../i18n"
 
 import { BaseTool, ToolCallbacks } from "./BaseTool"
+import { summarizeConversation, autoUpdateGlobalSummary } from "../condense"
 
 interface AttemptCompletionParams {
 	result: string
@@ -87,6 +88,30 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 
 			TelemetryService.instance.captureTaskCompleted(task.taskId)
 			task.emit(RooCodeEventName.TaskCompleted, task.taskId, task.getTokenUsage(), task.toolUsage)
+
+			// Auto-generate Global Summary Q on task completion.
+			// Uses minimal LLM context (only summary instruction + messages to summarize).
+			// This ensures the model sees a compact summary of completed work,
+			// whether the user approves or provides feedback to continue.
+			try {
+				const messages = task.apiConversationHistory
+				if (messages.length > 2) {
+					const condenseResult = await summarizeConversation({
+						messages,
+						apiHandler: task.api,
+						systemPrompt: "",
+						taskId: task.taskId,
+						isAutomaticTrigger: true,
+					})
+					if (!condenseResult.error && condenseResult.messages !== messages) {
+						const globalUpdate = await autoUpdateGlobalSummary(condenseResult.messages, task.api)
+						await task.overwriteApiConversationHistory(globalUpdate.messages)
+					}
+				}
+			} catch (error) {
+				console.error("[AttemptCompletionTool] Auto Global Q generation failed:", error)
+				// Non-critical: failure shouldn't block task completion
+			}
 
 			// Check for subtask using parentTaskId (metadata-driven delegation)
 			if (task.parentTaskId) {

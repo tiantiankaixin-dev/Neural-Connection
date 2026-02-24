@@ -108,6 +108,9 @@ export interface ExtensionMessage {
 		| "branchWorktreeIncludeResult"
 		| "folderSelected"
 		| "skills"
+		// Neural Agent
+		| "neuralAgentStatus"
+		| "neuralAgentModels"
 	text?: string
 	payload?: any // eslint-disable-line @typescript-eslint/no-explicit-any
 	checkpointWarning?: {
@@ -120,6 +123,7 @@ export interface ExtensionMessage {
 		| "historyButtonClicked"
 		| "marketplaceButtonClicked"
 		| "cloudButtonClicked"
+		| "discussButtonClicked"
 		| "didBecomeVisible"
 		| "focusInput"
 		| "switchTab"
@@ -317,6 +321,9 @@ export type ExtensionState = Pick<
 	| "requestDelaySeconds"
 	| "showWorktreesInHomeScreen"
 	| "disabledTools"
+	| "neuralAgentEnabled"
+	| "neuralAgentOllamaUrl"
+	| "neuralAgentModelId"
 > & {
 	lockApiConfigAcrossModes?: boolean
 	version: string
@@ -598,6 +605,12 @@ export interface WebviewMessage {
 		| "moveSkill"
 		| "updateSkillModes"
 		| "openSkillFile"
+		// Neural Agent messages
+		| "neuralAgentToggle"
+		| "neuralAgentGetStatus"
+		| "neuralAgentInstallPlatform"
+		| "neuralAgentShowModelDetail"
+		| "neuralAgentFetchModels"
 	text?: string
 	editedMessageContent?: string
 	tab?: "settings" | "history" | "mcp" | "modes" | "chat" | "marketplace" | "cloud"
@@ -632,6 +645,8 @@ export interface WebviewMessage {
 	timeout?: number
 	payload?: WebViewMessagePayload
 	source?: "global" | "project" | "built-in"
+	platformName?: string // For neuralAgentInstallPlatform
+	installCmd?: { windows: string; macos: string; linux: string } // For neuralAgentInstallPlatform
 	skillName?: string // For skill operations (createSkill, deleteSkill, moveSkill, openSkillFile)
 	/** @deprecated Use skillModeSlugs instead */
 	skillMode?: string // For skill operations (current mode restriction)
@@ -787,6 +802,7 @@ export interface ClineSayTool {
 		| "listFilesTopLevel"
 		| "listFilesRecursive"
 		| "searchFiles"
+		| "findByName"
 		| "switchMode"
 		| "newTask"
 		| "finishTask"
@@ -808,6 +824,7 @@ export interface ClineSayTool {
 	diffStats?: { added: number; removed: number }
 	regex?: string
 	filePattern?: string
+	pattern?: string
 	mode?: string
 	reason?: string
 	isOutsideWorkspace?: boolean

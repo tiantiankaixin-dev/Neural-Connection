@@ -20,11 +20,12 @@ import { CheckpointRestoreDialog } from "./components/chat/CheckpointRestoreDial
 import { DeleteMessageDialog, EditMessageDialog } from "./components/chat/MessageModificationConfirmationDialog"
 import ErrorBoundary from "./components/ErrorBoundary"
 import { CloudView } from "./components/cloud/CloudView"
+import DiscussView from "./components/discuss/DiscussView"
 import { useAddNonInteractiveClickListener } from "./components/ui/hooks/useNonInteractiveClick"
 import { TooltipProvider } from "./components/ui/tooltip"
 import { STANDARD_TOOLTIP_DELAY } from "./components/ui/standard-tooltip"
 
-type Tab = "settings" | "history" | "chat" | "marketplace" | "cloud"
+type Tab = "settings" | "history" | "chat" | "marketplace" | "cloud" | "discuss"
 
 interface DeleteMessageDialogState {
 	isOpen: boolean
@@ -50,6 +51,7 @@ const tabsByMessageAction: Partial<Record<NonNullable<ExtensionMessage["action"]
 	historyButtonClicked: "history",
 	marketplaceButtonClicked: "marketplace",
 	cloudButtonClicked: "cloud",
+	discussButtonClicked: "discuss",
 }
 
 const App = () => {
@@ -237,6 +239,7 @@ const App = () => {
 					targetTab={currentMarketplaceTab as "mcp" | "mode" | undefined}
 				/>
 			)}
+			{tab === "discuss" && <DiscussView onDone={() => switchTab("chat")} />}
 			{tab === "cloud" && (
 				<CloudView
 					userInfo={cloudUserInfo}

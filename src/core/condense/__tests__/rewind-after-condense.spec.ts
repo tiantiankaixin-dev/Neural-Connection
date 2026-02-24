@@ -194,29 +194,29 @@ describe("Rewind After Condense - Issue #8295", () => {
 			expect(effectiveAfter.length).toBe(5) // All messages visible
 		})
 
-		it("should hide condensed messages when their summary still exists (fresh start)", () => {
+		it("should hide condensed messages when their summary still exists (multi-summary)", () => {
 			const condenseId = "summary-exists"
 
-			// Scenario: Messages were condensed and summary exists - fresh start model returns
-			// only the summary and messages after it, NOT messages before the summary
+			// Scenario: Messages were condensed and summary exists - condensed messages
+			// (those BEFORE the summary with condenseParent) are hidden
 			const messages: ApiMessage[] = [
-				{ role: "user", content: "Start", ts: 1 },
+				{ role: "user", content: "Start", ts: 1, condenseParent: condenseId },
 				{ role: "assistant", content: "Response 1", ts: 2, condenseParent: condenseId },
 				{ role: "user", content: "More", ts: 3, condenseParent: condenseId },
 				{ role: "user", content: "Summary", ts: 4, isSummary: true, condenseId },
 				{ role: "assistant", content: "After summary", ts: 5 },
 			]
 
-			// Fresh start model: effective history is summary + messages after it
-			// "Start" is NOT included because it's before the summary
+			// Multi-summary model: condensed messages before summary are hidden
 			const effective = getEffectiveApiHistory(messages)
-			expect(effective.length).toBe(2) // Summary, After summary (NOT Start)
+			expect(effective.length).toBe(2) // Summary, After summary
 			expect(effective[0].content).toBe("Summary")
 			expect(effective[0].isSummary).toBe(true)
 			expect(effective[1].content).toBe("After summary")
 
 			// cleanupAfterTruncation should NOT clear condenseParent since summary exists
 			const cleaned = cleanupAfterTruncation(messages)
+			expect(cleaned[0].condenseParent).toBe(condenseId)
 			expect(cleaned[1].condenseParent).toBe(condenseId)
 			expect(cleaned[2].condenseParent).toBe(condenseId)
 		})
