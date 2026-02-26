@@ -63,8 +63,6 @@ import { EMBEDDING_MODEL_PROFILES } from "../../shared/embeddingModels"
 import { ProfileValidator } from "../../shared/ProfileValidator"
 
 import { Terminal } from "../../integrations/terminal/Terminal"
-import { downloadTask, getTaskFileName } from "../../integrations/misc/export-markdown"
-import { resolveDefaultSaveUri, saveLastExportPath } from "../../utils/export"
 import { getTheme } from "../../integrations/theme/getTheme"
 import WorkspaceTracker from "../../integrations/workspace/WorkspaceTracker"
 
@@ -94,6 +92,8 @@ import { ContextProxy } from "../config/ContextProxy"
 import { ProviderSettingsManager } from "../config/ProviderSettingsManager"
 import { CustomModesManager } from "../config/CustomModesManager"
 import { Task } from "../task/Task"
+import { summarizeConversation, autoUpdateGlobalSummary } from "../condense"
+import { SummaryPanel } from "./SummaryPanel"
 
 import { webviewMessageHandler } from "./webviewMessageHandler"
 import type { ClineMessage, TodoItem } from "@roo-code/types"
@@ -1730,16 +1730,23 @@ export class ClineProvider
 			throw new Error("Task not found")
 		}
 
-		const { getTaskDirectoryPath } = await import("../../utils/storage")
+		const { getTaskDirectoryPath, getTaskContextPath } = await import("../../utils/storage")
 		const globalStoragePath = this.contextProxy.globalStorageUri.fsPath
 		const taskDirPath = await getTaskDirectoryPath(globalStoragePath, id)
-		const apiConversationHistoryFilePath = path.join(taskDirPath, GlobalFileNames.apiConversationHistory)
-		const uiMessagesFilePath = path.join(taskDirPath, GlobalFileNames.uiMessages)
-		const fileExists = await fileExistsAtPath(apiConversationHistoryFilePath)
+		const contextDirPath = await getTaskContextPath(globalStoragePath, id)
+
+		// Check context/ subdirectory first, then fall back to task root
+		const newApiPath = path.join(contextDirPath, GlobalFileNames.apiConversationHistory)
+		const legacyApiPath = path.join(taskDirPath, GlobalFileNames.apiConversationHistory)
+		const apiConversationHistoryFilePath = (await fileExistsAtPath(newApiPath)) ? newApiPath : legacyApiPath
+
+		const newUiPath = path.join(contextDirPath, GlobalFileNames.uiMessages)
+		const legacyUiPath = path.join(taskDirPath, GlobalFileNames.uiMessages)
+		const uiMessagesFilePath = (await fileExistsAtPath(newUiPath)) ? newUiPath : legacyUiPath
 
 		let apiConversationHistory: Anthropic.MessageParam[] = []
 
-		if (fileExists) {
+		if (await fileExistsAtPath(apiConversationHistoryFilePath)) {
 			try {
 				apiConversationHistory = JSON.parse(await fs.readFile(apiConversationHistoryFilePath, "utf8"))
 			} catch (error) {
@@ -1787,16 +1794,96 @@ export class ClineProvider
 	}
 
 	async exportTaskWithId(id: string) {
-		const { historyItem, apiConversationHistory } = await this.getTaskWithId(id)
-		const fileName = getTaskFileName(historyItem.ts)
-		const defaultUri = await resolveDefaultSaveUri(this.contextProxy, "lastTaskExportPath", fileName, {
-			useWorkspace: false,
-			fallbackDir: path.join(os.homedir(), "Downloads"),
-		})
-		const saveUri = await downloadTask(historyItem.ts, apiConversationHistory, defaultUri)
+		const { historyItem, taskDirPath, apiConversationHistory } = await this.getTaskWithId(id)
 
-		if (saveUri) {
-			await saveLastExportPath(this.contextProxy, "lastTaskExportPath", saveUri)
+		// Build a human-friendly folder name from the task timestamp
+		const date = new Date(historyItem.ts)
+		const month = date.toLocaleString("en-US", { month: "short" }).toLowerCase()
+		const day = date.getDate()
+		const year = date.getFullYear()
+		let hours = date.getHours()
+		const minutes = date.getMinutes().toString().padStart(2, "0")
+		const seconds = date.getSeconds().toString().padStart(2, "0")
+		const ampm = hours >= 12 ? "pm" : "am"
+		hours = hours % 12 || 12
+		const folderName = `roo_task_${month}-${day}-${year}_${hours}-${minutes}-${seconds}-${ampm}`
+
+		// Determine default location
+		const lastExportPath = this.contextProxy.getValue("lastTaskExportPath") as string | undefined
+		let defaultDir: vscode.Uri
+		if (lastExportPath) {
+			defaultDir = vscode.Uri.file(path.dirname(lastExportPath))
+		} else {
+			defaultDir = vscode.Uri.file(path.join(os.homedir(), "Downloads"))
+		}
+
+		// Ask user to pick a destination folder
+		const selected = await vscode.window.showOpenDialog({
+			canSelectFiles: false,
+			canSelectFolders: true,
+			canSelectMany: false,
+			openLabel: "Export Task Folder Here",
+			defaultUri: defaultDir,
+		})
+
+		if (!selected || selected.length === 0) {
+			return
+		}
+
+		const destRoot = path.join(selected[0].fsPath, folderName)
+
+		// Recursively copy the task directory to the destination
+		const copyDir = async (src: string, dest: string) => {
+			await fs.mkdir(dest, { recursive: true })
+			const entries = await fs.readdir(src, { withFileTypes: true })
+			for (const entry of entries) {
+				const srcPath = path.join(src, entry.name)
+				const destPath = path.join(dest, entry.name)
+				if (entry.isDirectory()) {
+					await copyDir(srcPath, destPath)
+				} else {
+					await fs.copyFile(srcPath, destPath)
+				}
+			}
+		}
+
+		try {
+			await copyDir(taskDirPath, destRoot)
+
+			// Also generate a readable markdown summary inside the exported folder
+			if (apiConversationHistory.length > 0) {
+				const markdownContent = apiConversationHistory
+					.map((message) => {
+						const role = message.role === "user" ? "**User:**" : "**Assistant:**"
+						const content = Array.isArray(message.content)
+							? message.content
+									.map((block: any) => {
+										if (block.type === "text") return block.text
+										if (block.type === "tool_use") return `[Tool Use: ${block.name}]`
+										if (block.type === "tool_result") {
+											const c = typeof block.content === "string" ? block.content : "[result]"
+											return `[Tool Result${block.is_error ? " (Error)" : ""}]\n${c}`
+										}
+										return `[${block.type}]`
+									})
+									.join("\n")
+							: message.content
+						return `${role}\n\n${content}\n\n`
+					})
+					.join("---\n\n")
+				await fs.writeFile(path.join(destRoot, "conversation.md"), markdownContent, "utf8")
+			}
+
+			await this.contextProxy.setValue("lastTaskExportPath", destRoot)
+			vscode.window.showInformationMessage(`Task exported to: ${destRoot}`)
+
+			// Open the exported folder in the system file explorer
+			const destUri = vscode.Uri.file(destRoot)
+			await vscode.env.openExternal(destUri)
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Failed to export task folder: ${error instanceof Error ? error.message : String(error)}`,
+			)
 		}
 	}
 
@@ -3111,7 +3198,60 @@ export class ClineProvider
 		if (this.clineStack.length > 0) {
 			const task = this.clineStack[this.clineStack.length - 1]
 			console.log(`[clearTask] clearing task ${task.taskId}.${task.instanceId}`)
+
+			// Auto-generate summary on task end (system-triggered, no AI tool call needed).
+			// Capture data before clearing so the summarization can run in the background.
+			const messages = [...task.apiConversationHistory]
+			const taskId = task.taskId
+			let condensingApi: any = null
+
+			// Check if a summary was already generated (e.g. by AttemptCompletionTool)
+			const alreadyHasSummary = messages.some((m: any) => m.isSummary)
+
+			if (messages.length > 2 && !alreadyHasSummary) {
+				try {
+					condensingApi = await task.getCondensingApiHandler()
+				} catch (err) {
+					console.error("[clearTask] Failed to get condensing API handler:", err)
+				}
+			}
+
 			await this.removeClineFromStack()
+
+			// Fire-and-forget: generate summary in background after task is cleared
+			if (messages.length > 2 && !alreadyHasSummary && condensingApi) {
+				console.log("[clearTask] Auto-generating summary for ended task", taskId, "messages:", messages.length)
+				summarizeConversation({
+					messages,
+					apiHandler: condensingApi,
+					systemPrompt: "",
+					taskId,
+					isAutomaticTrigger: true,
+				})
+					.then((result) => {
+						console.log(
+							"[clearTask] summarizeConversation result: error=",
+							result.error,
+							"summary length=",
+							result.summary?.length,
+						)
+						if (!result.error && result.messages !== messages) {
+							return autoUpdateGlobalSummary(result.messages, condensingApi).then(() => {
+								console.log("[clearTask] Global summary updated successfully")
+							})
+						}
+						return undefined
+					})
+					.catch((err) => {
+						console.error("[clearTask] Auto summary generation failed:", err)
+					})
+			} else if (messages.length > 2 && alreadyHasSummary) {
+				console.log(
+					"[clearTask] Skipped auto-summary: task already has a summary (likely from AttemptCompletionTool)",
+				)
+			} else {
+				console.log("[clearTask] Skipped auto-summary: messages.length =", messages.length)
+			}
 		}
 	}
 

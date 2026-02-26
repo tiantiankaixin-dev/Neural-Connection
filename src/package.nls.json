@@ -12,6 +12,7 @@
 	"command.cloud.title": "Cloud",
 	"command.settings.title": "Settings",
 	"command.neuralAgent.title": "Neural Agent",
+	"command.condensingModel.title": "Condensing Model",
 	"command.documentation.title": "Documentation",
 	"command.openInNewTab.title": "Open In New Tab",
 	"command.explainCode.title": "Explain Code",

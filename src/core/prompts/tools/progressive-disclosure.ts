@@ -59,6 +59,7 @@ const TOOL_BRIEFS: Record<string, string> = {
 	view_content_chunk: "View a specific chunk of a web or knowledge base document content",
 	create_memory: "Save important context relevant to the USER and their task to a memory database",
 	task_memory: "Autonomous task lifecycle memory — track task start/end and search past task history",
+	recall_memory: "Deep memory recall — drill down from summaries to retrieve original conversation messages",
 }
 
 // Cache full tool definitions so we can return them when a stripped tool is "discovered"

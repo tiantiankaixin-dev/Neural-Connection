@@ -137,6 +137,13 @@ const getCommandsMap = ({ context, outputChannel, provider }: RegisterCommandOpt
 			action: "discussButtonClicked",
 		})
 	},
+	condensingModelButtonClicked: async () => {
+		const visibleProvider = getVisibleProviderOrLog(outputChannel)
+		if (!visibleProvider) return
+
+		const { CondensingModelPanel } = await import("../core/webview/CondensingModelPanel")
+		CondensingModelPanel.show(visibleProvider.providerSettingsManager, visibleProvider.contextProxy)
+	},
 	marketplaceButtonClicked: () => {
 		const visibleProvider = getVisibleProviderOrLog(outputChannel)
 		if (!visibleProvider) return

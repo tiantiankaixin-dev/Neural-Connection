@@ -235,6 +235,8 @@ export type ContextManagementOptions = {
 	cwd?: string
 	/** Optional controller for file access validation */
 	rooIgnoreController?: RooIgnoreController
+	/** If provided, summaries will be persisted to memory/ subdirectory on disk */
+	globalStoragePath?: string
 }
 
 export type ContextManagementResult = SummarizeResponse & {
@@ -268,6 +270,7 @@ export async function manageContext({
 	filesReadByRoo,
 	cwd,
 	rooIgnoreController,
+	globalStoragePath,
 }: ContextManagementOptions): Promise<ContextManagementResult> {
 	let error: string | undefined
 	let errorDetails: string | undefined
@@ -325,6 +328,7 @@ export async function manageContext({
 				filesReadByRoo,
 				cwd,
 				rooIgnoreController,
+				globalStoragePath,
 			})
 			if (result.error) {
 				error = result.error
@@ -335,7 +339,10 @@ export async function manageContext({
 				// or merges multiple visible summaries into a new Global Q.
 				// Uses minimal LLM context (only merge instruction + summary texts).
 				try {
-					const globalUpdate = await autoUpdateGlobalSummary(result.messages, apiHandler)
+					const globalUpdate = await autoUpdateGlobalSummary(result.messages, apiHandler, {
+						globalStoragePath,
+						taskId,
+					})
 					return {
 						...result,
 						messages: globalUpdate.messages,

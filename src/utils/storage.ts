@@ -78,6 +78,36 @@ export async function getCacheDirectoryPath(globalStoragePath: string): Promise<
 }
 
 /**
+ * Gets the context subdirectory path for a task (stores conversation history)
+ */
+export async function getTaskContextPath(globalStoragePath: string, taskId: string): Promise<string> {
+	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+	const contextDir = path.join(taskDir, "context")
+	await fs.mkdir(contextDir, { recursive: true })
+	return contextDir
+}
+
+/**
+ * Gets the memory subdirectory path for a task (stores summaries, global Q, task memories)
+ */
+export async function getTaskMemoryPath(globalStoragePath: string, taskId: string): Promise<string> {
+	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+	const memoryDir = path.join(taskDir, "memory")
+	await fs.mkdir(memoryDir, { recursive: true })
+	return memoryDir
+}
+
+/**
+ * Gets the summaries subdirectory path within memory/ for a task
+ */
+export async function getTaskSummariesPath(globalStoragePath: string, taskId: string): Promise<string> {
+	const memoryDir = await getTaskMemoryPath(globalStoragePath, taskId)
+	const summariesDir = path.join(memoryDir, "summaries")
+	await fs.mkdir(summariesDir, { recursive: true })
+	return summariesDir
+}
+
+/**
  * Prompts the user to set a custom storage path
  * Displays an input box allowing the user to enter a custom path
  */

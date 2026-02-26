@@ -101,6 +101,9 @@ describe("attemptCompletionTool", () => {
 			taskId: "task_1",
 			apiConfiguration: { apiProvider: "test" } as any,
 			api: { getModel: vi.fn().mockReturnValue({ id: "test-model", info: {} }) } as any,
+			getCondensingApiHandler: vi
+				.fn()
+				.mockResolvedValue({ getModel: vi.fn().mockReturnValue({ id: "test-model", info: {} }) }),
 			apiConversationHistory: [
 				{ role: "user", content: "hello", ts: 1 },
 				{ role: "assistant", content: "hi", ts: 2 },
@@ -527,10 +530,10 @@ describe("attemptCompletionTool", () => {
 			}
 			await attemptCompletionTool.handle(mockTask as Task, block, callbacks)
 
+			expect(mockTask.getCondensingApiHandler).toHaveBeenCalled()
 			expect(mockSummarizeConversation).toHaveBeenCalledWith(
 				expect.objectContaining({
 					messages: mockTask.apiConversationHistory,
-					apiHandler: mockTask.api,
 					systemPrompt: "",
 					taskId: "task_1",
 					isAutomaticTrigger: true,

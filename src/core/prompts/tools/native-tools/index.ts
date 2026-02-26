@@ -23,6 +23,7 @@ import readTerminal from "./read_terminal"
 import readUrlContent from "./read_url_content"
 import searchWeb from "./search_web"
 import taskMemory from "./task_memory"
+import recallMemory from "./recall_memory"
 import { createReadFileTool, type ReadFileToolOptions } from "./read_file"
 import runSlashCommand from "./run_slash_command"
 import skill from "./skill"
@@ -83,6 +84,7 @@ export function getNativeTools(options: NativeToolsOptions = {}): OpenAI.Chat.Ch
 		readUrlContent,
 		searchWeb,
 		taskMemory,
+		recallMemory,
 		createReadFileTool(readFileOptions),
 		runSlashCommand,
 		skill,

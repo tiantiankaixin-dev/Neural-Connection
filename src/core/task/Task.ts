@@ -129,7 +129,13 @@ import {
 	checkpointDiff,
 } from "../checkpoints"
 import { processUserContentMentions } from "../mentions/processUserContentMentions"
-import { summarizeConversation, getEffectiveApiHistory } from "../condense"
+import {
+	summarizeConversation,
+	getEffectiveApiHistory,
+	generateRollingSummary,
+	getMessagesSinceLastSummary,
+	ROLLING_SUMMARY_THRESHOLD,
+} from "../condense"
 import { MessageQueueService } from "../message-queue/MessageQueueService"
 import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
@@ -268,7 +274,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	private taskApiConfigReady: Promise<void>
 
 	providerRef: WeakRef<ClineProvider>
-	private readonly globalStoragePath: string
+	public readonly globalStoragePath: string
 	abort: boolean = false
 	currentRequestAbortController?: AbortController
 	skipPrevResponseIdOnce: boolean = false
@@ -1742,6 +1748,105 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		this.api = buildApiHandler(this.apiConfiguration)
 	}
 
+	/**
+	 * Returns the API handler to use for context condensing (summarization).
+	 * If the user has selected a specific condensing model profile, builds a
+	 * separate ApiHandler from that profile. Otherwise falls back to this.api.
+	 */
+	public async getCondensingApiHandler(): Promise<ApiHandler> {
+		try {
+			const provider = this.providerRef.deref()
+			if (!provider) return this.api
+
+			const condensingBaseUrl = provider.contextProxy.getGlobalState("condensingBaseUrl")
+			const condensingModelId = provider.contextProxy.getGlobalState("condensingModelId")
+
+			if (condensingBaseUrl) {
+				// Custom endpoint: use OpenAI-compatible provider with the given base URL + model ID.
+				// Use "openai" provider (not "openai-native") because openai-native validates
+				// model IDs against a hardcoded list and falls back to a default model,
+				// which breaks custom models (e.g. Ollama, LM Studio).
+				return buildApiHandler({
+					apiProvider: "openai",
+					openAiApiKey: "none",
+					openAiBaseUrl: condensingBaseUrl,
+					openAiModelId: condensingModelId || undefined,
+				})
+			}
+		} catch (error) {
+			console.error("[Task] Failed to build condensing API handler, falling back to task API:", error)
+		}
+		return this.api
+	}
+
+	/**
+	 * Returns the API handler to use for memory regression (drilling down summaries).
+	 * If the user has selected a specific regression model, builds a separate ApiHandler.
+	 * Otherwise returns undefined (regression not configured).
+	 */
+	public async getRegressionApiHandler(): Promise<ApiHandler | undefined> {
+		try {
+			const provider = this.providerRef.deref()
+			if (!provider) return undefined
+
+			const regressionBaseUrl = provider.contextProxy.getGlobalState("regressionBaseUrl")
+			const regressionModelId = provider.contextProxy.getGlobalState("regressionModelId")
+
+			if (regressionBaseUrl) {
+				return buildApiHandler({
+					apiProvider: "openai",
+					openAiApiKey: "none",
+					openAiBaseUrl: regressionBaseUrl,
+					openAiModelId: regressionModelId || undefined,
+				})
+			}
+		} catch (error) {
+			console.error("[Task] Failed to build regression API handler:", error)
+		}
+		return undefined
+	}
+
+	/**
+	 * Checks whether enough unsummarized messages have accumulated and, if so,
+	 * generates a rolling (rough) summary using the condensing model.
+	 *
+	 * Called before each API request inside recursivelyMakeClineRequests so that
+	 * the effective context stays compressed as: [Global Q] + [Rolling Summary] + [recent messages].
+	 */
+	private async maybeGenerateRollingSummary(): Promise<void> {
+		const messages = this.apiConversationHistory
+		if (messages.length === 0) return
+
+		const sinceLastSummary = getMessagesSinceLastSummary(messages)
+		const nonSummaryMessages = sinceLastSummary.filter((m) => !m.isSummary)
+
+		if (nonSummaryMessages.length < ROLLING_SUMMARY_THRESHOLD) return
+
+		try {
+			console.log(
+				"[Rolling Summary] Triggering — %d non-summary messages since last summary (threshold: %d)",
+				nonSummaryMessages.length,
+				ROLLING_SUMMARY_THRESHOLD,
+			)
+			const condensingApi = await this.getCondensingApiHandler()
+			const result = await generateRollingSummary({
+				messages,
+				apiHandler: condensingApi,
+				globalStoragePath: this.globalStoragePath,
+				taskId: this.taskId,
+			})
+			if (!result.error && result.messages !== messages) {
+				await this.overwriteApiConversationHistory(result.messages)
+				console.log("[Rolling Summary] History updated — new length:", result.messages.length)
+			} else if (result.error) {
+				console.log("[Rolling Summary] Skipped:", result.error)
+			}
+		} catch (error) {
+			console.error("[Rolling Summary] Failed:", error)
+			// Non-critical: don't block the main task loop
+		}
+	}
+
 	public async submitUserMessage(
 		text: string,
 		images?: string[],
@@ -1866,7 +1971,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			condenseId,
 		} = await summarizeConversation({
 			messages: this.apiConversationHistory,
-			apiHandler: this.api,
+			apiHandler: await this.getCondensingApiHandler(),
 			systemPrompt,
 			taskId: this.taskId,
 			isAutomaticTrigger: false,
@@ -2848,6 +2953,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const isEmptyUserContent = currentUserContent.length === 0
 			const shouldAddUserMessage =
 				((currentItem.retryAttempt ?? 0) === 0 && !isEmptyUserContent) || currentItem.userMessageWasRemoved
+
+			// Rolling summary: compress conversation if enough new messages have accumulated.
+			// Runs BEFORE adding the current user message so only completed exchanges are summarized.
+			if (shouldAddUserMessage) {
+				await this.maybeGenerateRollingSummary()
+			}
+
 			if (shouldAddUserMessage) {
 				await this.addToApiConversationHistory({ role: "user", content: finalUserContent })
 				TelemetryService.instance.captureConversationMessage(this.taskId, "user")
@@ -4016,6 +4128,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				currentProfileId,
 				metadata,
 				environmentDetails,
+				globalStoragePath: this.globalStoragePath,
 			})
 
 			if (truncateResult.messages !== this.apiConversationHistory) {
@@ -4227,12 +4340,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					: undefined
 
 			try {
+				const condensingApi =
+					contextManagementWillRun && autoCondenseContext ? await this.getCondensingApiHandler() : this.api
 				const truncateResult = await manageContext({
 					messages: this.apiConversationHistory,
 					totalTokens: contextTokens,
 					maxTokens,
 					contextWindow,
-					apiHandler: this.api,
+					apiHandler: condensingApi,
 					autoCondenseContext,
 					autoCondenseContextPercent,
 					systemPrompt,
@@ -4245,6 +4360,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					filesReadByRoo: contextMgmtFilesReadByRoo,
 					cwd: this.cwd,
 					rooIgnoreController: this.rooIgnoreController,
+					globalStoragePath: this.globalStoragePath,
 				})
 				if (truncateResult.messages !== this.apiConversationHistory) {
 					await this.overwriteApiConversationHistory(truncateResult.messages)

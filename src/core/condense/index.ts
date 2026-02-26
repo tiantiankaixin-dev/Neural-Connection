@@ -10,6 +10,8 @@ import { maybeRemoveImageBlocks } from "../../api/transform/image-cleaning"
 import { supportPrompt } from "../../shared/support-prompt"
 import { RooIgnoreController } from "../ignore/RooIgnoreController"
 import { generateFoldedFileContext } from "./foldedFileContext"
+import { SummaryPanel } from "../webview/SummaryPanel"
+import { saveSummaryEntry, saveGlobalSummary } from "../task-persistence/memory-persistence"
 
 export type { FoldedFileContextResult, FoldedFileContextOptions } from "./foldedFileContext"
 
@@ -239,6 +241,8 @@ export type SummarizeConversationOptions = {
 	 * Intermediate summaries within the range are also tagged (replaced by the new comprehensive summary).
 	 * Used by task_memory to create a full-quality summary from ALL sub-task messages. */
 	summarizeFromIndex?: number
+	/** If provided, summaries will be persisted to memory/ subdirectory on disk */
+	globalStoragePath?: string
 }
 
 /**
@@ -260,6 +264,14 @@ export type SummarizeConversationOptions = {
  *   getEnvironmentDetails() in recursivelyMakeClineRequests().
  */
 export async function summarizeConversation(options: SummarizeConversationOptions): Promise<SummarizeResponse> {
+	console.log(
+		"[summarizeConversation] CALLED — messages:",
+		options.messages.length,
+		"isAutomatic:",
+		options.isAutomaticTrigger,
+		"taskId:",
+		options.taskId,
+	)
 	const {
 		messages,
 		apiHandler,
@@ -284,16 +296,30 @@ export async function summarizeConversation(options: SummarizeConversationOption
 	// Determine which messages to summarize:
 	// - If summarizeFromIndex is set, use that range (for full-quality sub-task summarization)
 	// - Otherwise, use the default "since last summary" logic
-	const messagesToSummarize =
+	let messagesToSummarize =
 		options.summarizeFromIndex !== undefined
 			? messages.slice(options.summarizeFromIndex)
 			: getMessagesSinceLastSummary(messages)
+
+	// In the default path, getMessagesSinceLastSummary includes the previous summary
+	// as the first message. Strip summary messages so we only summarize NEW conversation
+	// content — prevents re-summarizing old summaries (which causes content duplication
+	// across condensation cycles: Summary B would contain Summary A's content).
+	if (options.summarizeFromIndex === undefined) {
+		messagesToSummarize = messagesToSummarize.filter((msg) => !msg.isSummary)
+	}
 
 	if (messagesToSummarize.length <= 1) {
 		const error =
 			messages.length <= 1
 				? t("common:errors.condense_not_enough_messages")
 				: t("common:errors.condensed_recently")
+		console.log(
+			"[summarizeConversation] EARLY RETURN — messagesToSummarize:",
+			messagesToSummarize.length,
+			"error:",
+			error,
+		)
 		return { ...response, error }
 	}
 
@@ -526,6 +552,57 @@ ${commandBlocks}
 	// Append the summary message at the end
 	newMessages.push(summaryMessage)
 
+	// Notify SummaryPanel
+	try {
+		console.log(
+			"[summarizeConversation] Summary generated, notifying SummaryPanel. condenseId:",
+			condenseId,
+			"summary length:",
+			summary.length,
+		)
+		let modelId = "unknown"
+		try {
+			modelId = apiHandler.getModel().id
+		} catch {}
+		SummaryPanel.getInstance().addSummary({
+			id: condenseId,
+			timestamp: summaryMessage.ts ?? Date.now(),
+			text: summary,
+			isGlobal: false,
+			modelId,
+			sourceMessages: messagesToSummarize.map((msg) => ({
+				role: msg.role,
+				content: msg.content,
+				ts: msg.ts,
+				id: msg.id || "unknown",
+			})),
+		})
+		console.log("[summarizeConversation] SummaryPanel notified successfully, modelId:", modelId)
+
+		// Persist to disk if globalStoragePath is provided
+		if (options.globalStoragePath) {
+			try {
+				await saveSummaryEntry(options.globalStoragePath, taskId, {
+					id: condenseId,
+					timestamp: summaryMessage.ts ?? Date.now(),
+					text: summary,
+					isGlobal: false,
+					modelId,
+					sourceMessages: messagesToSummarize.map((msg) => ({
+						role: msg.role,
+						content: msg.content,
+						ts: msg.ts,
+						id: msg.id || "unknown",
+					})),
+				})
+			} catch (persistErr) {
+				console.warn("[summarizeConversation] Failed to persist summary to disk:", persistErr)
+			}
+		}
+	} catch (err) {
+		console.error("[summarizeConversation] SummaryPanel notification failed:", err)
+	}
+
 	// Count the tokens in the context for the next API request
 	// After condense, the context will contain: system prompt + summary + tool definitions
 	const systemPromptMessage: ApiMessage = { role: "user", content: systemPrompt }
@@ -564,29 +641,51 @@ export async function generateGlobalSummaryText(
 		return null
 	}
 
-	// Single summary: just return it directly (no LLM call needed)
+	let mergePrompt: string
+
 	if (summaries.length === 1) {
-		return { text: summaries[0].summary, cost: 0 }
+		mergePrompt = `Below is a conversation summary from a completed task. Distill it into a concise global task summary.
+
+For each user request found in the summary, output exactly these 4 items:
+- **Command**: What did the user ask?
+- **Purpose**: What was the goal?
+- **Actions**: What was done? (key files, commands, decisions — brief)
+- **Result**: What was the outcome?
+
+Rules:
+- Always output in English.
+- Multiple requests → separate numbered blocks.
+- Be concise — no filler, no code snippets, no verbose explanations.
+- Focus on WHAT happened, not HOW the code works internally.
+
+Conversation Summary:
+${summaries[0].summary}`
+	} else {
+		const formattedSummaries = summaries.map((s, i) => `### Task ${i + 1}: ${s.title}\n${s.summary}`).join("\n\n")
+
+		mergePrompt = `Below are summaries of completed tasks in chronological order. Merge them into a single concise global summary.
+
+For each user request across all tasks, output exactly these 4 items:
+- **Command**: What did the user ask?
+- **Purpose**: What was the goal?
+- **Actions**: What was done? (key files, commands, decisions — brief)
+- **Result**: What was the outcome?
+
+Rules:
+- Always output in English.
+- Multiple requests → separate numbered blocks.
+- Be concise — no filler, no code snippets, no verbose explanations.
+- Deduplicate overlapping content across tasks.
+- Focus on WHAT happened, not HOW the code works internally.
+
+Task Summaries:
+${formattedSummaries}`
 	}
-
-	const formattedSummaries = summaries.map((s, i) => `### Sub-Task ${i + 1}: ${s.title}\n${s.summary}`).join("\n\n")
-
-	const mergePrompt = `Below are summaries of completed sub-tasks in chronological order.
-Merge them into a single comprehensive global summary that captures:
-1. The overall progress and key decisions made
-2. Important technical details, patterns, and architecture decisions
-3. Current state of the work and what has been accomplished
-4. Key files that were modified or created
-
-Sub-Task Summaries:
-${formattedSummaries}
-
-Generate a concise but comprehensive global summary. Do NOT use headers or bullet points for the top level - write flowing prose with technical details. Keep it under 2000 words.`
 
 	const requestMessages: Anthropic.MessageParam[] = [{ role: "user", content: mergePrompt }]
 
 	const systemPrompt =
-		"You are a technical summarizer. Merge the provided sub-task summaries into one comprehensive global summary that preserves all important context for continuing the work."
+		"You are a technical summarizer. Output a concise global summary using the Command/Purpose/Actions/Result format. Be brief and factual."
 
 	try {
 		let text = ""
@@ -630,6 +729,7 @@ Generate a concise but comprehensive global summary. Do NOT use headers or bulle
 export async function autoUpdateGlobalSummary(
 	messages: ApiMessage[],
 	apiHandler: ApiHandler,
+	options?: { globalStoragePath?: string; taskId?: string },
 ): Promise<{ messages: ApiMessage[]; cost: number }> {
 	// Build ID sets matching getEffectiveApiHistory logic
 	const existingSummaryIds = new Set<string>()
@@ -670,35 +770,18 @@ export async function autoUpdateGlobalSummary(
 		return { messages, cost: 0 }
 	}
 
-	// Case 1: Single visible summary → promote to Global Q (no LLM call)
-	if (visibleSummaries.length === 1) {
-		const { index, msg } = visibleSummaries[0]
-		if (msg.isGlobalSummary) {
-			return { messages, cost: 0 } // already a Global Q
-		}
-		const updated = [...messages]
-		const cloned: ApiMessage = { ...msg, isGlobalSummary: true }
-		// Update heading in content
-		if (Array.isArray(cloned.content)) {
-			const content = [...(cloned.content as Anthropic.Messages.ContentBlockParam[])]
-			if (content.length > 0 && content[0].type === "text") {
-				const tb = content[0] as Anthropic.Messages.TextBlockParam
-				content[0] = {
-					type: "text",
-					text: tb.text.replace(
-						/^## (Conversation Summary|Sub-Task Summary:[^\n]*)/,
-						"## Global Task Summary",
-					),
-				}
-			}
-			cloned.content = content
-		}
-		updated[index] = cloned
-		return { messages: updated, cost: 0 }
+	// Skip if only visible summaries are already Global Q (nothing new to merge)
+	if (visibleSummaries.every(({ msg }) => msg.isGlobalSummary)) {
+		return { messages, cost: 0 }
 	}
 
-	// Case 2: 2+ visible summaries → merge into new Global Q via LLM
-	const summaryInputs: Array<{ title: string; summary: string }> = visibleSummaries.map(({ msg }, i) => {
+	// --- Merge input selection ---
+	// Use latest Global Q + individual summaries that came AFTER it.
+	// This avoids redundancy: the Global Q already covers older conversations,
+	// so we only need to merge it with new individual summaries.
+	const latestGlobal = [...visibleSummaries].reverse().find(({ msg }) => msg.isGlobalSummary)
+
+	const extractText = (msg: ApiMessage): { title: string; summary: string } => {
 		let text = ""
 		if (Array.isArray(msg.content)) {
 			const blocks = msg.content as Anthropic.Messages.ContentBlockParam[]
@@ -708,10 +791,26 @@ export async function autoUpdateGlobalSummary(
 			text = msg.content
 		}
 		const headingMatch = text.match(/^## (?:Global Task Summary|Conversation Summary|Sub-Task Summary: ([^\n]*))\n/)
-		const title = headingMatch?.[1] || `Summary ${i + 1}`
+		const title = headingMatch?.[1] || "Summary"
 		const cleanText = text.replace(/^## [^\n]*\n/, "").trim()
 		return { title, summary: cleanText }
-	})
+	}
+
+	let mergeSource: Array<{ index: number; msg: ApiMessage }>
+	if (latestGlobal) {
+		// Include latest Global Q + individual summaries NEWER than it (by timestamp).
+		// Older individuals are already covered by the Global Q, so excluding them
+		// avoids redundant content in the merge input.
+		const globalTs = latestGlobal.msg.ts ?? 0
+		mergeSource = visibleSummaries.filter(
+			({ msg }) => msg === latestGlobal.msg || (!msg.isGlobalSummary && (msg.ts ?? 0) > globalTs),
+		)
+	} else {
+		// No Global Q yet — use all individual summaries
+		mergeSource = visibleSummaries.filter(({ msg }) => !msg.isGlobalSummary)
+	}
+
+	const summaryInputs = mergeSource.map(({ msg }) => extractText(msg))
 
 	const globalResult = await generateGlobalSummaryText(summaryInputs, apiHandler)
 	if (!globalResult) {
@@ -736,10 +835,16 @@ export async function autoUpdateGlobalSummary(
 		}
 	}
 
-	// Tag all visible summaries with new Q's condenseId
-	const visibleIndices = new Set(visibleSummaries.map((vs) => vs.index))
+	// --- Tagging ---
+	// Tag all visible summaries EXCEPT the last individual (non-global) summary.
+	// This keeps the last individual summary visible alongside the new Global Q,
+	// giving the model the context structure: [Global Q] + [last summary] + [current messages]
+	const lastIndividual = [...visibleSummaries].reverse().find(({ msg }) => !msg.isGlobalSummary)
+	const indicesToTag = new Set(
+		visibleSummaries.filter(({ index }) => index !== lastIndividual?.index).map(({ index }) => index),
+	)
 	const updatedMessages = messages.map((msg, index) => {
-		if (visibleIndices.has(index)) {
+		if (indicesToTag.has(index)) {
 			return { ...msg, condenseParent: newQId }
 		}
 		return msg
@@ -758,7 +863,52 @@ export async function autoUpdateGlobalSummary(
 		isGlobalSummary: true,
 		condenseId: newQId,
 	}
-	updatedMessages.push(qMessage)
+	// Insert Global Q BEFORE the last individual summary so the effective
+	// context order becomes: [Global Q] → [last summary] → [current messages]
+	if (lastIndividual) {
+		updatedMessages.splice(lastIndividual.index, 0, qMessage)
+	} else {
+		updatedMessages.push(qMessage)
+	}
+
+	// Notify SummaryPanel
+	try {
+		let modelId = "unknown"
+		try {
+			modelId = apiHandler.getModel().id
+		} catch {}
+		SummaryPanel.getInstance().addSummary({
+			id: newQId,
+			timestamp: qMessage.ts ?? Date.now(),
+			text: globalResult.text,
+			isGlobal: true,
+			modelId,
+			sourceMessages: mergeSource.map(({ msg }) => ({
+				role: msg.role,
+				content: msg.content,
+				ts: msg.ts,
+				id: msg.id || "unknown",
+				isSummary: msg.isSummary,
+				isGlobalSummary: msg.isGlobalSummary,
+				isRolling: msg.isRollingSummary,
+			})),
+		})
+		// Persist Global Q to disk
+		if (options?.globalStoragePath && options?.taskId) {
+			try {
+				await saveGlobalSummary(options.globalStoragePath, options.taskId, {
+					text: globalResult.text,
+					condenseId: newQId,
+					timestamp: qMessage.ts ?? Date.now(),
+					sourceSummaryCount: mergeSource.length,
+				})
+			} catch (persistErr) {
+				console.warn("[autoUpdateGlobalSummary] Failed to persist Global Q to disk:", persistErr)
+			}
+		}
+	} catch {
+		// Panel may not be initialized
+	}
 
 	return { messages: updatedMessages, cost: globalResult.cost }
 }
@@ -881,6 +1031,258 @@ export function getEffectiveApiHistory(messages: ApiMessage[]): ApiMessage[] {
 		.filter((msg): msg is ApiMessage => msg !== null)
 
 	return effective
+}
+
+/** Minimum number of non-summary messages since the last summary before a rolling summary is triggered.
+ * Set to 2 (one user + one assistant message) so that rolling summaries run after every API turn. */
+export const ROLLING_SUMMARY_THRESHOLD = 2
+
+/**
+ * Prompt used as the system message for rolling summary generation.
+ * Lighter than the full CONDENSE prompt — focuses on incremental compression.
+ */
+const ROLLING_SUMMARY_SYSTEM_PROMPT = `You are a helpful AI assistant performing incremental conversation summarization.
+CRITICAL: This is a summarization-only request. DO NOT call any tools or functions.
+Your ONLY task is to produce a concise text summary. Respond with text only.`
+
+/**
+ * Generates a rolling (rough) summary that progressively compresses the conversation.
+ *
+ * Each rolling summary incorporates the previous rolling summary (if any) and new messages
+ * since the last summary boundary, producing a cumulative compressed representation.
+ *
+ * The rolling summary is stored as an ApiMessage with isSummary + isRollingSummary flags.
+ * Old messages (and the previous rolling summary) are tagged with condenseParent so that
+ * getEffectiveApiHistory yields: [Global Q] + [Rolling Summary] + [current unsummarized messages].
+ *
+ * @param options.messages  Full apiConversationHistory
+ * @param options.apiHandler  The condensing API handler
+ * @returns Updated messages array with rolling summary appended, or unchanged on failure
+ */
+export async function generateRollingSummary(options: {
+	messages: ApiMessage[]
+	apiHandler: ApiHandler
+	globalStoragePath?: string
+	taskId?: string
+}): Promise<SummarizeResponse> {
+	const { messages, apiHandler } = options
+	const response: SummarizeResponse = { messages, cost: 0, summary: "" }
+
+	// --- Determine boundary: messages since the last summary of ANY kind ---
+	const sinceLastSummary = getMessagesSinceLastSummary(messages)
+	const newMessages = sinceLastSummary.filter((m) => !m.isSummary)
+
+	if (newMessages.length < 2) {
+		return { ...response, error: "Not enough new messages for rolling summary" }
+	}
+
+	// --- Find the previous rolling/individual summary text for progressive compression ---
+	let previousSummaryText = ""
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i]
+		if (msg.isSummary && !msg.isGlobalSummary) {
+			// Extract text from the summary content
+			if (Array.isArray(msg.content)) {
+				const blocks = msg.content as Anthropic.Messages.ContentBlockParam[]
+				const firstText = blocks.find((b): b is Anthropic.Messages.TextBlockParam => b.type === "text")
+				if (firstText) {
+					previousSummaryText = firstText.text
+						.replace(/^## (?:Rolling Summary|Conversation Summary|Sub-Task Summary:[^\n]*)\n/, "")
+						.trim()
+				}
+			} else if (typeof msg.content === "string") {
+				previousSummaryText = msg.content
+			}
+			break
+		}
+	}
+
+	// --- Build the condensing prompt ---
+	let userPrompt: string
+	if (previousSummaryText) {
+		userPrompt = `You are performing an incremental conversation summary (rolling compression).
+
+Previous Summary (covers earlier exchanges):
+${previousSummaryText}
+
+Merge the above summary with the new conversation messages below into a single updated summary.
+
+Rules:
+- Always output in English.
+- Be concise — focus on WHAT was requested, WHAT was done, key decisions, and outcomes.
+- Preserve important context from the previous summary while incorporating new information.
+- Do not include code snippets. Summarize actions at a high level.
+- Output as a brief structured narrative.`
+	} else {
+		userPrompt = `Summarize the conversation below concisely.
+
+Rules:
+- Always output in English.
+- Focus on WHAT was requested, WHAT was done, key decisions, and outcomes.
+- Be brief — no code snippets, no verbose explanations.
+- Output as a brief structured narrative.`
+	}
+
+	// --- Prepare messages for the condensing model ---
+	const finalRequestMessage: Anthropic.MessageParam = { role: "user", content: userPrompt }
+
+	const messagesWithToolResults = injectSyntheticToolResults(newMessages)
+	const prepared = transformMessagesForCondensing(
+		maybeRemoveImageBlocks([...messagesWithToolResults, finalRequestMessage], apiHandler),
+	)
+	const requestMessages = prepared.map(({ role, content }) => ({ role, content }))
+
+	// --- Call condensing model ---
+	let summary = ""
+	let cost = 0
+
+	try {
+		const stream = apiHandler.createMessage(ROLLING_SUMMARY_SYSTEM_PROMPT, requestMessages)
+		for await (const chunk of stream) {
+			if (chunk.type === "text") {
+				summary += chunk.text
+			} else if (chunk.type === "usage") {
+				cost = chunk.totalCost ?? 0
+			}
+		}
+	} catch (error) {
+		console.error("[generateRollingSummary] API call failed:", error)
+		const errorMessage = error instanceof Error ? error.message : String(error)
+		return { ...response, cost, error: `Rolling summary failed: ${errorMessage}` }
+	}
+
+	summary = summary.trim()
+	if (summary.length === 0) {
+		return { ...response, cost, error: "Rolling summary generated empty text" }
+	}
+
+	// --- Create the rolling summary message ---
+	const condenseId = crypto.randomUUID()
+	const lastTs = messages[messages.length - 1]?.ts ?? Date.now()
+
+	const summaryMessage: ApiMessage = {
+		role: "user",
+		content: [{ type: "text", text: `## Rolling Summary\n${summary}` }],
+		ts: lastTs + 1,
+		isSummary: true,
+		isRollingSummary: true,
+		condenseId,
+	}
+
+	// --- Tag old messages with condenseParent ---
+	// Find the last summary index (boundary for tagging)
+	let lastSummaryIdx = -1
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].isSummary) {
+			lastSummaryIdx = i
+			break
+		}
+	}
+
+	const newMsgArray = messages.map((msg, index) => {
+		// Don't touch messages before the last summary boundary
+		if (index < lastSummaryIdx) {
+			return msg
+		}
+		// Tag the previous rolling summary — it's been folded into the new one
+		if (index === lastSummaryIdx && msg.isRollingSummary) {
+			return { ...msg, condenseParent: condenseId }
+		}
+		// Never tag Global Q, but DO tag individual summaries from previous tasks
+		// so the rolling summary replaces them in the effective context
+		if (msg.isGlobalSummary) {
+			return msg
+		}
+		if (msg.isSummary && !msg.isRollingSummary) {
+			// Tag individual summaries so they're hidden, ensuring clean Q + Rolling + new messages context
+			return { ...msg, condenseParent: condenseId }
+		}
+		// Don't re-tag already-tagged messages
+		if (msg.condenseParent) {
+			return msg
+		}
+		// Tag regular messages after the last summary
+		if (index > lastSummaryIdx) {
+			return { ...msg, condenseParent: condenseId }
+		}
+		return msg
+	})
+
+	newMsgArray.push(summaryMessage)
+
+	// --- Notify SummaryPanel ---
+	try {
+		let modelId = "unknown"
+		try {
+			modelId = apiHandler.getModel().id
+		} catch {}
+		// Build sourceMessages: include previous summary + new messages to show progressive compression
+		const sourceMessages = []
+
+		// Find and include the previous summary that was used as input
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i]
+			if (msg.isSummary && !msg.isGlobalSummary) {
+				sourceMessages.push({
+					role: msg.role,
+					content: msg.content,
+					ts: msg.ts,
+					id: msg.id || "unknown",
+					isSummary: true,
+					isRolling: msg.isRollingSummary,
+				})
+				break
+			}
+		}
+
+		// Add all new messages since last summary
+		sourceMessages.push(
+			...newMessages.map((msg) => ({
+				role: msg.role,
+				content: msg.content,
+				ts: msg.ts,
+				id: msg.id || "unknown",
+			})),
+		)
+
+		SummaryPanel.getInstance().addSummary({
+			id: condenseId,
+			timestamp: summaryMessage.ts ?? Date.now(),
+			text: summary,
+			isGlobal: false,
+			isRolling: true,
+			modelId,
+			sourceMessages,
+		})
+
+		// Persist to disk
+		if (options.globalStoragePath && options.taskId) {
+			try {
+				await saveSummaryEntry(options.globalStoragePath, options.taskId, {
+					id: condenseId,
+					timestamp: summaryMessage.ts ?? Date.now(),
+					text: summary,
+					isGlobal: false,
+					isRolling: true,
+					modelId,
+					sourceMessages,
+				})
+			} catch (persistErr) {
+				console.warn("[generateRollingSummary] Failed to persist rolling summary to disk:", persistErr)
+			}
+		}
+	} catch {}
+
+	console.log(
+		"[generateRollingSummary] Generated rolling summary — condenseId:",
+		condenseId,
+		"summary length:",
+		summary.length,
+		"tagged messages:",
+		newMsgArray.filter((m) => m.condenseParent === condenseId).length,
+	)
+
+	return { messages: newMsgArray, summary, cost, condenseId }
 }
 
 /**

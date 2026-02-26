@@ -198,6 +198,9 @@ export type NativeToolArgs = {
 		Tags?: string[] | null
 		UserTriggered: boolean
 	}
+	recall_memory: {
+		query: string
+	}
 	// Add more tools as they are migrated to native protocol
 }
 
@@ -389,6 +392,7 @@ export const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
 	view_content_chunk: "view content chunks",
 	create_memory: "manage memories",
 	task_memory: "manage task memory",
+	recall_memory: "recall deep memories",
 } as const
 
 // Define available tool groups.
@@ -444,6 +448,7 @@ export const ALWAYS_AVAILABLE_TOOLS: ToolName[] = [
 	"skill",
 	"create_memory",
 	"task_memory",
+	"recall_memory",
 ] as const
 
 /**

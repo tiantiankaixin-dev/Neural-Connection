@@ -371,6 +371,17 @@ export async function activate(context: vscode.ExtensionContext) {
 		)
 	}
 
+	// Register Summary Inspector command
+	{
+		const { SummaryPanel } = require("./core/webview/SummaryPanel")
+		context.subscriptions.push(
+			vscode.commands.registerCommand("roo-cline.openSummaryInspector", () => {
+				const panel = SummaryPanel.getInstance()
+				panel.show()
+			}),
+		)
+	}
+
 	/**
 	 * We use the text document content provider API to show the left side for diff
 	 * view by creating a virtual document for the original content. This makes it

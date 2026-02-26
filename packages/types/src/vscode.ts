@@ -36,6 +36,7 @@ export const commandIds = [
 	"cloudButtonClicked",
 	"settingsButtonClicked",
 	"neuralAgentButtonClicked",
+	"condensingModelButtonClicked",
 
 	"openInNewTab",
 

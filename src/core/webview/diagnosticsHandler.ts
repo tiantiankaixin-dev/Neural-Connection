@@ -3,7 +3,7 @@ import * as os from "os"
 import * as fs from "fs/promises"
 import * as vscode from "vscode"
 
-import { getTaskDirectoryPath } from "../../utils/storage"
+import { getTaskDirectoryPath, getTaskContextPath } from "../../utils/storage"
 import { fileExistsAtPath } from "../../utils/fs"
 
 export interface ErrorDiagnosticsValues {
@@ -37,9 +37,12 @@ export async function generateErrorDiagnostics(params: GenerateDiagnosticsParams
 
 	try {
 		const taskDirPath = await getTaskDirectoryPath(globalStoragePath, taskId)
+		const contextDirPath = await getTaskContextPath(globalStoragePath, taskId)
 
-		// Load API conversation history from the same file used by openDebugApiHistory
-		const apiHistoryPath = path.join(taskDirPath, "api_conversation_history.json")
+		// Load API conversation history — check context/ subdirectory first, then task root
+		const newApiPath = path.join(contextDirPath, "api_conversation_history.json")
+		const legacyApiPath = path.join(taskDirPath, "api_conversation_history.json")
+		const apiHistoryPath = (await fileExistsAtPath(newApiPath)) ? newApiPath : legacyApiPath
 		let history: unknown = []
 
 		if (await fileExistsAtPath(apiHistoryPath)) {

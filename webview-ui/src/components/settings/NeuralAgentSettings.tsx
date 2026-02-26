@@ -118,7 +118,7 @@ export const NeuralAgentSettings = ({
 			port: 1234,
 			description: "图形界面，支持 GGUF 模型",
 			installCmd: {
-				windows: "winget install LMStudio.LMStudio",
+				windows: "winget install ElementLabs.LMStudio",
 				macos: "brew install --cask lm-studio",
 				linux: 'echo "请从 https://lmstudio.ai 下载 Linux 版本"',
 			},
@@ -138,11 +138,11 @@ export const NeuralAgentSettings = ({
 			name: "LocalAI",
 			icon: "🐳",
 			port: 8080,
-			description: "Docker 部署，OpenAI 兼容 API",
+			description: "Docker 部署，兼容 OpenAI API",
 			installCmd: {
-				windows: "docker run -p 8080:8080 localai/localai",
-				macos: "docker run -p 8080:8080 localai/localai",
-				linux: "docker run -p 8080:8080 localai/localai",
+				windows: "docker run -d --name localai -p 8080:8080 localai/localai:latest",
+				macos: "docker run -d --name localai -p 8080:8080 localai/localai:latest",
+				linux: "docker run -d --name localai -p 8080:8080 localai/localai:latest",
 			},
 		},
 		{
@@ -151,7 +151,7 @@ export const NeuralAgentSettings = ({
 			port: 4891,
 			description: "完全离线，注重隐私",
 			installCmd: {
-				windows: "winget install Nomic.GPT4All",
+				windows: "winget install nomic.GPT4All",
 				macos: "brew install --cask gpt4all",
 				linux: 'echo "请从 https://gpt4all.io 下载 Linux 版本"',
 			},

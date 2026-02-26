@@ -3289,13 +3289,17 @@ export const webviewMessageHandler = async (
 			}
 
 			try {
-				const { getTaskDirectoryPath } = await import("../../utils/storage")
+				const { getTaskDirectoryPath, getTaskContextPath } = await import("../../utils/storage")
 				const globalStoragePath = provider.contextProxy.globalStorageUri.fsPath
 				const taskDirPath = await getTaskDirectoryPath(globalStoragePath, currentTask.taskId)
+				const contextDirPath = await getTaskContextPath(globalStoragePath, currentTask.taskId)
 
 				const fileName =
 					message.type === "openDebugApiHistory" ? "api_conversation_history.json" : "ui_messages.json"
-				const sourceFilePath = path.join(taskDirPath, fileName)
+				// Check context/ subdirectory first, then fall back to task root
+				const newFilePath = path.join(contextDirPath, fileName)
+				const legacyFilePath = path.join(taskDirPath, fileName)
+				const sourceFilePath = (await fileExistsAtPath(newFilePath)) ? newFilePath : legacyFilePath
 
 				// Check if file exists
 				if (!(await fileExistsAtPath(sourceFilePath))) {
@@ -3945,7 +3949,7 @@ export const webviewMessageHandler = async (
 					<span class="platform-name">LocalAI</span>
 					<span class="platform-port">端口 8080</span>
 				</div>
-				<div class="platform-cmd"><code>local-ai run ${model.id}</code></div>
+				<div class="platform-cmd"><code>curl http://localhost:8080/models/apply -H "Content-Type: application/json" -d '{"id":"${model.id}"}'</code></div>
 				<button class="btn btn-primary btn-download" data-platform="localai">
 					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
 					通过 LocalAI 下载
@@ -3992,7 +3996,8 @@ export const webviewMessageHandler = async (
 			const platformDownloadCmds: Record<string, (id: string) => string> = {
 				ollama: (id) => `ollama pull ${id}`,
 				lmstudio: (id) => `lms get ${id}`,
-				localai: (id) => `local-ai run ${id}`,
+				localai: (id) =>
+					`curl http://localhost:8080/models/apply -H "Content-Type: application/json" -d "{\"id\":\"${id}\"}"`,
 				jan: (_id) => `echo "请在 Jan 应用的模型市场中搜索并下载该模型"`,
 				gpt4all: (_id) => `echo "请在 GPT4All 应用的模型列表中搜索并下载该模型"`,
 			}

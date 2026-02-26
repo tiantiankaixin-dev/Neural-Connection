@@ -1,10 +1,14 @@
-import fs from "fs/promises"
-import path from "path"
 import { v4 as uuidv4 } from "uuid"
 
 import { Task } from "../task/Task"
 import { formatResponse } from "../prompts/responses"
 import { summarizeConversation, generateGlobalSummaryText } from "../condense"
+import {
+	loadTaskMemoryStore,
+	saveTaskMemoryStore,
+	type TaskMemoryEntry,
+	type TaskMemoryStore,
+} from "../task-persistence/memory-persistence"
 import crypto from "crypto"
 import type { ToolUse } from "../../shared/tools"
 
@@ -22,32 +26,8 @@ interface TaskMemoryParams {
 	tags?: string[] | null
 }
 
-export interface TaskMemoryEntry {
-	id: string
-	rooTaskId: string
-	status: "active" | "completed"
-	title: string
-	description: string
-	previousContextSummary: string
-	taskSummary: string
-	keyFiles: string[]
-	tags: string[]
-	startedAt: string
-	completedAt: string | null
-	conversationRef: {
-		taskId: string
-		messageCountAtStart: number
-		messageCountAtEnd: number | null
-	}
-}
+export type { TaskMemoryEntry, TaskMemoryStore }
 
-export interface TaskMemoryStore {
-	version: number
-	tasks: TaskMemoryEntry[]
-}
-
-const TASK_MEMORY_FILE_NAME = ".roo-task-memories.json"
-const TASK_MEMORY_STORE_VERSION = 1
 const MAX_QUERY_RESULTS = 10
 
 export class TaskMemoryTool extends BaseTool<"task_memory"> {
@@ -68,15 +48,14 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 
 			task.consecutiveMistakeCount = 0
 
-			const memoryFilePath = this.getMemoryFilePath(task.cwd)
-			let store = await this.loadMemoryStore(memoryFilePath)
+			let store = await loadTaskMemoryStore(task.globalStoragePath, task.taskId)
 
 			switch (action) {
 				case "start":
-					await this.handleStart(params, task, store, memoryFilePath, callbacks)
+					await this.handleStart(params, task, store, callbacks)
 					break
 				case "end":
-					await this.handleEnd(params, task, store, memoryFilePath, callbacks)
+					await this.handleEnd(params, task, store, callbacks)
 					break
 				case "query":
 					await this.handleQuery(params, store, callbacks)
@@ -100,7 +79,6 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 		params: TaskMemoryParams,
 		task: Task,
 		store: TaskMemoryStore,
-		memoryFilePath: string,
 		callbacks: ToolCallbacks,
 	): Promise<void> {
 		const { pushToolResult, askApproval } = callbacks
@@ -160,7 +138,7 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 			return
 		}
 
-		await this.saveMemoryStore(memoryFilePath, store)
+		await saveTaskMemoryStore(task.globalStoragePath, task.taskId, store)
 
 		pushToolResult(
 			`Task memory started.\n` +
@@ -175,7 +153,6 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 		params: TaskMemoryParams,
 		task: Task,
 		store: TaskMemoryStore,
-		memoryFilePath: string,
 		callbacks: ToolCallbacks,
 	): Promise<void> {
 		const { pushToolResult, askApproval } = callbacks
@@ -235,7 +212,7 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 			return
 		}
 
-		await this.saveMemoryStore(memoryFilePath, store)
+		await saveTaskMemoryStore(task.globalStoragePath, task.taskId, store)
 
 		// === Global Summary Q Model ===
 		// When a sub-task completes, we:
@@ -295,6 +272,7 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 					isAutomaticTrigger: false,
 					subtaskTitle: entry.title,
 					summarizeFromIndex: summarizeStartIdx,
+					globalStoragePath: task.globalStoragePath,
 				})
 				condenseMode = "full"
 			} else {
@@ -306,6 +284,7 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 					taskId: task.taskId,
 					isAutomaticTrigger: false,
 					subtaskTitle: entry.title,
+					globalStoragePath: task.globalStoragePath,
 				})
 				condenseMode = "incremental"
 			}
@@ -324,7 +303,7 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 					...store.tasks[entryIndex],
 					taskSummary: individualSummaryText,
 				}
-				await this.saveMemoryStore(memoryFilePath, store)
+				await saveTaskMemoryStore(task.globalStoragePath, task.taskId, store)
 			}
 
 			// --- Step 3: Collect all completed sub-task summaries ---
@@ -462,29 +441,13 @@ export class TaskMemoryTool extends BaseTool<"task_memory"> {
 	}
 
 	/** @internal Exposed for testing */
-	public getMemoryFilePath(cwd: string): string {
-		return path.join(cwd, TASK_MEMORY_FILE_NAME)
+	public async loadStore(globalStoragePath: string, taskId: string): Promise<TaskMemoryStore> {
+		return loadTaskMemoryStore(globalStoragePath, taskId)
 	}
 
 	/** @internal Exposed for testing */
-	public async loadMemoryStore(filePath: string): Promise<TaskMemoryStore> {
-		try {
-			const content = await fs.readFile(filePath, "utf8")
-			const store = JSON.parse(content) as TaskMemoryStore
-
-			if (store.version !== TASK_MEMORY_STORE_VERSION) {
-				return { version: TASK_MEMORY_STORE_VERSION, tasks: store.tasks || [] }
-			}
-
-			return store
-		} catch (error) {
-			return { version: TASK_MEMORY_STORE_VERSION, tasks: [] }
-		}
-	}
-
-	/** @internal Exposed for testing */
-	public async saveMemoryStore(filePath: string, store: TaskMemoryStore): Promise<void> {
-		await fs.writeFile(filePath, JSON.stringify(store, null, 2), "utf8")
+	public async saveStore(globalStoragePath: string, taskId: string, store: TaskMemoryStore): Promise<void> {
+		return saveTaskMemoryStore(globalStoragePath, taskId, store)
 	}
 
 	/** @internal Exposed for testing - search task memories */

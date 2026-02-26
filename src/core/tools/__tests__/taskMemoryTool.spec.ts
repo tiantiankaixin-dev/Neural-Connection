@@ -13,23 +13,9 @@ describe("TaskMemoryTool", () => {
 		})
 	})
 
-	describe("getMemoryFilePath", () => {
-		it("should return correct path with .roo-task-memories.json filename", () => {
-			const filePath = tool.getMemoryFilePath("/project/root")
-			expect(filePath).toContain(".roo-task-memories.json")
-			expect(filePath).toContain("project")
-		})
-
-		it("should handle different cwd paths", () => {
-			const path1 = tool.getMemoryFilePath("/a")
-			const path2 = tool.getMemoryFilePath("/b")
-			expect(path1).not.toBe(path2)
-		})
-	})
-
-	describe("loadMemoryStore", () => {
-		it("should return empty store for non-existent file", async () => {
-			const store = await tool.loadMemoryStore("/non/existent/path.json")
+	describe("loadStore", () => {
+		it("should return empty store for non-existent task", async () => {
+			const store = await tool.loadStore("/non/existent/globalStorage", "fake-task-id")
 			expect(store.version).toBe(1)
 			expect(store.tasks).toEqual([])
 		})
