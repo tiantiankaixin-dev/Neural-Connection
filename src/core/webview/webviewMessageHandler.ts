@@ -822,6 +822,19 @@ export const webviewMessageHandler = async (
 		case "exportTaskWithId":
 			provider.exportTaskWithId(message.text!)
 			break
+		case "exportConversationMemory":
+			if (message.text) {
+				provider.exportConversationMemory(message.text)
+			}
+			break
+		case "importConversationMemory":
+			if (message.text) {
+				provider.importConversationMemory(message.text)
+			}
+			break
+		case "importConversationMemoryAsNewTask":
+			provider.importConversationMemoryAsNewTask()
+			break
 		case "getTaskWithAggregatedCosts": {
 			try {
 				const taskId = message.text

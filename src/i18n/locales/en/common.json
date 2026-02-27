@@ -55,6 +55,9 @@
 		"failed_remove_directory": "Failed to remove task directory: {{error}}",
 		"custom_storage_path_unusable": "Custom storage path \"{{path}}\" is unusable, will use default path",
 		"cannot_access_path": "Cannot access path {{path}}: {{error}}",
+		"invalid_memory_folder": "Invalid memory folder: must contain a 'summaries' or 'global_summary' subfolder.",
+		"empty_memory_folder": "The selected memory folder contains no usable summary data.",
+		"invalid_import_folder": "Invalid task folder: must contain a 'context' directory or conversation history files.",
 		"settings_import_failed": "Settings import failed: {{error}}.",
 		"mistake_limit_guidance": "This may indicate a failure in the model's thought process or inability to use a tool properly, which can be mitigated with some user guidance (e.g. \"Try breaking down the task into smaller steps\").",
 		"violated_organization_allowlist": "Failed to run task: the current profile isn't compatible with your organization settings",
@@ -161,7 +164,13 @@
 		"image_copied_to_clipboard": "Image data URI copied to clipboard",
 		"image_saved": "Image saved to {{path}}",
 		"mode_exported": "Mode '{{mode}}' exported successfully",
-		"mode_imported": "Mode imported successfully"
+		"mode_imported": "Mode imported successfully",
+		"export_memory_here": "Export Memory Folder Here",
+		"select_memory_folder": "Select Memory Folder to Import",
+		"memory_exported": "Memory exported: {{summaryCount}} summaries, Global Q: {{hasGlobal}}. Path: {{path}}",
+		"memory_imported": "Memory imported: {{summaryCount}} summaries, Global Q: {{hasGlobal}}",
+		"select_import_folder": "Select Exported Task Folder to Import",
+		"task_imported": "Task imported successfully"
 	},
 	"answers": {
 		"yes": "Yes",

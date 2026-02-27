@@ -1790,6 +1790,10 @@ export class ClineProvider
 			await this.createTaskWithHistoryItem(historyItem) // Clears existing task.
 		}
 
+		// Load persisted summaries into SummaryPanel for this task
+		const summaryPanel = SummaryPanel.getInstance()
+		await summaryPanel.loadFromDisk(this.context.globalStorageUri.fsPath, id)
+
 		await this.postMessageToWebview({ type: "action", action: "chatButtonClicked" })
 	}
 
@@ -1883,6 +1887,249 @@ export class ClineProvider
 		} catch (error) {
 			vscode.window.showErrorMessage(
 				`Failed to export task folder: ${error instanceof Error ? error.message : String(error)}`,
+			)
+		}
+	}
+
+	async exportConversationMemory(taskId: string) {
+		const { historyItem } = await this.getTaskWithId(taskId)
+
+		// Build folder name from task timestamp
+		const date = new Date(historyItem.ts)
+		const month = date.toLocaleString("en-US", { month: "short" }).toLowerCase()
+		const day = date.getDate()
+		const year = date.getFullYear()
+		let hours = date.getHours()
+		const minutes = date.getMinutes().toString().padStart(2, "0")
+		const seconds = date.getSeconds().toString().padStart(2, "0")
+		const ampm = hours >= 12 ? "pm" : "am"
+		hours = hours % 12 || 12
+		const folderName = `roo_memory_${month}-${day}-${year}_${hours}-${minutes}-${seconds}-${ampm}`
+
+		// Determine default location
+		const lastExportPath = this.contextProxy.getValue("lastTaskExportPath") as string | undefined
+		let defaultDir: vscode.Uri
+		if (lastExportPath) {
+			defaultDir = vscode.Uri.file(path.dirname(lastExportPath))
+		} else {
+			defaultDir = vscode.Uri.file(path.join(os.homedir(), "Downloads"))
+		}
+
+		// Ask user to pick a destination folder
+		const selected = await vscode.window.showOpenDialog({
+			canSelectFiles: false,
+			canSelectFolders: true,
+			canSelectMany: false,
+			openLabel: t("common:info.export_memory_here"),
+			defaultUri: defaultDir,
+		})
+
+		if (!selected || selected.length === 0) {
+			return
+		}
+
+		const destRoot = path.join(selected[0].fsPath, folderName)
+
+		try {
+			const { exportConversationMemory } = await import("../task-persistence/memory-persistence")
+			const result = await exportConversationMemory(this.context.globalStorageUri.fsPath, taskId, destRoot)
+
+			await this.contextProxy.setValue("lastTaskExportPath", destRoot)
+			vscode.window.showInformationMessage(
+				t("common:info.memory_exported", {
+					summaryCount: result.summaryCount,
+					hasGlobal: result.hasGlobalSummary ? "Yes" : "No",
+					path: destRoot,
+				}),
+			)
+
+			// Open the exported folder in the system file explorer
+			await vscode.env.openExternal(vscode.Uri.file(destRoot))
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Failed to export conversation memory: ${error instanceof Error ? error.message : String(error)}`,
+			)
+		}
+	}
+
+	async importConversationMemory(taskId: string) {
+		// Ask user to select the exported folder
+		const selected = await vscode.window.showOpenDialog({
+			canSelectFiles: false,
+			canSelectFolders: true,
+			canSelectMany: false,
+			openLabel: t("common:info.select_memory_folder"),
+		})
+
+		if (!selected || selected.length === 0) {
+			return
+		}
+
+		const srcFolder = selected[0].fsPath
+
+		// Validate: must contain summaries/ or global_summary/ subfolder
+		const hasSummaries = await fileExistsAtPath(path.join(srcFolder, "summaries"))
+		const hasGlobalSummary = await fileExistsAtPath(path.join(srcFolder, "global_summary"))
+
+		if (!hasSummaries && !hasGlobalSummary) {
+			vscode.window.showErrorMessage(t("common:errors.invalid_memory_folder"))
+			return
+		}
+
+		try {
+			const { importConversationMemory } = await import("../task-persistence/memory-persistence")
+			const result = await importConversationMemory(this.context.globalStorageUri.fsPath, taskId, srcFolder)
+
+			vscode.window.showInformationMessage(
+				t("common:info.memory_imported", {
+					summaryCount: result.summaryCount,
+					hasGlobal: result.hasGlobalSummary ? "Yes" : "No",
+				}),
+			)
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Failed to import conversation memory: ${error instanceof Error ? error.message : String(error)}`,
+			)
+		}
+	}
+
+	async importConversationMemoryAsNewTask() {
+		// Ask user to select the exported task folder
+		const selected = await vscode.window.showOpenDialog({
+			canSelectFiles: false,
+			canSelectFolders: true,
+			canSelectMany: false,
+			openLabel: t("common:info.select_import_folder"),
+		})
+
+		if (!selected || selected.length === 0) {
+			return
+		}
+
+		const srcFolder = selected[0].fsPath
+
+		// Validate: must contain context/ or api_conversation_history.json (legacy)
+		const hasContext = await fileExistsAtPath(path.join(srcFolder, "context"))
+		const hasLegacyApi = await fileExistsAtPath(path.join(srcFolder, GlobalFileNames.apiConversationHistory))
+		const hasLegacyUi = await fileExistsAtPath(path.join(srcFolder, GlobalFileNames.uiMessages))
+
+		if (!hasContext && !hasLegacyApi && !hasLegacyUi) {
+			vscode.window.showErrorMessage(t("common:errors.invalid_import_folder"))
+			return
+		}
+
+		try {
+			const { getTaskDirectoryPath } = await import("../../utils/storage")
+			const globalStoragePath = this.context.globalStorageUri.fsPath
+
+			// Generate a new unique task ID
+			const newTaskId = Date.now().toString()
+
+			// Get the new task directory path
+			const newTaskDir = await getTaskDirectoryPath(globalStoragePath, newTaskId)
+
+			// Recursively copy all files from exported folder to the new task directory
+			const copyDir = async (src: string, dest: string) => {
+				await fs.mkdir(dest, { recursive: true })
+				const entries = await fs.readdir(src, { withFileTypes: true })
+				for (const entry of entries) {
+					const srcPath = path.join(src, entry.name)
+					const destPath = path.join(dest, entry.name)
+					// Skip conversation.md (generated during export, not needed internally)
+					if (entry.name === "conversation.md") {
+						continue
+					}
+					if (entry.isDirectory()) {
+						await copyDir(srcPath, destPath)
+					} else {
+						await fs.copyFile(srcPath, destPath)
+					}
+				}
+			}
+
+			await copyDir(srcFolder, newTaskDir)
+
+			// Read UI messages to extract the first user task message
+			let taskText = "Imported conversation"
+			const contextUiPath = path.join(newTaskDir, "context", GlobalFileNames.uiMessages)
+			const legacyUiPath = path.join(newTaskDir, GlobalFileNames.uiMessages)
+			const uiMessagesPath = (await fileExistsAtPath(contextUiPath))
+				? contextUiPath
+				: (await fileExistsAtPath(legacyUiPath))
+					? legacyUiPath
+					: null
+
+			if (uiMessagesPath) {
+				try {
+					const uiMessages: ClineMessage[] = JSON.parse(await fs.readFile(uiMessagesPath, "utf8"))
+					// Find the first "text" say message (the user's initial prompt)
+					const firstTextMsg = uiMessages.find((m) => m.type === "say" && m.say === "text" && m.text)
+					if (firstTextMsg?.text) {
+						taskText = firstTextMsg.text.slice(0, 500)
+					}
+				} catch {
+					// Use default taskText
+				}
+			}
+
+			// Read api conversation history for token counts
+			let tokensIn = 0
+			let tokensOut = 0
+			let totalCost = 0
+			const contextApiPath = path.join(newTaskDir, "context", GlobalFileNames.apiConversationHistory)
+			const legacyApiPath = path.join(newTaskDir, GlobalFileNames.apiConversationHistory)
+			const apiPath = (await fileExistsAtPath(contextApiPath))
+				? contextApiPath
+				: (await fileExistsAtPath(legacyApiPath))
+					? legacyApiPath
+					: null
+
+			if (apiPath) {
+				try {
+					const apiMessages = JSON.parse(await fs.readFile(apiPath, "utf8"))
+					// Rough estimate of token counts from message count
+					tokensIn = apiMessages.length * 100
+					tokensOut = apiMessages.length * 100
+				} catch {
+					// Use defaults
+				}
+			}
+
+			// Read task_metadata.json if it exists for additional info
+			const metadataPath = path.join(newTaskDir, GlobalFileNames.taskMetadata)
+			if (await fileExistsAtPath(metadataPath)) {
+				try {
+					const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"))
+					if (metadata.tokensIn) tokensIn = metadata.tokensIn
+					if (metadata.tokensOut) tokensOut = metadata.tokensOut
+					if (metadata.totalCost) totalCost = metadata.totalCost
+				} catch {
+					// Use defaults
+				}
+			}
+
+			// Create a HistoryItem and add to task history
+			const history = (this.getGlobalState("taskHistory") as any[] | undefined) || []
+			const historyItem = {
+				id: newTaskId,
+				number: history.length + 1,
+				ts: Date.now(),
+				task: taskText,
+				tokensIn,
+				tokensOut,
+				totalCost,
+				workspace: this.cwd ?? "",
+			}
+
+			await this.updateTaskHistory(historyItem)
+
+			// Show the imported task
+			await this.showTaskWithId(newTaskId)
+
+			vscode.window.showInformationMessage(t("common:info.task_imported"))
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Failed to import task: ${error instanceof Error ? error.message : String(error)}`,
 			)
 		}
 	}

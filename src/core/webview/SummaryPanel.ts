@@ -1,5 +1,6 @@
 import * as vscode from "vscode"
 import { getNonce } from "./getNonce"
+import { loadAllSummaryEntries, loadGlobalSummary } from "../task-persistence/memory-persistence"
 
 export interface SummaryEntry {
 	id: string
@@ -139,6 +140,40 @@ export class SummaryPanel {
 		this.entries = []
 		if (this.isReady && this.panel) {
 			this.panel.webview.postMessage({ type: "reset" })
+		}
+	}
+
+	/**
+	 * Load all persisted summaries and global summary from disk for a given task.
+	 * Replaces the current in-memory entries with the loaded data.
+	 */
+	public async loadFromDisk(globalStoragePath: string, taskId: string): Promise<void> {
+		this.entries = []
+
+		try {
+			// Load individual summaries
+			const summaries = await loadAllSummaryEntries(globalStoragePath, taskId)
+			for (const entry of summaries) {
+				this.entries.push(entry)
+			}
+
+			// Load global summary
+			const globalSummary = await loadGlobalSummary(globalStoragePath, taskId)
+			if (globalSummary) {
+				this.entries.push({
+					id: `global_${taskId}`,
+					timestamp: globalSummary.timestamp ?? Date.now(),
+					text: globalSummary.text,
+					isGlobal: true,
+				})
+			}
+		} catch (error) {
+			console.warn("[SummaryPanel] Failed to load summaries from disk:", error)
+		}
+
+		// Update the panel if it's open
+		if (this.isReady && this.panel) {
+			this.sendAllEntries()
 		}
 	}
 

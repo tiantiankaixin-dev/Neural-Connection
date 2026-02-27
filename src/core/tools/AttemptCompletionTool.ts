@@ -10,7 +10,6 @@ import type { ToolUse } from "../../shared/tools"
 import { t } from "../../i18n"
 
 import { BaseTool, ToolCallbacks } from "./BaseTool"
-import { summarizeConversation, autoUpdateGlobalSummary } from "../condense"
 
 interface AttemptCompletionParams {
 	result: string
@@ -88,99 +87,6 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 
 			TelemetryService.instance.captureTaskCompleted(task.taskId)
 			task.emit(RooCodeEventName.TaskCompleted, task.taskId, task.getTokenUsage(), task.toolUsage)
-
-			// Auto-generate Global Summary Q on task completion.
-			// Uses minimal LLM context (only summary instruction + messages to summarize).
-			// This ensures the model sees a compact summary of completed work,
-			// whether the user approves or provides feedback to continue.
-			try {
-				const messages = task.apiConversationHistory
-				console.log("[AttemptCompletionTool] Auto summary: messages.length =", messages.length)
-				if (messages.length > 2) {
-					console.log("[AttemptCompletionTool] Getting condensing API handler...")
-					const condensingApi = await task.getCondensingApiHandler()
-
-					// --- Prepare clean messages for precise Individual Summary ---
-					// Rolling Summaries compress messages progressively during the task,
-					// but for the final Individual Summary we need ALL original messages
-					// to produce a precise, complete summary.
-					// 1. Collect condenseIds from Rolling Summaries
-					const rollingCondenseIds = new Set(
-						messages.filter((msg) => msg.isRollingSummary && msg.condenseId).map((msg) => msg.condenseId!),
-					)
-					// 2. Remove Rolling Summary messages and un-tag messages they hid
-					const cleanMessages = messages
-						.filter((msg) => !msg.isRollingSummary)
-						.map((msg) => {
-							if (msg.condenseParent && rollingCondenseIds.has(msg.condenseParent)) {
-								const { condenseParent, ...rest } = msg
-								return rest as typeof msg
-							}
-							return msg
-						})
-					console.log(
-						"[AttemptCompletionTool] Cleaned messages: original=",
-						messages.length,
-						"clean=",
-						cleanMessages.length,
-						"rollingRemoved=",
-						rollingCondenseIds.size,
-					)
-
-					console.log("[AttemptCompletionTool] Got condensing API, calling summarizeConversation...")
-					const condenseResult = await summarizeConversation({
-						messages: cleanMessages,
-						apiHandler: condensingApi,
-						systemPrompt: "",
-						taskId: task.taskId,
-						isAutomaticTrigger: true,
-						globalStoragePath: task.globalStoragePath,
-					})
-					console.log(
-						"[AttemptCompletionTool] summarizeConversation result: error=",
-						condenseResult.error,
-						"messagesChanged=",
-						condenseResult.messages !== cleanMessages,
-						"summary length=",
-						condenseResult.summary?.length,
-					)
-
-					// Use updated messages if summarizeConversation succeeded, otherwise use original.
-					// Always call autoUpdateGlobalSummary so the Global Q merges all existing
-					// summaries (including rolling summaries) even when no new individual summary
-					// was generated.
-					const messagesForGlobal =
-						!condenseResult.error && condenseResult.messages !== cleanMessages
-							? condenseResult.messages
-							: cleanMessages
-
-					const globalUpdate = await autoUpdateGlobalSummary(messagesForGlobal, condensingApi, {
-						globalStoragePath: task.globalStoragePath,
-						taskId: task.taskId,
-					})
-					if (globalUpdate.messages !== messagesForGlobal) {
-						await task.overwriteApiConversationHistory(globalUpdate.messages)
-						console.log("[AttemptCompletionTool] Global summary updated successfully")
-					} else {
-						// If summarizeConversation produced new messages but autoUpdateGlobalSummary didn't change them,
-						// still persist the summarizeConversation result
-						if (messagesForGlobal !== cleanMessages) {
-							await task.overwriteApiConversationHistory(messagesForGlobal)
-							console.log("[AttemptCompletionTool] Individual summary saved (no Global Q change)")
-						} else if (cleanMessages !== messages) {
-							// Even if no new summary was generated, persist the cleaned messages
-							// (without Rolling Summaries) since the Individual Summary replaces them
-							await task.overwriteApiConversationHistory(cleanMessages)
-							console.log("[AttemptCompletionTool] Cleaned messages saved (Rolling Summaries removed)")
-						}
-					}
-				} else {
-					console.log("[AttemptCompletionTool] Skipped: messages.length <= 2")
-				}
-			} catch (error) {
-				console.error("[AttemptCompletionTool] Auto Global Q generation failed:", error)
-				// Non-critical: failure shouldn't block task completion
-			}
 
 			// Check for subtask using parentTaskId (metadata-driven delegation)
 			if (task.parentTaskId) {

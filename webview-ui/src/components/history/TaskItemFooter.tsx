@@ -3,6 +3,8 @@ import type { HistoryItem } from "@roo-code/types"
 import { formatTimeAgo } from "@/utils/format"
 import { CopyButton } from "./CopyButton"
 import { ExportButton } from "./ExportButton"
+import { ExportMemoryButton } from "./ExportMemoryButton"
+import { ImportMemoryButton } from "./ImportMemoryButton"
 import { DeleteButton } from "./DeleteButton"
 import { StandardTooltip } from "../ui/standard-tooltip"
 import { useAppTranslation } from "@/i18n/TranslationContext"
@@ -57,6 +59,8 @@ const TaskItemFooter: React.FC<TaskItemFooterProps> = ({
 				<div className="flex flex-row gap-0 -mx-1.5 items-center text-vscode-descriptionForeground/60 hover:text-vscode-descriptionForeground opacity-0 group-hover:opacity-100">
 					<CopyButton itemTask={item.task} />
 					{variant === "full" && <ExportButton itemId={item.id} />}
+					{variant === "full" && <ExportMemoryButton itemId={item.id} />}
+					{variant === "full" && <ImportMemoryButton itemId={item.id} />}
 					{onDelete && <DeleteButton itemId={item.id} onDelete={onDelete} />}
 				</div>
 			)}

@@ -129,18 +129,13 @@ import {
 	checkpointDiff,
 } from "../checkpoints"
 import { processUserContentMentions } from "../mentions/processUserContentMentions"
-import {
-	summarizeConversation,
-	getEffectiveApiHistory,
-	generateRollingSummary,
-	getMessagesSinceLastSummary,
-	ROLLING_SUMMARY_THRESHOLD,
-} from "../condense"
+import { summarizeConversation, getEffectiveApiHistory } from "../condense"
 import { MessageQueueService } from "../message-queue/MessageQueueService"
 import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
 import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
+import { saveThinkingSummary } from "../task-persistence/thinking-persistence"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -1195,6 +1190,101 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		await this.saveApiConversationHistory()
 	}
 
+	/**
+	 * HIGHEST PRIORITY RULE: After each assistant turn with plain-text reasoning,
+	 * compress the thinking into a concise summary, REPLACE the reasoning block
+	 * with a standard text block in apiConversationHistory, and persist both
+	 * original and summary to <task_dir>/thinking_summaries/.
+	 *
+	 * The compressed summary is stored as { type: "text", text: "[Thinking Summary]\n..." }
+	 * — a regular text block — so it survives through ALL downstream consumers:
+	 *   - Context condensation (text blocks are included in summarization input)
+	 *   - AI SDK providers (text blocks are always included, unlike reasoning blocks)
+	 *   - buildCleanConversationHistory (text blocks pass through the default path)
+	 *
+	 * If the LLM compression call fails, the raw thinking text is used directly as the summary.
+	 */
+	private async compressThinkingInHistory(reasoningText: string): Promise<void> {
+		const lastMsg = this.apiConversationHistory[this.apiConversationHistory.length - 1]
+		if (!lastMsg || lastMsg.role !== "assistant") return
+
+		const content = lastMsg.content
+		if (!Array.isArray(content)) return
+
+		// Find the plain-text reasoning block (not encrypted, not Anthropic thinking)
+		const reasoningBlockIndex = content.findIndex(
+			(block: any) =>
+				block.type === "reasoning" &&
+				typeof block.text === "string" &&
+				!block.encrypted_content &&
+				!block.signature,
+		)
+		if (reasoningBlockIndex === -1) return
+
+		const reasoningBlock = content[reasoningBlockIndex] as any
+		const originalText = reasoningBlock.text as string
+
+		let summary = originalText // Fallback: use raw text
+
+		// Only call LLM for compression if thinking is long enough to be worth it
+		if (originalText.length >= 200) {
+			try {
+				const condensingApi = await this.getCondensingApiHandler()
+
+				const systemPrompt =
+					"You are a thinking summarizer. Given the model's internal reasoning/thinking process, " +
+					"produce a concise summary that captures the key decisions, discoveries, and conclusions. " +
+					"Output ONLY the summary, no preamble. Keep it under 30% of the original length. " +
+					"Use the same language as the original thinking."
+
+				const requestMessages: Anthropic.MessageParam[] = [
+					{
+						role: "user",
+						content: `Summarize the following thinking process concisely:\n\n${originalText}`,
+					},
+				]
+
+				let summaryText = ""
+				const stream = condensingApi.createMessage(systemPrompt, requestMessages)
+				for await (const chunk of stream) {
+					if (chunk.type === "text") {
+						summaryText += chunk.text
+					}
+				}
+
+				summaryText = summaryText.trim()
+				if (summaryText.length > 0 && summaryText.length < originalText.length) {
+					summary = summaryText
+				}
+			} catch (error) {
+				console.warn("[Task] Failed to generate thinking summary via LLM, using raw text:", error)
+				// Fallback: use raw text directly as the summary
+			}
+		}
+
+		// CRITICAL: Replace the reasoning block with a standard text block.
+		// Using type:"text" (not type:"reasoning") ensures the summary survives through:
+		// - Context condensation (reasoning blocks may be ignored by condensing models)
+		// - AI SDK convertToAiSdkMessages (reasoning may be stripped for non-thinking models)
+		// - Any other downstream consumer that only processes standard content blocks
+		content[reasoningBlockIndex] = {
+			type: "text" as const,
+			text: `[Thinking Summary]\n${summary}`,
+		}
+
+		// Persist to disk
+		await saveThinkingSummary(this.globalStoragePath, this.taskId, {
+			id: `${Date.now()}`,
+			timestamp: Date.now(),
+			originalLength: originalText.length,
+			summary,
+			original: originalText,
+		}).catch((err) => console.warn("[Task] Failed to persist thinking summary:", err))
+
+		// Save updated history with compressed thinking
+		await this.saveApiConversationHistory()
+	}
+
 	// NOTE: We intentionally do NOT mutate stored messages to merge consecutive user turns.
 	// For API requests, consecutive same-role messages are merged via mergeConsecutiveApiMessages()
 	// so rewind/edit behavior can still reference original message boundaries.
@@ -1804,47 +1894,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.error("[Task] Failed to build regression API handler:", error)
 		}
 		return undefined
-	}
-
-	/**
-	 * Checks whether enough unsummarized messages have accumulated and, if so,
-	 * generates a rolling (rough) summary using the condensing model.
-	 *
-	 * Called before each API request inside recursivelyMakeClineRequests so that
-	 * the effective context stays compressed as: [Global Q] + [Rolling Summary] + [recent messages].
-	 */
-	private async maybeGenerateRollingSummary(): Promise<void> {
-		const messages = this.apiConversationHistory
-		if (messages.length === 0) return
-
-		const sinceLastSummary = getMessagesSinceLastSummary(messages)
-		const nonSummaryMessages = sinceLastSummary.filter((m) => !m.isSummary)
-
-		if (nonSummaryMessages.length < ROLLING_SUMMARY_THRESHOLD) return
-
-		try {
-			console.log(
-				"[Rolling Summary] Triggering — %d non-summary messages since last summary (threshold: %d)",
-				nonSummaryMessages.length,
-				ROLLING_SUMMARY_THRESHOLD,
-			)
-			const condensingApi = await this.getCondensingApiHandler()
-			const result = await generateRollingSummary({
-				messages,
-				apiHandler: condensingApi,
-				globalStoragePath: this.globalStoragePath,
-				taskId: this.taskId,
-			})
-			if (!result.error && result.messages !== messages) {
-				await this.overwriteApiConversationHistory(result.messages)
-				console.log("[Rolling Summary] History updated — new length:", result.messages.length)
-			} else if (result.error) {
-				console.log("[Rolling Summary] Skipped:", result.error)
-			}
-		} catch (error) {
-			console.error("[Rolling Summary] Failed:", error)
-			// Non-critical: don't block the main task loop
-		}
 	}
 
 	public async submitUserMessage(
@@ -2954,12 +3003,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const shouldAddUserMessage =
 				((currentItem.retryAttempt ?? 0) === 0 && !isEmptyUserContent) || currentItem.userMessageWasRemoved
 
-			// Rolling summary: compress conversation if enough new messages have accumulated.
-			// Runs BEFORE adding the current user message so only completed exchanges are summarized.
-			if (shouldAddUserMessage) {
-				await this.maybeGenerateRollingSummary()
-			}
-
 			if (shouldAddUserMessage) {
 				await this.addToApiConversationHistory({ role: "user", content: finalUserContent })
 				TelemetryService.instance.captureConversationMessage(this.taskId, "user")
@@ -3763,6 +3806,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						reasoningMessage || undefined,
 					)
 					this.assistantMessageSavedToHistory = true
+
+					// HIGHEST PRIORITY: Compress thinking/reasoning into summary and replace in history.
+					// This runs after every assistant turn that includes plain-text reasoning.
+					// The compressed summary becomes part of future API context instead of being stripped.
+					// MUST be awaited to prevent race conditions: the next API call could run
+					// before compression completes, causing the raw reasoning to be sent/stripped.
+					if (reasoningMessage) {
+						try {
+							await this.compressThinkingInHistory(reasoningMessage)
+						} catch (err) {
+							console.warn("[Task] compressThinkingInHistory failed (non-critical):", err)
+						}
+					}
 
 					TelemetryService.instance.captureConversationMessage(this.taskId, "assistant")
 				}
@@ -4797,7 +4853,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					continue
 				} else if (hasPlainTextReasoning) {
-					// Preserve plain-text reasoning blocks for:
+					// NOTE: After compressThinkingInHistory runs, the reasoning block is replaced
+					// with a standard { type: "text", text: "[Thinking Summary]\n..." } block.
+					// So this branch only triggers for UN-compressed reasoning (e.g. if compression
+					// hasn't run yet, or for Anthropic thinking/encrypted blocks handled above).
+
+					// Preserve raw plain-text reasoning blocks for:
 					// - models explicitly opting in via preserveReasoning
 					// - AI SDK providers (provider packages decide what to include in the native request)
 					const shouldPreserveForApi =
@@ -4808,7 +4869,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					if (shouldPreserveForApi) {
 						assistantContent = contentArray
 					} else {
-						// Strip reasoning out - stored for history only, not sent back to API
+						// Strip raw (uncompressed) reasoning out - stored for history only, not sent back to API
 						if (rest.length === 0) {
 							assistantContent = ""
 						} else if (rest.length === 1 && rest[0].type === "text") {

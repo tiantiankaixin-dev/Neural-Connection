@@ -60,6 +60,9 @@
 		"failed_remove_directory": "删除任务目录失败：{{error}}",
 		"custom_storage_path_unusable": "自定义存储路径 \"{{path}}\" 不可用，将使用默认路径",
 		"cannot_access_path": "无法访问路径 {{path}}：{{error}}",
+		"invalid_memory_folder": "无效的记忆文件夹：必须包含 'summaries' 或 'global_summary' 子文件夹。",
+		"empty_memory_folder": "所选记忆文件夹中没有可用的摘要数据。",
+		"invalid_import_folder": "无效的任务文件夹：必须包含 'context' 目录或对话历史文件。",
 		"settings_import_failed": "设置导入失败：{{error}}。",
 		"mistake_limit_guidance": "这可能表明模型思维过程失败或无法正确使用工具，可通过用户指导来缓解（例如\"尝试将任务分解为更小的步骤\"）。",
 		"violated_organization_allowlist": "执行任务失败：当前配置文件与您的组织设置不兼容",
@@ -166,7 +169,13 @@
 		"organization_share_link_copied": "组织分享链接已复制到剪贴板！",
 		"public_share_link_copied": "公开分享链接已复制到剪贴板！",
 		"mode_exported": "模式 '{{mode}}' 已成功导出",
-		"mode_imported": "模式已成功导入"
+		"mode_imported": "模式已成功导入",
+		"export_memory_here": "导出记忆文件夹到此处",
+		"select_memory_folder": "选择要导入的记忆文件夹",
+		"memory_exported": "记忆已导出：{{summaryCount}} 个摘要，全局概要Q：{{hasGlobal}}。路径：{{path}}",
+		"memory_imported": "记忆已导入：{{summaryCount}} 个摘要，全局概要Q：{{hasGlobal}}",
+		"select_import_folder": "选择要导入的已导出任务文件夹",
+		"task_imported": "任务导入成功"
 	},
 	"answers": {
 		"yes": "是",

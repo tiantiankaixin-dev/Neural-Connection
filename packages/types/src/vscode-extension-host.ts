@@ -611,6 +611,10 @@ export interface WebviewMessage {
 		| "neuralAgentInstallPlatform"
 		| "neuralAgentShowModelDetail"
 		| "neuralAgentFetchModels"
+		// Conversation memory export/import
+		| "exportConversationMemory"
+		| "importConversationMemory"
+		| "importConversationMemoryAsNewTask"
 	text?: string
 	editedMessageContent?: string
 	tab?: "settings" | "history" | "mcp" | "modes" | "chat" | "marketplace" | "cloud"

@@ -47,5 +47,8 @@
 	"subtaskTag": "子任务",
 	"deleteWithSubtasks": "这也将删除 {{count}} 个子任务。您确定吗？",
 	"expandSubtasks": "展开子任务",
-	"collapseSubtasks": "收起子任务"
+	"collapseSubtasks": "收起子任务",
+	"exportMemory": "导出对话记忆",
+	"importMemory": "导入对话记忆",
+	"importMemoryAsNewTask": "导入"
 }
