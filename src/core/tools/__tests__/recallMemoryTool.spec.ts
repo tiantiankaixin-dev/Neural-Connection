@@ -369,18 +369,34 @@ describe("regressMemory", () => {
 				sourceMessages: [],
 			},
 		]
+
+		expect(result.success).toBe(true)
+		expect(result.chain).toHaveLength(1) // no global, just selected individual
+		expect(result.chain[0].entryId).toBe("summary-2")
+		expect(result.originalMessages).toHaveLength(1)
+		expect(result.originalMessages[0].content).toBe("Build dashboard")
+	})
+
+	it("should include global Q in chain when present alongside other summaries", async () => {
+		const entries: SummaryEntry[] = [
+			{
+				id: "global-1",
+				timestamp: Date.now() - 20000,
+				text: "Global overview",
+				isGlobal: true,
+			},
+			{
+				id: "summary-1",
+				timestamp: Date.now(),
+				text: "Detail about feature X",
+				isGlobal: false,
+				sourceMessages: [{ role: "user", content: "Implement X", ts: 1000, id: "msg-1" }],
+			},
+		]
 		;(mockSummaryPanel as any).entries = entries
 
-		const mockApi = {
-			createMessage: vi.fn().mockReturnValue(
-				(async function* () {
-					throw new Error("Network timeout")
-				})(),
-			),
-		} as any
-
-		const result = await regressMemory("query", mockApi)
-
+		const mockApi = {} as any
+		const result = await regressMemory("feature X", mockApi)
 		expect(result.success).toBe(false)
 		expect(result.error).toContain("Regression model call failed")
 	})
