@@ -50,7 +50,6 @@ export const toolNames = [
 	"read_terminal",
 	"read_url_content",
 	"search_web",
-	"task_memory",
 	"recall_memory",
 ] as const
 

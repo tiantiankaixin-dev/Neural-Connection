@@ -94,14 +94,6 @@ export const toolParamNames = [
 	"max_depth",
 	"type",
 	"full_path",
-	// task_memory parameters
-	"task_memory_id",
-	"title",
-	"description",
-	"previous_context_summary",
-	"task_summary",
-	"key_files",
-	"tags",
 ] as const
 
 export type ToolParamName = (typeof toolParamNames)[number]
@@ -391,7 +383,6 @@ export const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
 	edit_notebook: "edit notebooks",
 	view_content_chunk: "view content chunks",
 	create_memory: "manage memories",
-	task_memory: "manage task memory",
 	recall_memory: "recall deep memories",
 } as const
 
@@ -447,7 +438,6 @@ export const ALWAYS_AVAILABLE_TOOLS: ToolName[] = [
 	"run_slash_command",
 	"skill",
 	"create_memory",
-	"task_memory",
 	"recall_memory",
 ] as const
 

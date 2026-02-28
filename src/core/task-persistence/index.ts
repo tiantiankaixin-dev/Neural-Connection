@@ -8,12 +8,5 @@ export { isRooUserMessage, isRooAssistantMessage, isRooToolMessage, isRooReasoni
 export type { TextPart, ImagePart, FilePart, ToolCallPart, ToolResultPart, ReasoningPart } from "./rooMessage"
 export { convertAnthropicToRooMessages } from "./converters/anthropicToRoo"
 export { flattenModelMessagesToStringContent } from "./messageUtils"
-export {
-	saveSummaryEntry,
-	loadAllSummaryEntries,
-	saveGlobalSummary,
-	loadGlobalSummary,
-	saveTaskMemoryStore,
-	loadTaskMemoryStore,
-} from "./memory-persistence"
-export type { PersistedGlobalSummary, TaskMemoryEntry, TaskMemoryStore } from "./memory-persistence"
+export { saveSummaryEntry, loadAllSummaryEntries, saveGlobalSummary, loadGlobalSummary } from "./memory-persistence"
+export type { PersistedGlobalSummary } from "./memory-persistence"

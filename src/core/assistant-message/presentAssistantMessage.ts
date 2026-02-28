@@ -34,7 +34,6 @@ import { readNotebookTool } from "../tools/ReadNotebookTool"
 import { editNotebookTool } from "../tools/EditNotebookTool"
 import { viewContentChunkTool } from "../tools/ViewContentChunkTool"
 import { createMemoryTool } from "../tools/CreateMemoryTool"
-import { taskMemoryTool } from "../tools/TaskMemoryTool"
 import { recallMemoryTool } from "../tools/RecallMemoryTool"
 import { searchWebTool } from "../tools/SearchWebTool"
 import { useMcpToolTool } from "../tools/UseMcpToolTool"
@@ -893,13 +892,6 @@ export async function presentAssistantMessage(cline: Task) {
 					break
 				case "create_memory":
 					await createMemoryTool.handle(cline, block as ToolUse<"create_memory">, {
-						askApproval,
-						handleError,
-						pushToolResult,
-					})
-					break
-				case "task_memory":
-					await taskMemoryTool.handle(cline, block as ToolUse<"task_memory">, {
 						askApproval,
 						handleError,
 						pushToolResult,

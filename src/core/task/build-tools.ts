@@ -10,7 +10,7 @@ import { getRooDirectoriesForCwd } from "../../services/roo-config/index.js"
 
 import { getNativeTools, getMcpServerTools } from "../prompts/tools/native-tools"
 import { filterNativeToolsForMode, filterMcpToolsForMode } from "../prompts/tools/filter-tools-for-mode"
-import { applyProgressiveDisclosure } from "../prompts/tools/progressive-disclosure"
+import { applyProgressiveDisclosure, applyTaskLock } from "../prompts/tools/progressive-disclosure"
 
 interface BuildToolsOptions {
 	provider: ClineProvider
@@ -35,6 +35,12 @@ interface BuildToolsOptions {
 	 * discovered tools get full definitions; others are stripped to name + brief description.
 	 */
 	discoveredTools?: Set<string>
+	/**
+	 * Whether the model has established a task via update_todo_list.
+	 * When false, all tools except update_todo_list and ask_followup_question are
+	 * stripped to name-only with [LOCKED] notice. This physically enforces "task first".
+	 */
+	taskEstablished?: boolean
 }
 
 interface BuildToolsResult {
@@ -168,8 +174,15 @@ export async function buildNativeToolsArrayWithRestrictions(options: BuildToolsO
 		}
 	}
 
-	// Apply progressive disclosure if discoveredTools is provided
-	const finalTools = discoveredTools ? applyProgressiveDisclosure(filteredTools, discoveredTools) : filteredTools
+	// Apply task lock if task is not yet established (strips all tools except update_todo_list)
+	// Task lock takes priority over progressive disclosure since it's a stronger constraint
+	let finalTools: OpenAI.Chat.ChatCompletionTool[]
+	if (options.taskEstablished === false) {
+		finalTools = applyTaskLock(filteredTools)
+	} else {
+		// Apply progressive disclosure if discoveredTools is provided
+		finalTools = discoveredTools ? applyProgressiveDisclosure(filteredTools, discoveredTools) : filteredTools
+	}
 
 	// DEBUG: Log final tools sent to model
 	const toolNames = finalTools.map((t) => {

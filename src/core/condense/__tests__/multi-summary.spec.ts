@@ -324,7 +324,7 @@ describe("Multi-Summary Model", () => {
 
 	describe("Multi-summary end-to-end flow", () => {
 		it("should produce correct effective history after two sub-task condensations", () => {
-			// Simulate what happens after two task_memory(end) calls:
+			// Simulate what happens after two sub-task condensations:
 			// Sub-task 1: messages 0-4, condensed to summary_1
 			// Sub-task 2: messages 5-8, condensed to summary_2
 			// Current: messages 9-10
@@ -377,7 +377,7 @@ describe("Multi-Summary Model", () => {
 
 		it("should handle partial summary merge (context full during active sub-task)", () => {
 			// When context gets full during an active sub-task, manageContext creates
-			// a partial summary. Later, when task_memory(end) runs, the partial summary
+			// a partial summary. Later, when the final condensation runs, the partial summary
 			// + new messages get condensed into a final summary.
 			const s1 = "subtask-1-complete"
 			const s2_partial = "subtask-2-partial"
@@ -401,7 +401,7 @@ describe("Multi-Summary Model", () => {
 				},
 				// Sub-task 2 continued after partial summary
 				{ role: "user", content: "msg4", ts: 6, condenseParent: s2_final },
-				// Final summary from task_memory(end)
+				// Final summary from sub-task condensation
 				{
 					role: "user",
 					content: "Final summary: Sub-task 2 complete",

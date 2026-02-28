@@ -75,6 +75,9 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 
 			await setTodoListForTask(task, normalizedTodos)
 
+			// Task lock: establishing a task unlocks all tools for subsequent API calls
+			task.taskEstablished = true
+
 			if (isTodoListChanged) {
 				const md = todoListToMarkdown(normalizedTodos)
 				pushToolResult(formatResponse.toolResult("User edits todo:\n\n" + md))

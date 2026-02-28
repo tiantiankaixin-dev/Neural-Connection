@@ -5,7 +5,6 @@ export const GlobalFileNames = {
 	customModes: "custom_modes.yaml",
 	taskMetadata: "task_metadata.json",
 	globalSummary: "global_summary.json",
-	taskMemories: "task_memories.json",
 }
 
 export const TaskSubDirs = {

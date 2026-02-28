@@ -238,8 +238,7 @@ export type SummarizeConversationOptions = {
 	subtaskTitle?: string
 	/** If provided, override the default "since last summary" boundary.
 	 * Summarize and tag messages from this index onward (inclusive).
-	 * Intermediate summaries within the range are also tagged (replaced by the new comprehensive summary).
-	 * Used by task_memory to create a full-quality summary from ALL sub-task messages. */
+	 * Intermediate summaries within the range are also tagged (replaced by the new comprehensive summary). */
 	summarizeFromIndex?: number
 	/** If provided, summaries will be persisted to memory/ subdirectory on disk */
 	globalStoragePath?: string
@@ -949,7 +948,7 @@ export function getMessagesSinceLastSummary(messages: ApiMessage[]): ApiMessage[
  */
 export function getEffectiveApiHistory(messages: ApiMessage[]): ApiMessage[] {
 	// Multi-Summary Model: keep ALL summary messages visible, filter out condensed/truncated messages.
-	// This supports task_memory sub-task condensing where each sub-task gets its own summary
+	// Each sub-task gets its own summary
 	// and the model sees: [summary_1, summary_2, ..., summary_N, current_raw_messages]
 	//
 	// Backward compatible with old "Fresh Start" data: if old condensation tagged ALL messages

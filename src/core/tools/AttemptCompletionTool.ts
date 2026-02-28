@@ -143,6 +143,9 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 			// User provided feedback - push tool result to continue the conversation
 			await task.say("user_feedback", text ?? "", images)
 
+			// Task lock: re-lock tools after completion feedback so model must re-establish task
+			task.taskEstablished = false
+
 			const feedbackText = `<user_message>\n${text}\n</user_message>`
 			pushToolResult(formatResponse.toolResult(feedbackText, images))
 		} catch (error) {

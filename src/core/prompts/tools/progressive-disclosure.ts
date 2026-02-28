@@ -58,9 +58,11 @@ const TOOL_BRIEFS: Record<string, string> = {
 	edit_notebook: "Completely replaces the contents of a specific cell in a Jupyter notebook",
 	view_content_chunk: "View a specific chunk of a web or knowledge base document content",
 	create_memory: "Save important context relevant to the USER and their task to a memory database",
-	task_memory: "Autonomous task lifecycle memory — track task start/end and search past task history",
 	recall_memory: "Deep memory recall — drill down from summaries to retrieve original conversation messages",
 }
+
+// Tools that remain fully exposed when task is NOT yet established (task lock)
+const TASK_LOCK_UNLOCKED_TOOLS = new Set(["update_todo_list", "ask_followup_question"])
 
 // Cache full tool definitions so we can return them when a stripped tool is "discovered"
 const fullToolDefinitionCache = new Map<string, OpenAI.Chat.ChatCompletionTool>()
@@ -158,4 +160,47 @@ export function getFullToolSchemaText(toolName: string): string {
 
 	text += `\nPlease call \`${toolName}\` again with the correct parameters.`
 	return text
+}
+
+/**
+ * Apply task lock to a tools array.
+ * When task is not established, ALL tools except update_todo_list and ask_followup_question
+ * are stripped to name + "[LOCKED]" description with empty parameters.
+ * This physically prevents the model from calling tools without first establishing a task.
+ *
+ * @param tools - The tools array to apply lock to
+ * @returns Transformed tools array with task lock applied
+ */
+export function applyTaskLock(tools: OpenAI.Chat.ChatCompletionTool[]): OpenAI.Chat.ChatCompletionTool[] {
+	// Cache full definitions before stripping (for later unlock)
+	for (const tool of tools) {
+		const fn = (tool as OpenAI.Chat.ChatCompletionFunctionTool).function
+		if (fn?.name) {
+			fullToolDefinitionCache.set(fn.name, structuredClone(tool))
+		}
+	}
+
+	return tools.map((tool) => {
+		const fn = (tool as OpenAI.Chat.ChatCompletionFunctionTool).function
+		if (!fn?.name) return tool
+
+		// Unlocked tools: fully exposed during task lock
+		if (TASK_LOCK_UNLOCKED_TOOLS.has(fn.name)) {
+			return tool
+		}
+
+		// All other tools: stripped to name + LOCKED notice
+		const brief = TOOL_BRIEFS[fn.name] || fn.description?.split(".")[0] || fn.name
+		return {
+			type: "function",
+			function: {
+				name: fn.name,
+				description: `[LOCKED] ${brief} — Call update_todo_list first to unlock all tools.`,
+				parameters: {
+					type: "object",
+					properties: {},
+				},
+			},
+		} as OpenAI.Chat.ChatCompletionTool
+	})
 }

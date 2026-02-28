@@ -1,6 +1,6 @@
 import * as vscode from "vscode"
 import { getNonce } from "./getNonce"
-import { loadAllSummaryEntries, loadGlobalSummary } from "../task-persistence/memory-persistence"
+import { saveSummaryEntry, loadAllSummaryEntries, loadGlobalSummary } from "../task-persistence/memory-persistence"
 
 export interface SummaryEntry {
 	id: string
@@ -8,8 +8,14 @@ export interface SummaryEntry {
 	text: string
 	isGlobal: boolean
 	isRolling?: boolean
+	isThinking?: boolean
+	isTaskSummary?: boolean // Generated at task end via segmented compression
+	segmentIndex?: number // Which segment this is (1-based), undefined for final combined
+	totalSegments?: number // Total number of segments
 	modelId?: string
 	sourceMessages?: any[] // Original messages that were summarized
+	originalLength?: number // Original thinking length before compression
+	keyPoints?: string // Key findings from tool results (extracted from thinking_summary)
 }
 
 /**
@@ -23,6 +29,8 @@ export class SummaryPanel {
 	private disposables: vscode.Disposable[] = []
 	private entries: SummaryEntry[] = []
 	private isReady = false
+	private activeGlobalStoragePath: string | undefined
+	private activeTaskId: string | undefined
 
 	private constructor() {}
 
@@ -56,13 +64,27 @@ export class SummaryPanel {
 					this.sendAllEntries()
 				} else if (message.type === "test") {
 					const crypto = require("crypto")
+					// Test: Thinking entry WITH key points (split rendering)
 					this.addSummary({
 						id: crypto.randomUUID(),
 						timestamp: Date.now(),
-						text: "This is a test summary entry.\n\nThe user asked about the project architecture. The project uses a layered architecture with Core, Managers, Player, UI, and World modules. All managers extend Singleton<T> and communicate via a static GameEvents event bus.",
+						text: "User wants architecture overview. I've gathered core systems info via codebase_search. Next: search for remaining systems (SaveSystem, UI) to complete the picture.",
+						isGlobal: false,
+						isThinking: true,
+						modelId: "test-model",
+						originalLength: 2000,
+						keyPoints:
+							"codebase_search found: PlayerController handles movement+jump in Update(), GameManager is singleton managing game state, AudioManager uses event-driven pattern via GameEvents.",
+					})
+					// Test: Regular summary (no key points)
+					this.addSummary({
+						id: crypto.randomUUID(),
+						timestamp: Date.now(),
+						text: "This is a test summary entry.\n\nThe project uses a layered architecture with Core, Managers, Player, UI, and World modules.",
 						isGlobal: false,
 						modelId: "test-model",
 					})
+					// Test: Global summary
 					this.addSummary({
 						id: crypto.randomUUID(),
 						timestamp: Date.now(),
@@ -102,8 +124,33 @@ export class SummaryPanel {
 		return !!this.panel
 	}
 
-	/** Called by the condense system when a new summary is generated */
-	public addSummary(entry: SummaryEntry): void {
+	/**
+	 * Set the active task context so addSummary can persist to the correct DB location.
+	 * Must be called when a task starts or is resumed.
+	 */
+	public setActiveTask(globalStoragePath: string, taskId: string): void {
+		this.activeGlobalStoragePath = globalStoragePath
+		this.activeTaskId = taskId
+		console.log("[SummaryPanel] setActiveTask:", taskId)
+	}
+
+	/**
+	 * Clear the active task context (e.g. when task ends).
+	 */
+	public clearActiveTask(): void {
+		this.activeGlobalStoragePath = undefined
+		this.activeTaskId = undefined
+	}
+
+	/** Called by the condense system when a new summary is generated.
+	 *  DB-centric: saves to disk first, then reloads from disk to display.
+	 *  @param entry The summary entry to add.
+	 *  @param overrideStorage Optional explicit storage location (used by clearTask fire-and-forget
+	 *         which runs after the task is removed from stack). */
+	public addSummary(entry: SummaryEntry, overrideStorage?: { globalStoragePath: string; taskId: string }): void {
+		const storagePath = overrideStorage?.globalStoragePath ?? this.activeGlobalStoragePath
+		const taskId = overrideStorage?.taskId ?? this.activeTaskId
+
 		console.log(
 			"[SummaryPanel] addSummary called — id:",
 			entry.id,
@@ -111,22 +158,80 @@ export class SummaryPanel {
 			entry.isGlobal,
 			"text length:",
 			entry.text.length,
-			"panelOpen:",
-			!!this.panel,
-			"isReady:",
-			this.isReady,
-			"totalEntries:",
-			this.entries.length + 1,
+			"targetTask:",
+			taskId ?? "none",
 		)
-		this.entries.push(entry)
 
-		// Auto-open the panel when a new summary arrives
-		if (!this.panel) {
+		// DB-first: persist to disk, then reload from disk
+		if (storagePath && taskId) {
+			saveSummaryEntry(storagePath, taskId, entry)
+				.then(async () => {
+					// Only reload UI if this is still the active task
+					if (this.activeTaskId === taskId) {
+						await this.reloadFromDisk()
+					}
+				})
+				.catch((err) => {
+					console.error("[SummaryPanel] Failed to persist entry to disk:", err)
+					// Fallback: show in memory if disk save fails
+					this.entries.push(entry)
+					this.notifyPanel(entry)
+				})
+		} else {
+			console.warn("[SummaryPanel] No storage location available — entry stored in memory only")
+			this.entries.push(entry)
+			this.notifyPanel(entry)
+		}
+	}
+
+	/** Reload all entries from disk and refresh the panel */
+	private async reloadFromDisk(): Promise<void> {
+		if (!this.activeGlobalStoragePath || !this.activeTaskId) return
+
+		try {
+			const summaries = await loadAllSummaryEntries(this.activeGlobalStoragePath, this.activeTaskId)
+			const globalSummary = await loadGlobalSummary(this.activeGlobalStoragePath, this.activeTaskId)
+
+			this.entries = [...summaries]
+			if (globalSummary && !this.entries.some((e) => e.isGlobal && e.id === `global_${this.activeTaskId}`)) {
+				this.entries.push({
+					id: `global_${this.activeTaskId}`,
+					timestamp: globalSummary.timestamp ?? Date.now(),
+					text: globalSummary.text,
+					isGlobal: true,
+				})
+			}
+		} catch (err) {
+			console.warn("[SummaryPanel] reloadFromDisk failed:", err)
+		}
+
+		// Auto-open the panel when entries exist
+		if (this.entries.length > 0 && !this.panel) {
 			this.show()
 		}
 
 		if (this.isReady && this.panel) {
+			this.sendAllEntries()
+		}
+	}
+
+	/** Push a single entry to the webview (used as fallback when disk is unavailable) */
+	private notifyPanel(entry: SummaryEntry): void {
+		if (!this.panel) {
+			this.show()
+		}
+		if (this.isReady && this.panel) {
 			this.panel.webview.postMessage({ type: "addEntry", entry })
+		}
+	}
+
+	/** Update an existing entry by ID (e.g. when thinking compression completes) */
+	public updateSummary(id: string, updates: Partial<SummaryEntry>): void {
+		const idx = this.entries.findIndex((e) => e.id === id)
+		if (idx === -1) return
+		this.entries[idx] = { ...this.entries[idx], ...updates }
+		if (this.isReady && this.panel) {
+			this.panel.webview.postMessage({ type: "updateEntry", id, updates })
 		}
 	}
 
@@ -239,6 +344,23 @@ body {
 .tag-summary { background: #2d5a3d; color: #7dcea0; }
 .tag-global { background: #5a4b2d; color: #f0c040; }
 .tag-rolling { background: #4a3a5a; color: #c7a3f0; }
+.tag-thinking { background: #2d4a5a; color: #7dd3fc; }
+.tag-keypoints { background: #5a4a2d; color: #fbbf24; }
+.keypoints-block {
+	border-left: 3px solid #fbbf24; padding: 6px 10px; margin-bottom: 6px;
+	background: rgba(251, 191, 36, 0.06); border-radius: 0 4px 4px 0;
+	font-size: 12px; line-height: 1.6; white-space: pre-wrap; opacity: 0.9;
+}
+.thinking-block {
+	border-left: 3px solid #7dd3fc; padding: 6px 10px;
+	background: rgba(125, 211, 252, 0.06); border-radius: 0 4px 4px 0;
+	font-size: 12px; line-height: 1.6; white-space: pre-wrap; opacity: 0.85;
+}
+.tag-task-summary { background: #2d5a4a; color: #4ade80; }
+.tag-task-segment { background: #3a4a2d; color: #a3e635; }
+.compression-info {
+	font-size: 10px; opacity: 0.6; font-family: var(--vscode-editor-font-family, monospace);
+}
 .entry-header .time { font-size: 11px; opacity: 0.5; }
 .entry-header .model-label {
 	font-size: 10px; opacity: 0.4; font-family: var(--vscode-editor-font-family, monospace);
@@ -341,9 +463,18 @@ function renderEntry(entry) {
 	const el = document.createElement('div');
 	el.className = 'entry';
 	let tagClass, tagLabel;
-	if (entry.isGlobal) {
+	if (entry.isTaskSummary && entry.segmentIndex) {
+		tagClass = 'tag-task-segment';
+		tagLabel = 'Segment ' + entry.segmentIndex + '/' + (entry.totalSegments || '?');
+	} else if (entry.isTaskSummary) {
+		tagClass = 'tag-task-summary';
+		tagLabel = 'Task Summary';
+	} else if (entry.isGlobal) {
 		tagClass = 'tag-global';
 		tagLabel = 'Global Q';
+	} else if (entry.isThinking) {
+		tagClass = 'tag-thinking';
+		tagLabel = 'Thinking';
 	} else if (entry.isRolling) {
 		tagClass = 'tag-rolling';
 		tagLabel = 'Rolling';
@@ -352,10 +483,16 @@ function renderEntry(entry) {
 		tagLabel = 'Individual';
 	}
 	const modelHtml = entry.modelId ? '<span class="model-label">' + escapeHtml(entry.modelId) + '</span>' : '';
+	let compressionHtml = '';
+	if (entry.isThinking && entry.originalLength) {
+		const ratio = Math.round((1 - entry.text.length / entry.originalLength) * 100);
+		compressionHtml = '<span class="compression-info">' + entry.originalLength + ' → ' + entry.text.length + ' chars (' + ratio + '% reduced)</span>';
+	}
 	el.innerHTML =
 		'<div class="entry-header">' +
 			'<span class="tag ' + tagClass + '">' + tagLabel + '</span>' +
 			modelHtml +
+			compressionHtml +
 			'<span class="time">' + formatTime(entry.timestamp) + '</span>' +
 			'<span class="time" style="opacity:0.3">#' + entry.id.slice(0,8) + '</span>' +
 		'</div>' +
@@ -364,8 +501,15 @@ function renderEntry(entry) {
 			'<button class="copy-btn">Copy</button>' +
 			(entry.sourceMessages && entry.sourceMessages.length > 0 ? '<button class="source-btn">View Source</button>' : '') +
 		'</div>';
-	el.querySelector('.entry-body').textContent = entry.text;
-	el.querySelector('.entry-body').addEventListener('click', () => el.classList.toggle('expanded'));
+	const bodyEl = el.querySelector('.entry-body');
+	if (entry.isThinking && entry.keyPoints) {
+		bodyEl.innerHTML =
+			'<div class="keypoints-block"><span class="tag tag-keypoints" style="margin-bottom:4px;display:inline-block">Key Points</span><br>' + escapeHtml(entry.keyPoints) + '</div>' +
+			'<div class="thinking-block"><span class="tag tag-thinking" style="margin-bottom:4px;display:inline-block">Thinking</span><br>' + escapeHtml(entry.text) + '</div>';
+	} else {
+		bodyEl.textContent = entry.text;
+	}
+	bodyEl.addEventListener('click', () => el.classList.toggle('expanded'));
 	const copyBtn = el.querySelector('.copy-btn');
 	copyBtn.addEventListener('click', (e) => {
 		e.stopPropagation();

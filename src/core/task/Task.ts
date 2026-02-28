@@ -106,7 +106,6 @@ import { RooIgnoreController } from "../ignore/RooIgnoreController"
 import { RooProtectedController } from "../protect/RooProtectedController"
 import { type AssistantMessageContent, presentAssistantMessage } from "../assistant-message"
 import { NativeToolCallParser } from "../assistant-message/NativeToolCallParser"
-import { manageContext, willManageContext } from "../context-management"
 import { ClineProvider } from "../webview/ClineProvider"
 import { ContextInspectorPanel } from "../webview/ContextInspectorPanel"
 import { MultiSearchReplaceDiffStrategy } from "../diff/strategies/multi-search-replace"
@@ -119,7 +118,6 @@ import {
 	taskMetadata,
 } from "../task-persistence"
 import { getEnvironmentDetails } from "../environment/getEnvironmentDetails"
-import { checkContextWindowExceededError } from "../context/context-management/context-error-handling"
 import {
 	type CheckpointDiffOptions,
 	type CheckpointRestoreOptions,
@@ -134,13 +132,11 @@ import { MessageQueueService } from "../message-queue/MessageQueueService"
 import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
-import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
-import { saveThinkingSummary } from "../task-persistence/thinking-persistence"
+import { saveThinking } from "../task-persistence/thinking-persistence"
+import { SummaryPanel } from "../webview/SummaryPanel"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
-const FORCED_CONTEXT_REDUCTION_PERCENT = 75 // Keep 75% of context (remove 25%) on context window errors
-const MAX_CONTEXT_WINDOW_RETRIES = 3 // Maximum retries for context window errors
 
 export interface TaskOptions extends CreateTaskOptions {
 	provider: ClineProvider
@@ -335,6 +331,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	toolUsage: ToolUsage = {}
 	// Progressive tool disclosure: tracks which tools the model has "discovered"
 	discoveredTools: Set<string> = new Set()
+	// Task lock: tools are parameter-stripped until model establishes a task via update_todo_list
+	taskEstablished: boolean = false
 
 	// Checkpoints
 	enableCheckpoints: boolean
@@ -1191,18 +1189,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	/**
-	 * HIGHEST PRIORITY RULE: After each assistant turn with plain-text reasoning,
-	 * compress the thinking into a concise summary, REPLACE the reasoning block
-	 * with a standard text block in apiConversationHistory, and persist both
-	 * original and summary to <task_dir>/thinking_summaries/.
-	 *
-	 * The compressed summary is stored as { type: "text", text: "[Thinking Summary]\n..." }
-	 * — a regular text block — so it survives through ALL downstream consumers:
-	 *   - Context condensation (text blocks are included in summarization input)
-	 *   - AI SDK providers (text blocks are always included, unlike reasoning blocks)
-	 *   - buildCleanConversationHistory (text blocks pass through the default path)
-	 *
-	 * If the LLM compression call fails, the raw thinking text is used directly as the summary.
+	 * After each assistant turn with plain-text reasoning, extract the [KEY POINTS]
+	 * section the model wrote at the end of its thinking, and REPLACE the reasoning
+	 * block with a compact [Key Points] text block. Falls back to 500-char truncation
+	 * if the model didn't write [KEY POINTS]. Full original is persisted to disk.
 	 */
 	private async compressThinkingInHistory(reasoningText: string): Promise<void> {
 		const lastMsg = this.apiConversationHistory[this.apiConversationHistory.length - 1]
@@ -1224,70 +1214,272 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const reasoningBlock = content[reasoningBlockIndex] as any
 		const originalText = reasoningBlock.text as string
 
-		let summary = originalText // Fallback: use raw text
+		// Extract [KEY POINTS] section from the reasoning. Only this part is kept.
+		// If the model didn't write [KEY POINTS], just remove the reasoning block
+		// entirely — no fake "key points" from raw thinking.
+		const kpMatch = originalText.match(/\[KEY POINTS?\]\s*([\s\S]*?)$/i)
+		const keyPoints = kpMatch && kpMatch[1].trim().length > 0 ? kpMatch[1].trim() : null
 
-		// Only call LLM for compression if thinking is long enough to be worth it
-		if (originalText.length >= 200) {
+		if (keyPoints) {
+			// Replace reasoning block with a compact [Key Points] text block
+			content[reasoningBlockIndex] = {
+				type: "text" as const,
+				text: `[Key Points]\n${keyPoints}`,
+			}
+		} else {
+			// No key points found — remove the reasoning block entirely
+			content.splice(reasoningBlockIndex, 1)
+		}
+
+		// Persist full original to disk (always, for debugging/recovery)
+		const entryId = `thinking_${Date.now()}`
+		const entryTimestamp = Date.now()
+		await saveThinking(this.globalStoragePath, this.taskId, {
+			id: entryId,
+			timestamp: entryTimestamp,
+			originalLength: originalText.length,
+			text: originalText,
+		}).catch((err: Error) => console.warn("[Task] Failed to persist thinking:", err))
+
+		// Notify SummaryPanel only if actual key points were extracted
+		if (keyPoints) {
 			try {
-				const condensingApi = await this.getCondensingApiHandler()
-
-				const systemPrompt =
-					"You are a thinking summarizer. Given the model's internal reasoning/thinking process, " +
-					"produce a concise summary that captures the key decisions, discoveries, and conclusions. " +
-					"Output ONLY the summary, no preamble. Keep it under 30% of the original length. " +
-					"Use the same language as the original thinking."
-
-				const requestMessages: Anthropic.MessageParam[] = [
-					{
-						role: "user",
-						content: `Summarize the following thinking process concisely:\n\n${originalText}`,
-					},
-				]
-
-				let summaryText = ""
-				const stream = condensingApi.createMessage(systemPrompt, requestMessages)
-				for await (const chunk of stream) {
-					if (chunk.type === "text") {
-						summaryText += chunk.text
-					}
-				}
-
-				summaryText = summaryText.trim()
-				if (summaryText.length > 0 && summaryText.length < originalText.length) {
-					summary = summaryText
-				}
-			} catch (error) {
-				console.warn("[Task] Failed to generate thinking summary via LLM, using raw text:", error)
-				// Fallback: use raw text directly as the summary
+				let modelId = "unknown"
+				try {
+					modelId = this.api.getModel().id
+				} catch {}
+				SummaryPanel.getInstance().addSummary({
+					id: entryId,
+					timestamp: entryTimestamp,
+					text: "",
+					isGlobal: false,
+					isThinking: true,
+					modelId,
+					originalLength: originalText.length,
+					keyPoints,
+				})
+			} catch (err) {
+				console.warn("[Task] SummaryPanel notification for key points failed:", err)
 			}
 		}
 
-		// CRITICAL: Replace the reasoning block with a standard text block.
-		// Using type:"text" (not type:"reasoning") ensures the summary survives through:
-		// - Context condensation (reasoning blocks may be ignored by condensing models)
-		// - AI SDK convertToAiSdkMessages (reasoning may be stripped for non-thinking models)
-		// - Any other downstream consumer that only processes standard content blocks
-		content[reasoningBlockIndex] = {
-			type: "text" as const,
-			text: `[Thinking Summary]\n${summary}`,
-		}
-
-		// Persist to disk
-		await saveThinkingSummary(this.globalStoragePath, this.taskId, {
-			id: `${Date.now()}`,
-			timestamp: Date.now(),
-			originalLength: originalText.length,
-			summary,
-			original: originalText,
-		}).catch((err) => console.warn("[Task] Failed to persist thinking summary:", err))
-
-		// Save updated history with compressed thinking
+		// Save updated history
 		await this.saveApiConversationHistory()
 	}
 
+	/**
+	 * Build full-task-context messages from the conversation history.
+	 *
+	 * Design: Within a single task, the AI sees ALL accumulated context:
+	 *   - User's original request
+	 *   - ALL [Key Points] blocks (full thinking/reasoning from each turn)
+	 *   - ALL visible text output from assistant
+	 *   - Current message (tool_result or new user message)
+	 *
+	 * Tool results are NOT carried forward — their key points are captured in the
+	 * AI's <key_points> output (per the prompt instruction). This keeps context
+	 * compact while preserving all essential information.
+	 *
+	 * Format:
+	 *   Tool chain: [synthetic user: full context] + [assistant: current] + [user: tool_result]
+	 *   New user turn: [single user message: full context + current request]
+	 */
+	private buildSlidingWindowMessages(allMessages: ApiMessage[]): ApiMessage[] {
+		if (allMessages.length === 0) return []
+
+		const currentMsg = allMessages[allMessages.length - 1]
+		if (!currentMsg) return []
+
+		// ── Collect ALL accumulated context from the entire conversation ──
+
+		// 1. Find user's original request (first real user message, not tool_result)
+		let userRequest: string | null = null
+		for (const msg of allMessages) {
+			if (msg.role !== "user") continue
+			if (
+				Array.isArray(msg.content) &&
+				(msg.content as any[]).some((block: any) => block.type === "tool_result")
+			) {
+				continue
+			}
+			if (typeof msg.content === "string" && msg.content.trim()) {
+				userRequest = msg.content.trim()
+			} else if (Array.isArray(msg.content)) {
+				const texts = (msg.content as any[])
+					.filter((b: any) => b.type === "text" && typeof b.text === "string")
+					.map((b: any) => b.text.trim())
+					.filter((t: string) => t.length > 0)
+				if (texts.length > 0) userRequest = texts.join("\n")
+			}
+			break
+		}
+
+		// 2. Collect context from previous assistant messages
+		const prevAssistantIndex = this.findPrevAssistantIndex(allMessages)
+
+		// 3. Collect ALL visible text from ALL assistant messages (oldest → newest)
+		const allVisibleTexts: string[] = []
+		for (let i = 0; i < allMessages.length; i++) {
+			if (i === prevAssistantIndex) continue
+			const msg = allMessages[i]
+			if (msg.role !== "assistant" || msg.isSummary) continue
+			const vt = this.extractVisibleText(msg)
+			if (vt) allVisibleTexts.push(vt)
+		}
+
+		// ── Determine message type ──
+
+		const isToolResult =
+			currentMsg.role === "user" &&
+			Array.isArray(currentMsg.content) &&
+			(currentMsg.content as any[]).some((block: any) => block.type === "tool_result")
+
+		// ── Build the context string ──
+		let contextContent = ""
+		// Accumulated key points appear in synthetic context for historical reference.
+		if (isToolResult) {
+			const allKeyPoints: string[] = []
+			for (let i = 0; i < allMessages.length; i++) {
+				if (i === prevAssistantIndex) continue // skip current assistant, it's included directly
+				const msg = allMessages[i]
+				if (msg.role !== "assistant" || msg.isSummary) continue
+				const kp = this.extractKeyPoints(msg)
+				if (kp) allKeyPoints.push(kp)
+			}
+			if (allKeyPoints.length > 0) {
+				contextContent += `[Accumulated Key Points]\n`
+				contextContent += allKeyPoints.map((s: string, i: number) => `--- Turn ${i + 1} ---\n${s}`).join("\n\n")
+				contextContent += "\n\n"
+			}
+		}
+		if (userRequest) {
+			contextContent += `[User's Request]\n${userRequest}\n\n`
+		}
+		if (allVisibleTexts.length > 0) {
+			contextContent += `[Your Previous Outputs]\n`
+			contextContent += allVisibleTexts.join("\n\n---\n\n")
+			contextContent += "\n\n"
+		}
+
+		// ── Assemble final messages based on message type ──
+
+		if (isToolResult) {
+			// Tool chain: [synthetic user with full context] + [assistant] + [user: tool_result]
+			const result: ApiMessage[] = []
+
+			if (!contextContent) contextContent = "(continued)"
+			result.push({ role: "user", content: contextContent, ts: Date.now() } as ApiMessage)
+
+			// Include the immediate previous assistant (thinking + tool_use)
+			if (prevAssistantIndex >= 0) {
+				result.push(allMessages[prevAssistantIndex])
+			}
+
+			// Append KEY POINTS instruction to the tool_result message so it's the
+			// last thing the model sees before generating. Models follow nearby instructions better.
+			const toolResultMsg = { ...currentMsg }
+			const toolResultContent = Array.isArray(toolResultMsg.content)
+				? [...(toolResultMsg.content as any[])]
+				: [{ type: "text", text: String(toolResultMsg.content) }]
+			toolResultContent.push({
+				type: "text",
+				text: `\n[KEY POINTS] At the END of your thinking, write a [KEY POINTS] section — bullet points only, one finding per line. Paste critical code verbatim. No reasoning, no filler. Same language as the user.`,
+			})
+			toolResultMsg.content = toolResultContent
+			result.push(toolResultMsg as ApiMessage)
+
+			return result
+		} else {
+			// New user turn: prepend full context to current user message
+			if (contextContent) {
+				contextContent += "---\n\n"
+			}
+			const mergedContent = this.prependContextToUserMessage(currentMsg, contextContent)
+			return [{ ...currentMsg, content: mergedContent } as ApiMessage]
+		}
+	}
+
+	/**
+	 * Find the index of the immediate previous assistant message (not isSummary).
+	 * Returns -1 if not found.
+	 */
+	private findPrevAssistantIndex(allMessages: ApiMessage[]): number {
+		for (let i = allMessages.length - 2; i >= 0; i--) {
+			if (allMessages[i].role === "assistant" && !allMessages[i].isSummary) {
+				return i
+			}
+		}
+		return -1
+	}
+
+	/**
+	 * Extract [Key Points] text from an assistant message, if present.
+	 * Key points are persisted as text blocks starting with "[Key Points]".
+	 */
+	private extractKeyPoints(msg: ApiMessage | undefined): string | null {
+		if (!msg || msg.role !== "assistant") return null
+		if (!Array.isArray(msg.content)) return null
+
+		for (const block of msg.content as any[]) {
+			if (block.type === "text" && typeof block.text === "string" && block.text.startsWith("[Key Points]")) {
+				return block.text.replace(/^\[Key Points\]\n?/, "").trim()
+			}
+		}
+		return null
+	}
+
+	/**
+	 * Extract user-visible text from an assistant message (excludes [Key Points] and tool_use blocks).
+	 */
+	private extractVisibleText(msg: ApiMessage | undefined): string | null {
+		if (!msg || msg.role !== "assistant") return null
+
+		if (typeof msg.content === "string") {
+			if (msg.content.startsWith("[Key Points]")) return null
+			return msg.content.trim().length > 0 ? msg.content : null
+		}
+
+		if (!Array.isArray(msg.content)) return null
+
+		const visibleParts: string[] = []
+		for (const block of msg.content as any[]) {
+			if (block.type === "text" && typeof block.text === "string" && !block.text.startsWith("[Key Points]")) {
+				const trimmed = block.text.trim()
+				if (trimmed.length > 0) visibleParts.push(trimmed)
+			}
+		}
+		return visibleParts.length > 0 ? visibleParts.join("\n") : null
+	}
+
+	/**
+	 * Prepend context text to a user message's content.
+	 */
+	private prependContextToUserMessage(msg: ApiMessage, contextPrefix: string): ApiMessage["content"] {
+		if (!contextPrefix) return msg.content
+
+		if (typeof msg.content === "string") {
+			return contextPrefix + msg.content
+		}
+
+		if (Array.isArray(msg.content)) {
+			const blocks = [...(msg.content as any[])]
+			const firstTextIdx = blocks.findIndex((b: any) => b.type === "text")
+			if (firstTextIdx >= 0) {
+				blocks[firstTextIdx] = {
+					...blocks[firstTextIdx],
+					text: contextPrefix + (blocks[firstTextIdx].text || ""),
+				}
+			} else {
+				blocks.unshift({ type: "text", text: contextPrefix })
+			}
+			return blocks
+		}
+
+		return msg.content
+	}
+
 	// NOTE: We intentionally do NOT mutate stored messages to merge consecutive user turns.
-	// For API requests, consecutive same-role messages are merged via mergeConsecutiveApiMessages()
-	// so rewind/edit behavior can still reference original message boundaries.
+	// Rewind/edit behavior can still reference original message boundaries.
 
 	async overwriteApiConversationHistory(newHistory: ApiMessage[]) {
 		this.apiConversationHistory = newHistory
@@ -4099,140 +4291,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		})()
 	}
 
-	private getCurrentProfileId(state: any): string {
-		return (
-			state?.listApiConfigMeta?.find((profile: any) => profile.name === state?.currentApiConfigName)?.id ??
-			"default"
-		)
-	}
-
-	private async handleContextWindowExceededError(): Promise<void> {
-		const state = await this.providerRef.deref()?.getState()
-		const { profileThresholds = {}, mode, apiConfiguration } = state ?? {}
-
-		const { contextTokens } = this.getTokenUsage()
-		const modelInfo = this.api.getModel().info
-
-		const maxTokens = getModelMaxOutputTokens({
-			modelId: this.api.getModel().id,
-			model: modelInfo,
-			settings: this.apiConfiguration,
-		})
-
-		const contextWindow = modelInfo.contextWindow
-
-		// Get the current profile ID using the helper method
-		const currentProfileId = this.getCurrentProfileId(state)
-
-		// Log the context window error for debugging
-		console.warn(
-			`[Task#${this.taskId}] Context window exceeded for model ${this.api.getModel().id}. ` +
-				`Current tokens: ${contextTokens}, Context window: ${contextWindow}. ` +
-				`Forcing truncation to ${FORCED_CONTEXT_REDUCTION_PERCENT}% of current context.`,
-		)
-		// Send condenseTaskContextStarted to show in-progress indicator
-		await this.providerRef.deref()?.postMessageToWebview({ type: "condenseTaskContextStarted", text: this.taskId })
-
-		// Build tools for condensing metadata (same tools used for normal API calls)
-		const provider = this.providerRef.deref()
-		let allTools: import("openai").default.Chat.ChatCompletionTool[] = []
-		if (provider) {
-			const toolsResult = await buildNativeToolsArrayWithRestrictions({
-				provider,
-				cwd: this.cwd,
-				mode,
-				customModes: state?.customModes,
-				experiments: state?.experiments,
-				apiConfiguration,
-				browserToolEnabled: state?.browserToolEnabled ?? true,
-				disabledTools: state?.disabledTools,
-				modelInfo,
-				includeAllToolsWithRestrictions: false,
-			})
-			allTools = toolsResult.tools
-		}
-
-		// Build metadata with tools and taskId for the condensing API call
-		const metadata: ApiHandlerCreateMessageMetadata = {
-			mode,
-			taskId: this.taskId,
-			...(allTools.length > 0
-				? {
-						tools: allTools,
-						tool_choice: "auto",
-						parallelToolCalls: true,
-					}
-				: {}),
-		}
-
-		try {
-			// Generate environment details to include in the condensed summary
-			const environmentDetails = await getEnvironmentDetails(this, true)
-
-			// Force aggressive truncation by keeping only 75% of the conversation history
-			const truncateResult = await manageContext({
-				messages: this.apiConversationHistory,
-				totalTokens: contextTokens || 0,
-				maxTokens,
-				contextWindow,
-				apiHandler: this.api,
-				autoCondenseContext: true,
-				autoCondenseContextPercent: FORCED_CONTEXT_REDUCTION_PERCENT,
-				systemPrompt: await this.getSystemPrompt(),
-				taskId: this.taskId,
-				profileThresholds,
-				currentProfileId,
-				metadata,
-				environmentDetails,
-				globalStoragePath: this.globalStoragePath,
-			})
-
-			if (truncateResult.messages !== this.apiConversationHistory) {
-				await this.overwriteApiConversationHistory(truncateResult.messages)
-			}
-
-			if (truncateResult.summary) {
-				const { summary, cost, prevContextTokens, newContextTokens = 0 } = truncateResult
-				const contextCondense: ContextCondense = { summary, cost, newContextTokens, prevContextTokens }
-				await this.say(
-					"condense_context",
-					undefined /* text */,
-					undefined /* images */,
-					false /* partial */,
-					undefined /* checkpoint */,
-					undefined /* progressStatus */,
-					{ isNonInteractive: true } /* options */,
-					contextCondense,
-				)
-			} else if (truncateResult.truncationId) {
-				// Sliding window truncation occurred (fallback when condensing fails or is disabled)
-				const contextTruncation: ContextTruncation = {
-					truncationId: truncateResult.truncationId,
-					messagesRemoved: truncateResult.messagesRemoved ?? 0,
-					prevContextTokens: truncateResult.prevContextTokens,
-					newContextTokens: truncateResult.newContextTokensAfterTruncation ?? 0,
-				}
-				await this.say(
-					"sliding_window_truncation",
-					undefined /* text */,
-					undefined /* images */,
-					false /* partial */,
-					undefined /* checkpoint */,
-					undefined /* progressStatus */,
-					{ isNonInteractive: true } /* options */,
-					undefined /* contextCondense */,
-					contextTruncation,
-				)
-			}
-		} finally {
-			// Notify webview that context management is complete (removes in-progress spinner)
-			// IMPORTANT: Must always be sent to dismiss the spinner, even on error
-			await this.providerRef
-				.deref()
-				?.postMessageToWebview({ type: "condenseTaskContextResponse", text: this.taskId })
-		}
-	}
-
 	/**
 	 * Enforce the user-configured provider rate limit.
 	 *
@@ -4273,18 +4331,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	): ApiStream {
 		const state = await this.providerRef.deref()?.getState()
 
-		const {
-			apiConfiguration,
-			autoApprovalEnabled,
-			requestDelaySeconds,
-			mode,
-			autoCondenseContext = true,
-			autoCondenseContextPercent = 100,
-			profileThresholds = {},
-		} = state ?? {}
-
-		// Get condensing configuration for automatic triggers.
-		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
+		const { apiConfiguration, autoApprovalEnabled, requestDelaySeconds, mode } = state ?? {}
 
 		if (!options.skipProviderRateLimit) {
 			await this.maybeWaitForProviderRateLimit(retryAttempt)
@@ -4300,191 +4347,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		Task.lastGlobalApiRequestTime = performance.now()
 
 		const systemPrompt = await this.getSystemPrompt()
-		const { contextTokens } = this.getTokenUsage()
 
-		if (contextTokens) {
-			const modelInfo = this.api.getModel().info
-
-			const maxTokens = getModelMaxOutputTokens({
-				modelId: this.api.getModel().id,
-				model: modelInfo,
-				settings: this.apiConfiguration,
-			})
-
-			const contextWindow = modelInfo.contextWindow
-
-			// Get the current profile ID using the helper method
-			const currentProfileId = this.getCurrentProfileId(state)
-			// Check if context management will likely run (threshold check)
-			// This allows us to show an in-progress indicator to the user
-			// We use the centralized willManageContext helper to avoid duplicating threshold logic
-			const lastMessage = this.apiConversationHistory[this.apiConversationHistory.length - 1]
-			const lastMessageContent = lastMessage?.content
-			let lastMessageTokens = 0
-			if (lastMessageContent) {
-				lastMessageTokens = Array.isArray(lastMessageContent)
-					? await this.api.countTokens(lastMessageContent)
-					: await this.api.countTokens([{ type: "text", text: lastMessageContent as string }])
-			}
-
-			const contextManagementWillRun = willManageContext({
-				totalTokens: contextTokens,
-				contextWindow,
-				maxTokens,
-				autoCondenseContext,
-				autoCondenseContextPercent,
-				profileThresholds,
-				currentProfileId,
-				lastMessageTokens,
-			})
-
-			// Send condenseTaskContextStarted BEFORE manageContext to show in-progress indicator
-			// This notification must be sent here (not earlier) because the early check uses stale token count
-			// (before user message is added to history), which could incorrectly skip showing the indicator
-			if (contextManagementWillRun && autoCondenseContext) {
-				await this.providerRef
-					.deref()
-					?.postMessageToWebview({ type: "condenseTaskContextStarted", text: this.taskId })
-			}
-
-			// Build tools for condensing metadata (same tools used for normal API calls)
-			// This ensures the condensing API call includes tool definitions for providers that need them
-			let contextMgmtTools: import("openai").default.Chat.ChatCompletionTool[] = []
-			{
-				const provider = this.providerRef.deref()
-				if (provider) {
-					const toolsResult = await buildNativeToolsArrayWithRestrictions({
-						provider,
-						cwd: this.cwd,
-						mode,
-						customModes: state?.customModes,
-						experiments: state?.experiments,
-						apiConfiguration,
-						browserToolEnabled: state?.browserToolEnabled ?? true,
-						disabledTools: state?.disabledTools,
-						modelInfo,
-						includeAllToolsWithRestrictions: false,
-					})
-					contextMgmtTools = toolsResult.tools
-				}
-			}
-
-			// Build metadata with tools and taskId for the condensing API call
-			const contextMgmtMetadata: ApiHandlerCreateMessageMetadata = {
-				mode,
-				taskId: this.taskId,
-				...(contextMgmtTools.length > 0
-					? {
-							tools: contextMgmtTools,
-							tool_choice: "auto",
-							parallelToolCalls: true,
-						}
-					: {}),
-			}
-
-			// Only generate environment details when context management will actually run.
-			// getEnvironmentDetails(this, true) triggers a recursive workspace listing which
-			// adds overhead - avoid this for the common case where context is below threshold.
-			const contextMgmtEnvironmentDetails = contextManagementWillRun
-				? await getEnvironmentDetails(this, true)
-				: undefined
-
-			// Get files read by Roo for code folding - only when context management will run
-			const contextMgmtFilesReadByRoo =
-				contextManagementWillRun && autoCondenseContext
-					? await this.getFilesReadByRooSafely("attemptApiRequest")
-					: undefined
-
-			try {
-				const condensingApi =
-					contextManagementWillRun && autoCondenseContext ? await this.getCondensingApiHandler() : this.api
-				const truncateResult = await manageContext({
-					messages: this.apiConversationHistory,
-					totalTokens: contextTokens,
-					maxTokens,
-					contextWindow,
-					apiHandler: condensingApi,
-					autoCondenseContext,
-					autoCondenseContextPercent,
-					systemPrompt,
-					taskId: this.taskId,
-					customCondensingPrompt,
-					profileThresholds,
-					currentProfileId,
-					metadata: contextMgmtMetadata,
-					environmentDetails: contextMgmtEnvironmentDetails,
-					filesReadByRoo: contextMgmtFilesReadByRoo,
-					cwd: this.cwd,
-					rooIgnoreController: this.rooIgnoreController,
-					globalStoragePath: this.globalStoragePath,
-				})
-				if (truncateResult.messages !== this.apiConversationHistory) {
-					await this.overwriteApiConversationHistory(truncateResult.messages)
-				}
-				if (truncateResult.error) {
-					await this.say("condense_context_error", truncateResult.error)
-				}
-				if (truncateResult.summary) {
-					const { summary, cost, prevContextTokens, newContextTokens = 0, condenseId } = truncateResult
-					const contextCondense: ContextCondense = {
-						summary,
-						cost,
-						newContextTokens,
-						prevContextTokens,
-						condenseId,
-					}
-					await this.say(
-						"condense_context",
-						undefined /* text */,
-						undefined /* images */,
-						false /* partial */,
-						undefined /* checkpoint */,
-						undefined /* progressStatus */,
-						{ isNonInteractive: true } /* options */,
-						contextCondense,
-					)
-				} else if (truncateResult.truncationId) {
-					// Sliding window truncation occurred (fallback when condensing fails or is disabled)
-					const contextTruncation: ContextTruncation = {
-						truncationId: truncateResult.truncationId,
-						messagesRemoved: truncateResult.messagesRemoved ?? 0,
-						prevContextTokens: truncateResult.prevContextTokens,
-						newContextTokens: truncateResult.newContextTokensAfterTruncation ?? 0,
-					}
-					await this.say(
-						"sliding_window_truncation",
-						undefined /* text */,
-						undefined /* images */,
-						false /* partial */,
-						undefined /* checkpoint */,
-						undefined /* progressStatus */,
-						{ isNonInteractive: true } /* options */,
-						undefined /* contextCondense */,
-						contextTruncation,
-					)
-				}
-			} finally {
-				// Notify webview that context management is complete (sets isCondensing = false)
-				// This removes the in-progress spinner and allows the completed result to show
-				// IMPORTANT: Must always be sent to dismiss the spinner, even on error
-				if (contextManagementWillRun && autoCondenseContext) {
-					await this.providerRef
-						.deref()
-						?.postMessageToWebview({ type: "condenseTaskContextResponse", text: this.taskId })
-				}
-			}
-		}
-
-		// Get the effective API history by filtering out condensed messages.
-		// This allows non-destructive condensing where messages are tagged but not deleted,
-		// enabling accurate rewind operations while still sending condensed history to the API.
-		// The effective history preserves ALL visible summaries (Global Q + stacked partials)
-		// so the model sees: [Q] + [stacked partials] + [current messages].
-		const effectiveHistory = getEffectiveApiHistory(this.apiConversationHistory)
-		// For API only: merge consecutive user messages (excludes summary messages per
-		// mergeConsecutiveApiMessages implementation) without mutating stored history.
-		const mergedForApi = mergeConsecutiveApiMessages(effectiveHistory, { roles: ["user"] })
-		const messagesWithoutImages = maybeRemoveImageBlocks(mergedForApi, this.api)
+		// Sliding window context: only include [previous key points + previous visible text + current user message].
+		// For tool chains: [synthetic user context] + [assistant: thinking + tool_call] + [user: tool_result].
+		// This replaces the full history pipeline (getEffectiveApiHistory + mergeConsecutiveApiMessages).
+		const slidingWindowMessages = this.buildSlidingWindowMessages(this.apiConversationHistory)
+		const messagesWithoutImages = maybeRemoveImageBlocks(slidingWindowMessages, this.api)
 		const cleanConversationHistory = this.buildCleanConversationHistory(messagesWithoutImages as ApiMessage[])
 
 		// Check auto-approval limits
@@ -4534,6 +4402,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				modelInfo,
 				includeAllToolsWithRestrictions: supportsAllowedFunctionNames,
 				discoveredTools: this.discoveredTools,
+				taskEstablished: this.taskEstablished,
 			})
 			allTools = toolsResult.tools
 			allowedFunctionNames = toolsResult.allowedFunctionNames
@@ -4613,20 +4482,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		} catch (error) {
 			this.isWaitingForFirstChunk = false
 			this.currentRequestAbortController = undefined
-			const isContextWindowExceededError = checkContextWindowExceededError(error)
-
-			// If it's a context window error and we haven't exceeded max retries for this error type
-			if (isContextWindowExceededError && retryAttempt < MAX_CONTEXT_WINDOW_RETRIES) {
-				console.warn(
-					`[Task#${this.taskId}] Context window exceeded for model ${this.api.getModel().id}. ` +
-						`Retry attempt ${retryAttempt + 1}/${MAX_CONTEXT_WINDOW_RETRIES}. ` +
-						`Attempting automatic truncation...`,
-				)
-				await this.handleContextWindowExceededError()
-				// Retry the request after handling the context window error
-				yield* this.attemptApiRequest(retryAttempt + 1)
-				return
-			}
 
 			// note that this api_req_failed ask is unique in that we only present this option if the api hasn't streamed any content yet (ie it fails on the first chunk due), as it would allow them to hit a retry button. However if the api failed mid-stream, it could be in any arbitrary state where some tools may have executed, so that error is handled differently and requires cancelling the task entirely.
 			if (autoApprovalEnabled) {
@@ -4854,7 +4709,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					continue
 				} else if (hasPlainTextReasoning) {
 					// NOTE: After compressThinkingInHistory runs, the reasoning block is replaced
-					// with a standard { type: "text", text: "[Thinking Summary]\n..." } block.
+					// with a standard { type: "text", text: "[Key Points]\n..." } block.
 					// So this branch only triggers for UN-compressed reasoning (e.g. if compression
 					// hasn't run yet, or for Anthropic thinking/encrypted blocks handled above).
 
