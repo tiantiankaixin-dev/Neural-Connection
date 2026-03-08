@@ -125,6 +125,7 @@ interface ChatRowProps {
 	isFollowUpAutoApprovalPaused?: boolean
 	editable?: boolean
 	hasCheckpoint?: boolean
+	onToggleTodoGroup?: (dividerTs: number) => void
 }
 
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
@@ -153,6 +154,7 @@ const ChatRow = memo(
 						borderBottom: borderStyle,
 						borderBottomLeftRadius: "6px",
 						borderBottomRightRadius: "6px",
+						marginBottom: "10px",
 					}),
 				}
 			: undefined
@@ -162,17 +164,6 @@ const ChatRow = memo(
 				<ChatRowContent {...props} />
 			</div>,
 		)
-
-		if (todoGroupPos) {
-			console.log(
-				"[TodoBox] ChatRow todoGroupPos:",
-				todoGroupPos,
-				"say:",
-				message.say,
-				"text:",
-				message.text?.slice(0, 50),
-			)
-		}
 
 		const chatrow = todoBoxStyle ? <div style={todoBoxStyle}>{chatrowInner}</div> : chatrowInner
 
@@ -210,6 +201,7 @@ export const ChatRowContent = ({
 	onBatchFileResponse,
 	isFollowUpAnswered,
 	isFollowUpAutoApprovalPaused,
+	onToggleTodoGroup,
 }: ChatRowContentProps) => {
 	const { t, i18n } = useTranslation()
 
@@ -1454,7 +1446,9 @@ export const ChatRowContent = ({
 					const { results = [] } = parsed?.content || {}
 
 					return <CodebaseSearchResultsDisplay results={results} />
-				case "todo_item_divider":
+				case "todo_item_divider": {
+					const dividerTs = (message as any)._todoGroupDividerTs as number | undefined
+					const isGroupCollapsed = (message as any)._todoGroupCollapsed as boolean | undefined
 					return (
 						<div
 							style={{
@@ -1462,10 +1456,23 @@ export const ChatRowContent = ({
 								color: "var(--vscode-descriptionForeground)",
 								padding: "2px 0",
 								fontWeight: 500,
-							}}>
+								cursor: dividerTs ? "pointer" : "default",
+								display: "flex",
+								alignItems: "center",
+								gap: "4px",
+								userSelect: "none",
+							}}
+							onClick={() => dividerTs && onToggleTodoGroup?.(dividerTs)}>
+							{dividerTs && (
+								<span
+									className={`codicon codicon-chevron-${isGroupCollapsed ? "right" : "down"}`}
+									style={{ fontSize: 10 }}
+								/>
+							)}
 							{message.text || ""}
 						</div>
 					)
+				}
 				case "user_edit_todos":
 					return <UpdateTodoListToolBlock userEdited onChange={() => {}} />
 				case "tool" as any:

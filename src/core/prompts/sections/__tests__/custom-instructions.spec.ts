@@ -545,7 +545,6 @@ describe("addCustomInstructions", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -576,7 +575,6 @@ describe("addCustomInstructions", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: false,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -636,7 +634,6 @@ describe("addCustomInstructions", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -681,7 +678,6 @@ describe("addCustomInstructions", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -748,7 +744,6 @@ describe("addCustomInstructions", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -799,7 +794,6 @@ describe("addCustomInstructions", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -852,7 +846,6 @@ describe("addCustomInstructions", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -897,7 +890,6 @@ describe("addCustomInstructions", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -1623,7 +1615,6 @@ describe("Rules directory reading", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -1667,7 +1658,6 @@ describe("Rules directory reading", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)
@@ -1709,7 +1699,6 @@ describe("Rules directory reading", () => {
 				settings: {
 					todoListEnabled: true,
 					useAgentRules: true,
-					newTaskRequireTodos: false,
 				},
 			},
 		)

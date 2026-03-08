@@ -90,7 +90,8 @@ export function generateTaskTimestamp(): string {
 function sanitizeFolderName(name: string, maxLength: number = 80): string {
 	return (
 		name
-			.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+			// eslint-disable-next-line no-control-regex
+			.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
 			.replace(/\s+/g, "_")
 			.substring(0, maxLength)
 			.replace(/_+$/, "") || "unnamed"

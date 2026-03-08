@@ -168,6 +168,8 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		{ type: "WAIT_TIMEOUT" | "INIT_TIMEOUT"; timeout: number } | undefined
 	>(undefined)
 	const [isCondensing, setIsCondensing] = useState<boolean>(false)
+	const [collapsedTodoGroups, setCollapsedTodoGroups] = useState<Set<number>>(new Set())
+	const autoCollapsedRef = useRef(false)
 	const [showAnnouncementModal, setShowAnnouncementModal] = useState(false)
 	const everVisibleMessagesTsRef = useRef<LRUCache<number, boolean>>(
 		new LRUCache({
@@ -509,6 +511,8 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		everVisibleMessagesTsRef.current.clear() // Clear for new task
 		setCurrentFollowUpTs(null) // Clear follow-up answered state for new task
 		setIsCondensing(false) // Reset condensing state when switching tasks
+		setCollapsedTodoGroups(new Set()) // Reset todo group collapse state
+		autoCollapsedRef.current = false
 		// Note: sendingDisabled is not reset here as it's managed by message effects
 
 		// Clear any pending auto-approval timeout from previous task
@@ -538,6 +542,21 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	}, [task?.ts])
 
 	const taskTs = task?.ts
+
+	// Auto-collapse all todo groups when task completes
+	useEffect(() => {
+		if (autoCollapsedRef.current) return
+		const hasCompletion = modifiedMessages.some(
+			(msg) => msg.say === "completion_result" || msg.ask === "completion_result",
+		)
+		if (hasCompletion) {
+			const dividerTs = modifiedMessages.filter((msg) => msg.say === "todo_item_divider").map((msg) => msg.ts)
+			if (dividerTs.length > 0) {
+				autoCollapsedRef.current = true
+				setCollapsedTodoGroups(new Set(dividerTs))
+			}
+		}
+	}, [modifiedMessages])
 
 	// Request aggregated costs when task changes and has childIds
 	useEffect(() => {
@@ -1355,6 +1374,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		// Annotate messages between todo_item_divider markers with group position
 		// so ChatRow can render bordered boxes around each todo item's messages.
 		// _todoGroupPos: 'header' (the divider itself), 'body' (middle), 'last' (bottom of box)
+		// Collapsed groups have body/last filtered out; header becomes "only".
 		// IMPORTANT: Create shallow copies to avoid mutating shared message objects,
 		// which would break memo's deepEqual comparison.
 		const dividerIndices: number[] = []
@@ -1363,20 +1383,54 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				dividerIndices.push(i)
 			}
 		}
-		if (dividerIndices.length > 0) {
-			console.log("[TodoBox] Found dividers at indices:", dividerIndices, "total messages:", result.length)
-		}
+		const hiddenIndices = new Set<number>()
 		for (let d = 0; d < dividerIndices.length; d++) {
 			const startIdx = dividerIndices[d]
 			const endIdx = d + 1 < dividerIndices.length ? dividerIndices[d + 1] : result.length
-			if (endIdx <= startIdx + 1) {
-				result[startIdx] = { ...result[startIdx], _todoGroupPos: "only" } as any
-			} else {
-				result[startIdx] = { ...result[startIdx], _todoGroupPos: "header" } as any
+			const dividerTs = result[startIdx].ts
+			const isCollapsed = collapsedTodoGroups.has(dividerTs)
+
+			if (isCollapsed) {
+				// Collapsed: header becomes "only", body/last are hidden
+				result[startIdx] = {
+					...result[startIdx],
+					_todoGroupPos: "only",
+					_todoGroupCollapsed: true,
+					_todoGroupDividerTs: dividerTs,
+				} as any
 				for (let i = startIdx + 1; i < endIdx; i++) {
-					result[i] = { ...result[i], _todoGroupPos: i === endIdx - 1 ? "last" : "body" } as any
+					hiddenIndices.add(i)
+				}
+			} else {
+				// Expanded: normal annotation
+				if (endIdx <= startIdx + 1) {
+					result[startIdx] = {
+						...result[startIdx],
+						_todoGroupPos: "only",
+						_todoGroupCollapsed: false,
+						_todoGroupDividerTs: dividerTs,
+					} as any
+				} else {
+					result[startIdx] = {
+						...result[startIdx],
+						_todoGroupPos: "header",
+						_todoGroupCollapsed: false,
+						_todoGroupDividerTs: dividerTs,
+					} as any
+					for (let i = startIdx + 1; i < endIdx; i++) {
+						result[i] = {
+							...result[i],
+							_todoGroupPos: i === endIdx - 1 ? "last" : "body",
+						} as any
+					}
 				}
 			}
+		}
+		// Remove hidden messages from collapsed groups
+		if (hiddenIndices.size > 0) {
+			const filtered = result.filter((_, idx) => !hiddenIndices.has(idx))
+			result.length = 0
+			result.push(...filtered)
 		}
 
 		if (isCondensing) {
@@ -1388,7 +1442,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			} as ClineMessage)
 		}
 		return result
-	}, [isCondensing, visibleMessages, isBrowserSessionMessage])
+	}, [isCondensing, visibleMessages, isBrowserSessionMessage, collapsedTodoGroups])
 
 	// scrolling
 
@@ -1519,6 +1573,18 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		vscode.postMessage({ type: "askResponse", askResponse: "objectResponse", text: JSON.stringify(response) })
 	}, [])
 
+	const handleToggleTodoGroup = useCallback((dividerTs: number) => {
+		setCollapsedTodoGroups((prev) => {
+			const next = new Set(prev)
+			if (next.has(dividerTs)) {
+				next.delete(dividerTs)
+			} else {
+				next.add(dividerTs)
+			}
+			return next
+		})
+	}, [])
+
 	const itemContent = useCallback(
 		(index: number, messageOrGroup: ClineMessage) => {
 			const hasCheckpoint = modifiedMessages.some((message) => message.say === "checkpoint_saved")
@@ -1582,6 +1648,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						})()
 					}
 					hasCheckpoint={hasCheckpoint}
+					onToggleTodoGroup={handleToggleTodoGroup}
 				/>
 			)
 		},
@@ -1594,6 +1661,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			isStreaming,
 			handleSuggestionClickInRow,
 			handleBatchFileResponse,
+			handleToggleTodoGroup,
 			currentFollowUpTs,
 			isFollowUpAutoApprovalPaused,
 			enableButtons,

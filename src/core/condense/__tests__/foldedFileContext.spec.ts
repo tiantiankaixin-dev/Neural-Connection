@@ -16,7 +16,7 @@ describe("foldedFileContext", () => {
 		it("should return empty sections for empty file list", async () => {
 			const result = await generateFoldedFileContext([], { cwd: "/test" })
 			expect(result.sections).toEqual([])
-			expect(result.totalFiles).toBe(0)
+			expect(result.filesProcessed).toBe(0)
 		})
 	})
 })
