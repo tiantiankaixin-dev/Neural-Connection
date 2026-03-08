@@ -92,8 +92,6 @@ import { ContextProxy } from "../config/ContextProxy"
 import { ProviderSettingsManager } from "../config/ProviderSettingsManager"
 import { CustomModesManager } from "../config/CustomModesManager"
 import { Task } from "../task/Task"
-import { SummaryPanel } from "./SummaryPanel"
-
 import { webviewMessageHandler } from "./webviewMessageHandler"
 import type { ClineMessage, TodoItem } from "@roo-code/types"
 import { readApiMessages, saveApiMessages, saveTaskMessages } from "../task-persistence"
@@ -428,9 +426,6 @@ export class ClineProvider
 		// all the called tasks.
 		this.clineStack.push(task)
 		task.emit(RooCodeEventName.TaskFocused)
-
-		// Set SummaryPanel active task so all addSummary calls persist to DB
-		SummaryPanel.getInstance().setActiveTask(this.contextProxy.globalStorageUri.fsPath, task.taskId)
 
 		// Perform special setup provider specific tasks.
 		await this.performPreparationTasks(task)
@@ -1792,11 +1787,6 @@ export class ClineProvider
 			await this.createTaskWithHistoryItem(historyItem) // Clears existing task.
 		}
 
-		// Set active task + load persisted summaries from DB into SummaryPanel
-		const summaryPanel = SummaryPanel.getInstance()
-		summaryPanel.setActiveTask(this.context.globalStorageUri.fsPath, id)
-		await summaryPanel.loadFromDisk(this.context.globalStorageUri.fsPath, id)
-
 		await this.postMessageToWebview({ type: "action", action: "chatButtonClicked" })
 	}
 
@@ -2135,22 +2125,6 @@ export class ClineProvider
 				`Failed to import task: ${error instanceof Error ? error.message : String(error)}`,
 			)
 		}
-	}
-
-	/* Condenses a task's message history to use fewer tokens. */
-	async condenseTaskContext(taskId: string) {
-		let task: Task | undefined
-		for (let i = this.clineStack.length - 1; i >= 0; i--) {
-			if (this.clineStack[i].taskId === taskId) {
-				task = this.clineStack[i]
-				break
-			}
-		}
-		if (!task) {
-			throw new Error(`Task with id ${taskId} not found in stack`)
-		}
-		await task.condenseContext()
-		await this.postMessageToWebview({ type: "condenseTaskContextResponse", text: taskId })
 	}
 
 	// this function deletes a task from task history, and deletes its checkpoints and delete the task folder
@@ -3448,224 +3422,7 @@ export class ClineProvider
 		if (this.clineStack.length > 0) {
 			const task = this.clineStack[this.clineStack.length - 1]
 			console.log(`[clearTask] clearing task ${task.taskId}.${task.instanceId}`)
-
-			// Auto-generate summary on task end (system-triggered, no AI tool call needed).
-			// Capture data before clearing so the summarization can run in the background.
-			const messages = [...task.apiConversationHistory]
-			const taskId = task.taskId
-			let condensingApi: any = null
-
-			// Check if a summary was already generated (e.g. by AttemptCompletionTool)
-			const alreadyHasSummary = messages.some((m: any) => m.isSummary)
-
-			if (messages.length > 2 && !alreadyHasSummary) {
-				try {
-					condensingApi = await task.getCondensingApiHandler()
-				} catch (err) {
-					console.error("[clearTask] Failed to get condensing API handler:", err)
-				}
-			}
-
 			await this.removeClineFromStack()
-
-			// Fire-and-forget: segmented compression of all AI thinking summaries + text
-			if (messages.length > 2 && !alreadyHasSummary && condensingApi) {
-				const globalStoragePath = this.contextProxy.globalStorageUri.fsPath
-				console.log(
-					"[clearTask] Auto-generating task summary for ended task",
-					taskId,
-					"messages:",
-					messages.length,
-				)
-
-				// Extract all AI thinking summaries + text from assistant messages
-				const fragments: string[] = []
-				for (const msg of messages) {
-					if (msg.role !== "assistant") continue
-					const content = msg.content
-					if (!Array.isArray(content)) {
-						if (typeof content === "string" && content.trim()) {
-							fragments.push(content)
-						}
-						continue
-					}
-					for (const block of content) {
-						if ((block as any).type === "text" && typeof (block as any).text === "string") {
-							const text = (block as any).text as string
-							if (text.trim()) {
-								fragments.push(text)
-							}
-						}
-					}
-				}
-
-				if (fragments.length === 0) {
-					console.log("[clearTask] No AI thinking/text fragments found, skipping summary")
-				} else {
-					console.log("[clearTask] Extracted", fragments.length, "fragments")
-					;(async () => {
-						try {
-							// Determine context window char limit for the condensing model.
-							// Reserve ~30% for system prompt + output tokens; use ~3 chars/token estimate.
-							const modelInfo = condensingApi.getModel().info
-							const contextWindow = modelInfo?.contextWindow || 128000
-							const charLimit = Math.floor(contextWindow * 3 * 0.6)
-							console.log(
-								"[clearTask] Condensing model context:",
-								contextWindow,
-								"tokens, char limit:",
-								charLimit,
-							)
-
-							// Greedy bin-packing: group fragments until they fill the char limit.
-							// If a single fragment exceeds the limit, truncate it.
-							const groups: string[][] = []
-							let currentGroup: string[] = []
-							let currentGroupSize = 0
-
-							for (const frag of fragments) {
-								const fragLen = frag.length
-								if (fragLen > charLimit) {
-									// Flush current group first
-									if (currentGroup.length > 0) {
-										groups.push(currentGroup)
-										currentGroup = []
-										currentGroupSize = 0
-									}
-									// Single oversized fragment → truncate to fit
-									groups.push([frag.substring(0, charLimit)])
-									console.log("[clearTask] Truncated oversized fragment:", fragLen, "→", charLimit)
-								} else if (currentGroupSize + fragLen > charLimit) {
-									// Current group is full, start a new one
-									if (currentGroup.length > 0) {
-										groups.push(currentGroup)
-									}
-									currentGroup = [frag]
-									currentGroupSize = fragLen
-								} else {
-									currentGroup.push(frag)
-									currentGroupSize += fragLen
-								}
-							}
-							if (currentGroup.length > 0) {
-								groups.push(currentGroup)
-							}
-
-							console.log("[clearTask] Split into", groups.length, "segment groups")
-
-							const segmentSummaryPrompt = [
-								"You are a task summarizer. The user will provide AI thinking summaries and text outputs from a task segment.",
-								"Generate a concise but comprehensive summary that captures:",
-								"- What was accomplished",
-								"- Key decisions and discoveries",
-								"- Important files/code changes",
-								"- Any unresolved issues",
-								"Keep the summary under 30% of the original length. Use the same language as the input.",
-							].join("\n")
-
-							const totalSegments = groups.length
-							let modelId = "unknown"
-							try {
-								modelId = condensingApi.getModel().id
-							} catch {}
-							const panel = SummaryPanel.getInstance()
-							const storage = { globalStoragePath, taskId }
-
-							// Summarize each segment group via LLM, show each in SummaryPanel as it completes
-							const segmentSummaries: string[] = []
-							for (let i = 0; i < groups.length; i++) {
-								const groupText = groups[i].join("\n\n---\n\n")
-								console.log(
-									`[clearTask] Summarizing segment ${i + 1}/${totalSegments}, chars:`,
-									groupText.length,
-								)
-
-								const reqMessages = [
-									{
-										role: "user" as const,
-										content: `以下是任务第${i + 1}段AI思考概括与输出，请概括：\n\n${groupText}`,
-									},
-								]
-
-								let segSummary = ""
-								const stream = condensingApi.createMessage(segmentSummaryPrompt, reqMessages)
-								for await (const chunk of stream) {
-									if (chunk.type === "text") {
-										segSummary += chunk.text
-									}
-								}
-
-								if (segSummary.trim()) {
-									segmentSummaries.push(segSummary.trim())
-									console.log(`[clearTask] Segment ${i + 1} summary length:`, segSummary.length)
-
-									// Show each segment in SummaryPanel immediately (real-time)
-									if (totalSegments > 1) {
-										const segEntry = {
-											id: `task_seg_${i + 1}_${Date.now()}`,
-											timestamp: Date.now(),
-											text: segSummary.trim(),
-											isGlobal: false,
-											isTaskSummary: true,
-											segmentIndex: i + 1,
-											totalSegments,
-											modelId,
-											originalLength: groupText.length,
-										}
-										panel.addSummary(segEntry, storage)
-									}
-								} else {
-									console.warn(`[clearTask] Segment ${i + 1} returned empty summary`)
-								}
-							}
-
-							if (segmentSummaries.length === 0) {
-								console.warn("[clearTask] All segments returned empty summaries")
-								return
-							}
-
-							// Final task summary = all segment summaries combined
-							const finalSummary =
-								segmentSummaries.length === 1
-									? segmentSummaries[0]
-									: segmentSummaries.map((s, i) => `## 第${i + 1}段\n${s}`).join("\n\n")
-
-							const totalInputChars = fragments.reduce((sum, f) => sum + f.length, 0)
-
-							const finalEntry = {
-								id: `task_summary_${Date.now()}`,
-								timestamp: Date.now(),
-								text: finalSummary,
-								isGlobal: false,
-								isTaskSummary: true,
-								modelId,
-								originalLength: totalInputChars,
-							}
-
-							// Show final combined summary in SummaryPanel + persist to DB
-							panel.addSummary(finalEntry, storage)
-
-							console.log(
-								"[clearTask] Task summary saved:",
-								segmentSummaries.length,
-								"segments,",
-								"final length:",
-								finalSummary.length,
-								"input:",
-								totalInputChars,
-								"compression:",
-								Math.round((1 - finalSummary.length / totalInputChars) * 100) + "%",
-							)
-						} catch (err) {
-							console.error("[clearTask] Task summary generation failed:", err)
-						}
-					})()
-				}
-			} else if (messages.length > 2 && alreadyHasSummary) {
-				console.log("[clearTask] Skipped auto-summary: task already has a summary")
-			} else {
-				console.log("[clearTask] Skipped auto-summary: messages.length =", messages.length)
-			}
 		}
 	}
 

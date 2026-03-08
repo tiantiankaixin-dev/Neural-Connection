@@ -183,6 +183,8 @@ export const clineSays = [
 	"user_edit_todos",
 	"too_many_tools_warning",
 	"tool",
+	"task_completed",
+	"todo_item_divider",
 ] as const
 
 export const clineSaySchema = z.enum(clineSays)

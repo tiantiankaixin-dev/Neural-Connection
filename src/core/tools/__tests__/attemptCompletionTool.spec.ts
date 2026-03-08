@@ -34,12 +34,10 @@ vi.mock("@roo-code/telemetry", () => ({
 	},
 }))
 
-// Mock condense module for auto Global Q generation
+// Mock condense module
 const mockSummarizeConversation = vi.fn()
-const mockAutoUpdateGlobalSummary = vi.fn()
 vi.mock("../../condense", () => ({
 	summarizeConversation: (...args: any[]) => mockSummarizeConversation(...args),
-	autoUpdateGlobalSummary: (...args: any[]) => mockAutoUpdateGlobalSummary(...args),
 }))
 
 import { attemptCompletionTool, AttemptCompletionCallbacks } from "../AttemptCompletionTool"
@@ -75,16 +73,11 @@ describe("attemptCompletionTool", () => {
 
 		// Clear condense mocks between tests
 		mockSummarizeConversation.mockReset()
-		mockAutoUpdateGlobalSummary.mockReset()
 
 		// Default: condense functions succeed without doing anything
 		mockSummarizeConversation.mockResolvedValue({
-			messages: [], // same ref check will fail → triggers globalUpdate
+			messages: [],
 			summary: "test summary",
-			cost: 0,
-		})
-		mockAutoUpdateGlobalSummary.mockResolvedValue({
-			messages: [{ role: "user", content: "summarized", ts: 99, isSummary: true, isGlobalSummary: true }],
 			cost: 0,
 		})
 
@@ -101,15 +94,14 @@ describe("attemptCompletionTool", () => {
 			taskId: "task_1",
 			apiConfiguration: { apiProvider: "test" } as any,
 			api: { getModel: vi.fn().mockReturnValue({ id: "test-model", info: {} }) } as any,
-			getCondensingApiHandler: vi
-				.fn()
-				.mockResolvedValue({ getModel: vi.fn().mockReturnValue({ id: "test-model", info: {} }) }),
 			apiConversationHistory: [
 				{ role: "user", content: "hello", ts: 1 },
 				{ role: "assistant", content: "hi", ts: 2 },
 				{ role: "user", content: "do something", ts: 3 },
 			],
 			overwriteApiConversationHistory: vi.fn().mockResolvedValue(undefined),
+			currentTaskStartIndex: 0,
+			taskEstablished: true,
 		}
 	})
 
@@ -511,8 +503,8 @@ describe("attemptCompletionTool", () => {
 		})
 	})
 
-	describe("auto Global Q generation", () => {
-		it("should call summarizeConversation and autoUpdateGlobalSummary on task completion", async () => {
+	describe("task boundary on completion", () => {
+		it("should update currentTaskStartIndex on task completion", async () => {
 			const block: AttemptCompletionToolUse = {
 				type: "tool_use",
 				name: "attempt_completion",
@@ -530,100 +522,9 @@ describe("attemptCompletionTool", () => {
 			}
 			await attemptCompletionTool.handle(mockTask as Task, block, callbacks)
 
-			expect(mockTask.getCondensingApiHandler).toHaveBeenCalled()
-			expect(mockSummarizeConversation).toHaveBeenCalledWith(
-				expect.objectContaining({
-					messages: mockTask.apiConversationHistory,
-					systemPrompt: "",
-					taskId: "task_1",
-					isAutomaticTrigger: true,
-				}),
-			)
-			expect(mockAutoUpdateGlobalSummary).toHaveBeenCalled()
-			expect(mockTask.overwriteApiConversationHistory).toHaveBeenCalled()
-		})
-
-		it("should not call summarize when conversation has 2 or fewer messages", async () => {
-			mockTask.apiConversationHistory = [
-				{ role: "user", content: "hi", ts: 1 },
-				{ role: "assistant", content: "hello", ts: 2 },
-			]
-
-			const block: AttemptCompletionToolUse = {
-				type: "tool_use",
-				name: "attempt_completion",
-				params: { result: "Done" },
-				nativeArgs: { result: "Done" },
-				partial: false,
-			}
-
-			const callbacks: AttemptCompletionCallbacks = {
-				askApproval: mockAskApproval,
-				handleError: mockHandleError,
-				pushToolResult: mockPushToolResult,
-				askFinishSubTaskApproval: mockAskFinishSubTaskApproval,
-				toolDescription: mockToolDescription,
-			}
-			await attemptCompletionTool.handle(mockTask as Task, block, callbacks)
-
-			expect(mockSummarizeConversation).not.toHaveBeenCalled()
-		})
-
-		it("should not block completion if auto-summary fails", async () => {
-			mockSummarizeConversation.mockRejectedValue(new Error("LLM error"))
-
-			const block: AttemptCompletionToolUse = {
-				type: "tool_use",
-				name: "attempt_completion",
-				params: { result: "Done" },
-				nativeArgs: { result: "Done" },
-				partial: false,
-			}
-
-			const callbacks: AttemptCompletionCallbacks = {
-				askApproval: mockAskApproval,
-				handleError: mockHandleError,
-				pushToolResult: mockPushToolResult,
-				askFinishSubTaskApproval: mockAskFinishSubTaskApproval,
-				toolDescription: mockToolDescription,
-			}
-
-			// Should not throw
-			await attemptCompletionTool.handle(mockTask as Task, block, callbacks)
-
-			// Completion still proceeds
-			expect(mockTask.say).toHaveBeenCalledWith("completion_result", "Done", undefined, false)
-			expect(mockTask.ask).toHaveBeenCalled()
-		})
-
-		it("should skip autoUpdateGlobalSummary when summarizeConversation returns error", async () => {
-			const originalMessages = mockTask.apiConversationHistory!
-			mockSummarizeConversation.mockResolvedValue({
-				messages: originalMessages, // same reference → no update
-				summary: "",
-				cost: 0,
-				error: "summarization failed",
-			})
-
-			const block: AttemptCompletionToolUse = {
-				type: "tool_use",
-				name: "attempt_completion",
-				params: { result: "Done" },
-				nativeArgs: { result: "Done" },
-				partial: false,
-			}
-
-			const callbacks: AttemptCompletionCallbacks = {
-				askApproval: mockAskApproval,
-				handleError: mockHandleError,
-				pushToolResult: mockPushToolResult,
-				askFinishSubTaskApproval: mockAskFinishSubTaskApproval,
-				toolDescription: mockToolDescription,
-			}
-			await attemptCompletionTool.handle(mockTask as Task, block, callbacks)
-
-			expect(mockAutoUpdateGlobalSummary).not.toHaveBeenCalled()
-			expect(mockTask.overwriteApiConversationHistory).not.toHaveBeenCalled()
+			// currentTaskStartIndex should be updated after completion
+			expect(mockTask.currentTaskStartIndex).toBe(mockTask.apiConversationHistory!.length)
+			expect(mockTask.taskEstablished).toBe(false)
 		})
 	})
 })

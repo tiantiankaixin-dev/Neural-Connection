@@ -38,7 +38,7 @@ const TOOL_BRIEFS: Record<string, string> = {
 	ask_followup_question: "Ask the user a clarifying question",
 	attempt_completion: "Mark the task as complete",
 	switch_mode: "Switch to a different mode",
-	new_task: "Create a new subtask",
+
 	update_todo_list: "Update the task todo list",
 	generate_image: "Generate an image",
 	run_slash_command: "Run a slash command",
@@ -62,7 +62,7 @@ const TOOL_BRIEFS: Record<string, string> = {
 }
 
 // Tools that remain fully exposed when task is NOT yet established (task lock)
-const TASK_LOCK_UNLOCKED_TOOLS = new Set(["update_todo_list", "ask_followup_question"])
+const TASK_LOCK_UNLOCKED_TOOLS = new Set(["update_todo_list", "ask_followup_question", "attempt_completion"])
 
 // Cache full tool definitions so we can return them when a stripped tool is "discovered"
 const fullToolDefinitionCache = new Map<string, OpenAI.Chat.ChatCompletionTool>()

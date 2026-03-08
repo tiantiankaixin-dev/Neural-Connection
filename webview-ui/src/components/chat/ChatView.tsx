@@ -1352,6 +1352,33 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		const listFilesBatched = batchConsecutive(readFileBatched, isListFilesAsk, synthesizeListFilesBatch)
 		const result = batchConsecutive(listFilesBatched, isEditFileAsk, synthesizeEditFileBatch)
 
+		// Annotate messages between todo_item_divider markers with group position
+		// so ChatRow can render bordered boxes around each todo item's messages.
+		// _todoGroupPos: 'header' (the divider itself), 'body' (middle), 'last' (bottom of box)
+		// IMPORTANT: Create shallow copies to avoid mutating shared message objects,
+		// which would break memo's deepEqual comparison.
+		const dividerIndices: number[] = []
+		for (let i = 0; i < result.length; i++) {
+			if (result[i].say === "todo_item_divider") {
+				dividerIndices.push(i)
+			}
+		}
+		if (dividerIndices.length > 0) {
+			console.log("[TodoBox] Found dividers at indices:", dividerIndices, "total messages:", result.length)
+		}
+		for (let d = 0; d < dividerIndices.length; d++) {
+			const startIdx = dividerIndices[d]
+			const endIdx = d + 1 < dividerIndices.length ? dividerIndices[d + 1] : result.length
+			if (endIdx <= startIdx + 1) {
+				result[startIdx] = { ...result[startIdx], _todoGroupPos: "only" } as any
+			} else {
+				result[startIdx] = { ...result[startIdx], _todoGroupPos: "header" } as any
+				for (let i = startIdx + 1; i < endIdx; i++) {
+					result[i] = { ...result[i], _todoGroupPos: i === endIdx - 1 ? "last" : "body" } as any
+				}
+			}
+		}
+
 		if (isCondensing) {
 			result.push({
 				type: "say",

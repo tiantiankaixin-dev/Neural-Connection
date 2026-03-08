@@ -127,13 +127,20 @@ import {
 	checkpointDiff,
 } from "../checkpoints"
 import { processUserContentMentions } from "../mentions/processUserContentMentions"
-import { summarizeConversation, getEffectiveApiHistory } from "../condense"
+import { mergeConsecutiveApiMessages } from "./mergeConsecutiveApiMessages"
 import { MessageQueueService } from "../message-queue/MessageQueueService"
 import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
 import { saveThinking } from "../task-persistence/thinking-persistence"
-import { SummaryPanel } from "../webview/SummaryPanel"
+import {
+	type TurnOutput,
+	type TurnThinking,
+	saveTurnOutput,
+	saveTurnThinking,
+	assembleTurns,
+	generateTaskTimestamp,
+} from "../task-persistence/turn-persistence"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -165,12 +172,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	readonly rootTaskId?: string
 	readonly parentTaskId?: string
 	childTaskId?: string
-	pendingNewTaskToolCallId?: string
 
 	readonly instanceId: string
 	readonly metadata: TaskMetadata
 
 	todoList?: TodoItem[]
+
+	/**
+	 * Index into apiConversationHistory where the current sub-task started.
+	 * Updated when attempt_completion is accepted (set to the next message index).
+	 * Used by compression to only condense within the current task boundary.
+	 */
+	currentTaskStartIndex = 0
 
 	readonly rootTask: Task | undefined = undefined
 	readonly parentTask: Task | undefined = undefined
@@ -334,6 +347,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	// Task lock: tools are parameter-stripped until model establishes a task via update_todo_list
 	taskEstablished: boolean = false
 
+	// Per-turn persistence: save each LLM call's full I/O and thinking to separate files
+	turnCounter: number = 0
+	taskTimestamp?: string
+	lastTurnApiInput?: {
+		systemPrompt: string
+		messages: any[]
+		tools?: any[]
+		metadata?: Record<string, any>
+		modelId?: string
+		provider?: string
+	}
+	// Context stripping: maps todoItemId → apiConversationHistory index where that item's work begins
+	todoItemBoundaries: Map<string, number> = new Map()
+
 	// Checkpoints
 	enableCheckpoints: boolean
 	checkpointTimeout: number
@@ -363,9 +390,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * has been saved to API conversation history.
 	 *
 	 * This is critical for parallel tool calling: tools should NOT execute until
-	 * the assistant message is saved. Otherwise, if a tool like `new_task` triggers
-	 * `flushPendingToolResultsToHistory()`, the user message with tool_results would
-	 * appear BEFORE the assistant message with tool_uses, causing API errors.
+	 * the assistant message is saved. Otherwise, `flushPendingToolResultsToHistory()`
+	 * could cause the user message with tool_results to appear BEFORE the assistant
+	 * message with tool_uses, causing API errors.
 	 *
 	 * Reset to `false` at the start of each API request.
 	 * Set to `true` after the assistant message is saved in `recursivelyMakeClineRequests`.
@@ -1152,21 +1179,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			this.apiConversationHistory.push(messageWithTs)
 		} else {
-			// For user messages, validate tool_result IDs ONLY when the immediately previous *effective* message
+			// For user messages, validate tool_result IDs ONLY when the immediately previous message
 			// is an assistant message.
-			//
-			// If the previous effective message is also a user message (e.g., summary + a new user message),
-			// validating against any earlier assistant message can incorrectly inject placeholder tool_results.
-			const effectiveHistoryForValidation = getEffectiveApiHistory(this.apiConversationHistory)
-			const lastEffective = effectiveHistoryForValidation[effectiveHistoryForValidation.length - 1]
-			const historyForValidation = lastEffective?.role === "assistant" ? effectiveHistoryForValidation : []
+			const lastMsg = this.apiConversationHistory[this.apiConversationHistory.length - 1]
+			const historyForValidation = lastMsg?.role === "assistant" ? this.apiConversationHistory : []
 
-			// If the previous effective message is NOT an assistant, convert tool_result blocks to text blocks.
-			// This prevents orphaned tool_results from being filtered out by getEffectiveApiHistory.
-			// This can happen when condensing occurs after the assistant sends tool_uses but before
-			// the user responds - the tool_use blocks get condensed away, leaving orphaned tool_results.
+			// If the previous message is NOT an assistant, convert tool_result blocks to text blocks.
 			let messageToAdd = message
-			if (lastEffective?.role !== "assistant" && Array.isArray(message.content)) {
+			if (lastMsg?.role !== "assistant" && Array.isArray(message.content)) {
 				messageToAdd = {
 					...message,
 					content: message.content.map((block) =>
@@ -1189,10 +1209,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	/**
-	 * After each assistant turn with plain-text reasoning, extract the [KEY POINTS]
-	 * section the model wrote at the end of its thinking, and REPLACE the reasoning
-	 * block with a compact [Key Points] text block. Falls back to 500-char truncation
-	 * if the model didn't write [KEY POINTS]. Full original is persisted to disk.
+	 * After each assistant turn with plain-text reasoning, remove the reasoning
+	 * block from history (it's not needed for context). Full original is persisted
+	 * to disk for debugging/recovery.
 	 */
 	private async compressThinkingInHistory(reasoningText: string): Promise<void> {
 		const lastMsg = this.apiConversationHistory[this.apiConversationHistory.length - 1]
@@ -1214,268 +1233,192 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const reasoningBlock = content[reasoningBlockIndex] as any
 		const originalText = reasoningBlock.text as string
 
-		// Extract [KEY POINTS] section from the reasoning. Only this part is kept.
-		// If the model didn't write [KEY POINTS], just remove the reasoning block
-		// entirely — no fake "key points" from raw thinking.
-		const kpMatch = originalText.match(/\[KEY POINTS?\]\s*([\s\S]*?)$/i)
-		const keyPoints = kpMatch && kpMatch[1].trim().length > 0 ? kpMatch[1].trim() : null
+		// Remove the reasoning block from history
+		content.splice(reasoningBlockIndex, 1)
 
-		if (keyPoints) {
-			// Replace reasoning block with a compact [Key Points] text block
-			content[reasoningBlockIndex] = {
-				type: "text" as const,
-				text: `[Key Points]\n${keyPoints}`,
-			}
-		} else {
-			// No key points found — remove the reasoning block entirely
-			content.splice(reasoningBlockIndex, 1)
-		}
-
-		// Persist full original to disk (always, for debugging/recovery)
+		// Persist full original to disk (for debugging/recovery)
 		const entryId = `thinking_${Date.now()}`
-		const entryTimestamp = Date.now()
 		await saveThinking(this.globalStoragePath, this.taskId, {
 			id: entryId,
-			timestamp: entryTimestamp,
+			timestamp: Date.now(),
 			originalLength: originalText.length,
 			text: originalText,
 		}).catch((err: Error) => console.warn("[Task] Failed to persist thinking:", err))
-
-		// Notify SummaryPanel only if actual key points were extracted
-		if (keyPoints) {
-			try {
-				let modelId = "unknown"
-				try {
-					modelId = this.api.getModel().id
-				} catch {}
-				SummaryPanel.getInstance().addSummary({
-					id: entryId,
-					timestamp: entryTimestamp,
-					text: "",
-					isGlobal: false,
-					isThinking: true,
-					modelId,
-					originalLength: originalText.length,
-					keyPoints,
-				})
-			} catch (err) {
-				console.warn("[Task] SummaryPanel notification for key points failed:", err)
-			}
-		}
 
 		// Save updated history
 		await this.saveApiConversationHistory()
 	}
 
 	/**
-	 * Build full-task-context messages from the conversation history.
+	 * Save per-turn LLM data (I/O and thinking) to the task's turns directory.
 	 *
-	 * Design: Within a single task, the AI sees ALL accumulated context:
-	 *   - User's original request
-	 *   - ALL [Key Points] blocks (full thinking/reasoning from each turn)
-	 *   - ALL visible text output from assistant
-	 *   - Current message (tool_result or new user message)
+	 * Called after each successful API stream completes. Saves two files:
+	 *   - turn_NNN_io.json: full input context (system prompt, messages, tools) + output
+	 *   - turn_NNN_thinking.json: reasoning/thinking content (only if present)
 	 *
-	 * Tool results are NOT carried forward — their key points are captured in the
-	 * AI's <key_points> output (per the prompt instruction). This keeps context
-	 * compact while preserving all essential information.
-	 *
-	 * Format:
-	 *   Tool chain: [synthetic user: full context] + [assistant: current] + [user: tool_result]
-	 *   New user turn: [single user message: full context + current request]
+	 * Non-critical: failures are logged but do not block task execution.
 	 */
-	private buildSlidingWindowMessages(allMessages: ApiMessage[]): ApiMessage[] {
-		if (allMessages.length === 0) return []
+	private async saveTurnData(assistantText: string, assistantContent: any[], reasoning?: string): Promise<void> {
+		try {
+			// Active item = first in_progress, or first pending (many models skip in_progress)
+			const currentItem =
+				this.todoList?.find((t) => t.status === "in_progress") ||
+				this.todoList?.find((t) => t.status === "pending")
+			const itemContent = currentItem?.content
 
-		const currentMsg = allMessages[allMessages.length - 1]
-		if (!currentMsg) return []
-
-		// ── Collect ALL accumulated context from the entire conversation ──
-
-		// 1. Find user's original request (first real user message, not tool_result)
-		let userRequest: string | null = null
-		for (const msg of allMessages) {
-			if (msg.role !== "user") continue
-			if (
-				Array.isArray(msg.content) &&
-				(msg.content as any[]).some((block: any) => block.type === "tool_result")
-			) {
-				continue
-			}
-			if (typeof msg.content === "string" && msg.content.trim()) {
-				userRequest = msg.content.trim()
-			} else if (Array.isArray(msg.content)) {
-				const texts = (msg.content as any[])
-					.filter((b: any) => b.type === "text" && typeof b.text === "string")
-					.map((b: any) => b.text.trim())
-					.filter((t: string) => t.length > 0)
-				if (texts.length > 0) userRequest = texts.join("\n")
-			}
-			break
-		}
-
-		// 2. Collect context from previous assistant messages
-		const prevAssistantIndex = this.findPrevAssistantIndex(allMessages)
-
-		// 3. Collect ALL visible text from ALL assistant messages (oldest → newest)
-		const allVisibleTexts: string[] = []
-		for (let i = 0; i < allMessages.length; i++) {
-			if (i === prevAssistantIndex) continue
-			const msg = allMessages[i]
-			if (msg.role !== "assistant" || msg.isSummary) continue
-			const vt = this.extractVisibleText(msg)
-			if (vt) allVisibleTexts.push(vt)
-		}
-
-		// ── Determine message type ──
-
-		const isToolResult =
-			currentMsg.role === "user" &&
-			Array.isArray(currentMsg.content) &&
-			(currentMsg.content as any[]).some((block: any) => block.type === "tool_result")
-
-		// ── Build the context string ──
-		let contextContent = ""
-		// Accumulated key points appear in synthetic context for historical reference.
-		if (isToolResult) {
-			const allKeyPoints: string[] = []
-			for (let i = 0; i < allMessages.length; i++) {
-				if (i === prevAssistantIndex) continue // skip current assistant, it's included directly
-				const msg = allMessages[i]
-				if (msg.role !== "assistant" || msg.isSummary) continue
-				const kp = this.extractKeyPoints(msg)
-				if (kp) allKeyPoints.push(kp)
-			}
-			if (allKeyPoints.length > 0) {
-				contextContent += `[Accumulated Key Points]\n`
-				contextContent += allKeyPoints.map((s: string, i: number) => `--- Turn ${i + 1} ---\n${s}`).join("\n\n")
-				contextContent += "\n\n"
-			}
-		}
-		if (userRequest) {
-			contextContent += `[User's Request]\n${userRequest}\n\n`
-		}
-		if (allVisibleTexts.length > 0) {
-			contextContent += `[Your Previous Outputs]\n`
-			contextContent += allVisibleTexts.join("\n\n---\n\n")
-			contextContent += "\n\n"
-		}
-
-		// ── Assemble final messages based on message type ──
-
-		if (isToolResult) {
-			// Tool chain: [synthetic user with full context] + [assistant] + [user: tool_result]
-			const result: ApiMessage[] = []
-
-			if (!contextContent) contextContent = "(continued)"
-			result.push({ role: "user", content: contextContent, ts: Date.now() } as ApiMessage)
-
-			// Include the immediate previous assistant (thinking + tool_use)
-			if (prevAssistantIndex >= 0) {
-				result.push(allMessages[prevAssistantIndex])
+			const turnOutput: TurnOutput = {
+				turnNumber: this.turnCounter,
+				timestamp: Date.now(),
+				todoItemId: currentItem?.id,
+				todoItemContent: itemContent,
+				modelId: this.lastTurnApiInput?.modelId,
+				provider: this.lastTurnApiInput?.provider,
+				input: this.lastTurnApiInput || { systemPrompt: "", messages: [] },
+				output: {
+					assistantMessage: assistantText,
+					toolCalls: assistantContent.filter((b: any) => b.type === "tool_use"),
+				},
 			}
 
-			// Append KEY POINTS instruction to the tool_result message so it's the
-			// last thing the model sees before generating. Models follow nearby instructions better.
-			const toolResultMsg = { ...currentMsg }
-			const toolResultContent = Array.isArray(toolResultMsg.content)
-				? [...(toolResultMsg.content as any[])]
-				: [{ type: "text", text: String(toolResultMsg.content) }]
-			toolResultContent.push({
-				type: "text",
-				text: `\n[KEY POINTS] At the END of your thinking, write a [KEY POINTS] section — bullet points only, one finding per line. Paste critical code verbatim. No reasoning, no filler. Same language as the user.`,
-			})
-			toolResultMsg.content = toolResultContent
-			result.push(toolResultMsg as ApiMessage)
+			await saveTurnOutput(
+				this.globalStoragePath,
+				this.taskId,
+				this.taskTimestamp || generateTaskTimestamp(),
+				itemContent,
+				turnOutput,
+			)
 
-			return result
-		} else {
-			// New user turn: prepend full context to current user message
-			if (contextContent) {
-				contextContent += "---\n\n"
-			}
-			const mergedContent = this.prependContextToUserMessage(currentMsg, contextContent)
-			return [{ ...currentMsg, content: mergedContent } as ApiMessage]
-		}
-	}
-
-	/**
-	 * Find the index of the immediate previous assistant message (not isSummary).
-	 * Returns -1 if not found.
-	 */
-	private findPrevAssistantIndex(allMessages: ApiMessage[]): number {
-		for (let i = allMessages.length - 2; i >= 0; i--) {
-			if (allMessages[i].role === "assistant" && !allMessages[i].isSummary) {
-				return i
-			}
-		}
-		return -1
-	}
-
-	/**
-	 * Extract [Key Points] text from an assistant message, if present.
-	 * Key points are persisted as text blocks starting with "[Key Points]".
-	 */
-	private extractKeyPoints(msg: ApiMessage | undefined): string | null {
-		if (!msg || msg.role !== "assistant") return null
-		if (!Array.isArray(msg.content)) return null
-
-		for (const block of msg.content as any[]) {
-			if (block.type === "text" && typeof block.text === "string" && block.text.startsWith("[Key Points]")) {
-				return block.text.replace(/^\[Key Points\]\n?/, "").trim()
-			}
-		}
-		return null
-	}
-
-	/**
-	 * Extract user-visible text from an assistant message (excludes [Key Points] and tool_use blocks).
-	 */
-	private extractVisibleText(msg: ApiMessage | undefined): string | null {
-		if (!msg || msg.role !== "assistant") return null
-
-		if (typeof msg.content === "string") {
-			if (msg.content.startsWith("[Key Points]")) return null
-			return msg.content.trim().length > 0 ? msg.content : null
-		}
-
-		if (!Array.isArray(msg.content)) return null
-
-		const visibleParts: string[] = []
-		for (const block of msg.content as any[]) {
-			if (block.type === "text" && typeof block.text === "string" && !block.text.startsWith("[Key Points]")) {
-				const trimmed = block.text.trim()
-				if (trimmed.length > 0) visibleParts.push(trimmed)
-			}
-		}
-		return visibleParts.length > 0 ? visibleParts.join("\n") : null
-	}
-
-	/**
-	 * Prepend context text to a user message's content.
-	 */
-	private prependContextToUserMessage(msg: ApiMessage, contextPrefix: string): ApiMessage["content"] {
-		if (!contextPrefix) return msg.content
-
-		if (typeof msg.content === "string") {
-			return contextPrefix + msg.content
-		}
-
-		if (Array.isArray(msg.content)) {
-			const blocks = [...(msg.content as any[])]
-			const firstTextIdx = blocks.findIndex((b: any) => b.type === "text")
-			if (firstTextIdx >= 0) {
-				blocks[firstTextIdx] = {
-					...blocks[firstTextIdx],
-					text: contextPrefix + (blocks[firstTextIdx].text || ""),
+			if (reasoning) {
+				const turnThinking: TurnThinking = {
+					turnNumber: this.turnCounter,
+					timestamp: Date.now(),
+					todoItemId: currentItem?.id,
+					todoItemContent: itemContent,
+					reasoning,
+					reasoningLength: reasoning.length,
 				}
-			} else {
-				blocks.unshift({ type: "text", text: contextPrefix })
+
+				await saveTurnThinking(
+					this.globalStoragePath,
+					this.taskId,
+					this.taskTimestamp || generateTaskTimestamp(),
+					itemContent,
+					turnThinking,
+				)
 			}
-			return blocks
+		} catch (err) {
+			console.warn("[Task] saveTurnData failed (non-critical):", err)
+		}
+	}
+
+	/**
+	 * Build an effective conversation history with context stripping.
+	 *
+	 * When the AI is focused on a specific todo item, messages from completed
+	 * items are replaced with a compact summary pair, reducing context size.
+	 *
+	 * Returns the full history unchanged if:
+	 *   - No todo list exists
+	 *   - No item is currently in_progress
+	 *   - No boundaries have been recorded
+	 */
+	public buildEffectiveHistory(): ApiMessage[] {
+		// If no todo list or no boundaries, return full history
+		if (!this.todoList || this.todoList.length === 0 || this.todoItemBoundaries.size === 0) {
+			return this.apiConversationHistory
 		}
 
-		return msg.content
+		// Active item = first in_progress, or first pending (many models skip in_progress)
+		const currentItem =
+			this.todoList.find((t) => t.status === "in_progress") || this.todoList.find((t) => t.status === "pending")
+		if (!currentItem) {
+			return this.apiConversationHistory
+		}
+
+		let currentItemStart = this.todoItemBoundaries.get(currentItem.id)
+		if (currentItemStart === undefined || currentItemStart <= 0) {
+			return this.apiConversationHistory
+		}
+
+		// Find the earliest boundary across all items (= end of initial context)
+		const allBoundaryStarts = Array.from(this.todoItemBoundaries.values())
+		let firstBoundary = Math.min(...allBoundaryStarts)
+
+		if (firstBoundary >= this.apiConversationHistory.length) {
+			return this.apiConversationHistory
+		}
+
+		// ── Boundary alignment: never split tool_use / tool_result pairs ──
+		// Boundaries are recorded during tool execution, after the assistant's
+		// tool_use is in history but before the tool_result is added. This can
+		// leave an orphaned tool_use at the end of the initial context section
+		// or an orphaned tool_result at the start of the current-item section.
+		if (firstBoundary > 0 && firstBoundary < this.apiConversationHistory.length) {
+			const lastKept = this.apiConversationHistory[firstBoundary - 1]
+			if (
+				lastKept.role === "assistant" &&
+				Array.isArray(lastKept.content) &&
+				lastKept.content.some((b: any) => b.type === "tool_use")
+			) {
+				firstBoundary++
+			}
+		}
+		if (currentItemStart > 0 && currentItemStart < this.apiConversationHistory.length) {
+			const firstKept = this.apiConversationHistory[currentItemStart]
+			if (
+				firstKept.role === "user" &&
+				Array.isArray(firstKept.content) &&
+				firstKept.content.some((b: any) => b.type === "tool_result")
+			) {
+				currentItemStart--
+			}
+		}
+		// If adjustments closed the gap, no stripping needed
+		if (firstBoundary >= currentItemStart) {
+			return this.apiConversationHistory
+		}
+
+		const result: ApiMessage[] = []
+
+		// 1. Keep initial context: messages before any todo item started working
+		for (let i = 0; i < Math.min(firstBoundary, this.apiConversationHistory.length); i++) {
+			result.push(this.apiConversationHistory[i])
+		}
+
+		// 2. Insert completed-item status markers (project name + completed status only)
+		const completedItems = this.todoList.filter((t) => t.status === "completed")
+		if (completedItems.length > 0 && currentItemStart > firstBoundary) {
+			const statusLines = completedItems.map((item) => `[x] ${item.content}`).join("\n")
+
+			result.push({
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: `${statusLines}\n[-] ${currentItem.content}`,
+					},
+				],
+				ts: Date.now(),
+			} as ApiMessage)
+
+			result.push({
+				role: "assistant",
+				content: [
+					{
+						type: "text",
+						text: `Continuing: ${currentItem.content}`,
+					},
+				],
+				ts: Date.now(),
+			} as ApiMessage)
+		}
+
+		// 3. Keep all messages from the current item's boundary onwards
+		for (let i = currentItemStart; i < this.apiConversationHistory.length; i++) {
+			result.push(this.apiConversationHistory[i])
+		}
+
+		return result
 	}
 
 	// NOTE: We intentionally do NOT mutate stored messages to merge consecutive user turns.
@@ -1489,12 +1432,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	/**
 	 * Flush any pending tool results to the API conversation history.
 	 *
-	 * This is critical when the task is about to be
-	 * delegated (e.g., via new_task). Before delegation, if other tools were
-	 * called in the same turn before new_task, their tool_result blocks are
-	 * accumulated in `userMessageContent` but haven't been saved to the API
-	 * history yet. If we don't flush them before the parent is disposed,
-	 * the API conversation will be incomplete and cause 400 errors when
+	 * This is important when tool_result blocks are accumulated in
+	 * `userMessageContent` but haven't been saved to the API history yet.
+	 * If we don't flush them, the API conversation will be incomplete and cause 400 errors when
 	 * the parent resumes (missing tool_result for tool_use blocks).
 	 *
 	 * NOTE: The assistant message is typically already in history by the time
@@ -1512,10 +1452,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// conversation history, causing API errors like:
 		// "unexpected `tool_use_id` found in `tool_result` blocks"
 		//
-		// This can happen when parallel tools are called (e.g., update_todo_list + new_task).
+		// This can happen when parallel tools are called.
 		// Tools execute during streaming via presentAssistantMessage, BEFORE the assistant
-		// message is saved. When new_task triggers delegation, it calls this method to
-		// flush pending results - but the assistant message hasn't been saved yet.
+		// message is saved.
 		//
 		// The assistantMessageSavedToHistory flag is:
 		// - Reset to false at the start of each API request
@@ -1543,10 +1482,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			content: this.userMessageContent,
 		}
 
-		// Validate and fix tool_result IDs when the previous *effective* message is an assistant message.
-		const effectiveHistoryForValidation = getEffectiveApiHistory(this.apiConversationHistory)
-		const lastEffective = effectiveHistoryForValidation[effectiveHistoryForValidation.length - 1]
-		const historyForValidation = lastEffective?.role === "assistant" ? effectiveHistoryForValidation : []
+		// Validate and fix tool_result IDs when the previous message is an assistant message.
+		const lastMsg = this.apiConversationHistory[this.apiConversationHistory.length - 1]
+		const historyForValidation = lastMsg?.role === "assistant" ? this.apiConversationHistory : []
 		const validatedMessage = validateAndFixToolResultIds(userMessage, historyForValidation)
 		const userMessageWithTs = { ...validatedMessage, ts: Date.now() }
 		this.apiConversationHistory.push(userMessageWithTs as ApiMessage)
@@ -2031,37 +1969,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	/**
-	 * Returns the API handler to use for context condensing (summarization).
-	 * If the user has selected a specific condensing model profile, builds a
-	 * separate ApiHandler from that profile. Otherwise falls back to this.api.
-	 */
-	public async getCondensingApiHandler(): Promise<ApiHandler> {
-		try {
-			const provider = this.providerRef.deref()
-			if (!provider) return this.api
-
-			const condensingBaseUrl = provider.contextProxy.getGlobalState("condensingBaseUrl")
-			const condensingModelId = provider.contextProxy.getGlobalState("condensingModelId")
-
-			if (condensingBaseUrl) {
-				// Custom endpoint: use OpenAI-compatible provider with the given base URL + model ID.
-				// Use "openai" provider (not "openai-native") because openai-native validates
-				// model IDs against a hardcoded list and falls back to a default model,
-				// which breaks custom models (e.g. Ollama, LM Studio).
-				return buildApiHandler({
-					apiProvider: "openai",
-					openAiApiKey: "none",
-					openAiBaseUrl: condensingBaseUrl,
-					openAiModelId: condensingModelId || undefined,
-				})
-			}
-		} catch (error) {
-			console.error("[Task] Failed to build condensing API handler, falling back to task API:", error)
-		}
-		return this.api
-	}
-
-	/**
 	 * Returns the API handler to use for memory regression (drilling down summaries).
 	 * If the user has selected a specific regression model, builds a separate ApiHandler.
 	 * Otherwise returns undefined (regression not configured).
@@ -2149,114 +2056,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.error(`[Task#${context}] Failed to get files read by Roo:`, error)
 			return undefined
 		}
-	}
-
-	public async condenseContext(): Promise<void> {
-		// CRITICAL: Flush any pending tool results before condensing
-		// to ensure tool_use/tool_result pairs are complete in history
-		await this.flushPendingToolResultsToHistory()
-
-		const systemPrompt = await this.getSystemPrompt()
-
-		// Get condensing configuration
-		const state = await this.providerRef.deref()?.getState()
-		const customCondensingPrompt = state?.customSupportPrompts?.CONDENSE
-		const { mode, apiConfiguration } = state ?? {}
-
-		const { contextTokens: prevContextTokens } = this.getTokenUsage()
-
-		// Build tools for condensing metadata (same tools used for normal API calls)
-		const provider = this.providerRef.deref()
-		let allTools: import("openai").default.Chat.ChatCompletionTool[] = []
-		if (provider) {
-			const modelInfo = this.api.getModel().info
-			const toolsResult = await buildNativeToolsArrayWithRestrictions({
-				provider,
-				cwd: this.cwd,
-				mode,
-				customModes: state?.customModes,
-				experiments: state?.experiments,
-				apiConfiguration,
-				browserToolEnabled: state?.browserToolEnabled ?? true,
-				disabledTools: state?.disabledTools,
-				modelInfo,
-				includeAllToolsWithRestrictions: false,
-			})
-			allTools = toolsResult.tools
-		}
-
-		// Build metadata with tools and taskId for the condensing API call
-		const metadata: ApiHandlerCreateMessageMetadata = {
-			mode,
-			taskId: this.taskId,
-			...(allTools.length > 0
-				? {
-						tools: allTools,
-						tool_choice: "auto",
-						parallelToolCalls: true,
-					}
-				: {}),
-		}
-		// Generate environment details to include in the condensed summary
-		const environmentDetails = await getEnvironmentDetails(this, true)
-
-		const filesReadByRoo = await this.getFilesReadByRooSafely("condenseContext")
-
-		const {
-			messages,
-			summary,
-			cost,
-			newContextTokens = 0,
-			error,
-			errorDetails,
-			condenseId,
-		} = await summarizeConversation({
-			messages: this.apiConversationHistory,
-			apiHandler: await this.getCondensingApiHandler(),
-			systemPrompt,
-			taskId: this.taskId,
-			isAutomaticTrigger: false,
-			customCondensingPrompt,
-			metadata,
-			environmentDetails,
-			filesReadByRoo,
-			cwd: this.cwd,
-			rooIgnoreController: this.rooIgnoreController,
-		})
-		if (error) {
-			await this.say(
-				"condense_context_error",
-				error,
-				undefined /* images */,
-				false /* partial */,
-				undefined /* checkpoint */,
-				undefined /* progressStatus */,
-				{ isNonInteractive: true } /* options */,
-			)
-			return
-		}
-		await this.overwriteApiConversationHistory(messages)
-
-		const contextCondense: ContextCondense = {
-			summary,
-			cost,
-			newContextTokens,
-			prevContextTokens,
-			condenseId: condenseId!,
-		}
-		await this.say(
-			"condense_context",
-			undefined /* text */,
-			undefined /* images */,
-			false /* partial */,
-			undefined /* checkpoint */,
-			undefined /* progressStatus */,
-			{ isNonInteractive: true } /* options */,
-			contextCondense,
-		)
-
-		// Process any queued messages after condensing completes
-		this.processQueuedMessages()
 	}
 
 	async say(
@@ -2493,6 +2292,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 			this.isInitialized = true
 
+			// Generate timestamp-based folder name for per-turn persistence
+			this.taskTimestamp = generateTaskTimestamp()
+
 			const imageBlocks: Anthropic.ImageBlockParam[] = formatResponse.imageBlocks(images)
 
 			// Task starting
@@ -2581,6 +2383,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// This is important in case the user deletes messages without resuming
 		// the task first.
 		this.apiConversationHistory = await this.getSavedApiConversationHistory()
+
+		// Generate timestamp for per-turn persistence on resume (if not already set)
+		if (!this.taskTimestamp) {
+			this.taskTimestamp = generateTaskTimestamp()
+		}
 
 		const lastClineMessage = this.clineMessages
 			.slice()
@@ -3853,9 +3660,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				// No legacy text-stream tool parser state to reset.
 
 				// CRITICAL: Save assistant message to API history BEFORE executing tools.
-				// This ensures that when new_task triggers delegation and calls flushPendingToolResultsToHistory(),
-				// the assistant message is already in history. Otherwise, tool_result blocks would appear
-				// BEFORE their corresponding tool_use blocks, causing API errors.
+				// This ensures tool_result blocks appear AFTER their corresponding tool_use blocks.
 
 				// Check if we have any content to process (text or tool uses)
 				const hasTextContent = assistantMessage.length > 0
@@ -3952,47 +3757,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						}
 					}
 
-					// Enforce new_task isolation: if new_task is called alongside other tools,
-					// truncate any tools that come after it and inject error tool_results.
-					// This prevents orphaned tools when delegation disposes the parent task.
-					const newTaskIndex = assistantContent.findIndex(
-						(block) => block.type === "tool_use" && block.name === "new_task",
-					)
-
-					if (newTaskIndex !== -1 && newTaskIndex < assistantContent.length - 1) {
-						// new_task found but not last - truncate subsequent tools
-						const truncatedTools = assistantContent.slice(newTaskIndex + 1)
-						assistantContent.length = newTaskIndex + 1 // Truncate API history array
-
-						// ALSO truncate the execution array (assistantMessageContent) to prevent
-						// tools after new_task from being executed by presentAssistantMessage().
-						// Find new_task index in assistantMessageContent (may differ from assistantContent
-						// due to text blocks being structured differently).
-						const executionNewTaskIndex = this.assistantMessageContent.findIndex(
-							(block) => block.type === "tool_use" && block.name === "new_task",
-						)
-						if (executionNewTaskIndex !== -1) {
-							this.assistantMessageContent.length = executionNewTaskIndex + 1
-						}
-
-						// Pre-inject error tool_results for truncated tools
-						for (const tool of truncatedTools) {
-							if (tool.type === "tool_use" && (tool as Anthropic.ToolUseBlockParam).id) {
-								this.pushToolResultToUserContent({
-									type: "tool_result",
-									tool_use_id: (tool as Anthropic.ToolUseBlockParam).id,
-									content:
-										"This tool was not executed because new_task was called in the same message turn. The new_task tool must be the last tool in a message.",
-									is_error: true,
-								})
-							}
-						}
-					}
-
-					// Save assistant message BEFORE executing tools
-					// This is critical for new_task: when it triggers delegation, flushPendingToolResultsToHistory()
-					// will save the user message with tool_results. The assistant message must already be in history
-					// so that tool_result blocks appear AFTER their corresponding tool_use blocks.
+					// Save assistant message BEFORE executing tools.
 					await this.addToApiConversationHistory(
 						{ role: "assistant", content: assistantContent },
 						reasoningMessage || undefined,
@@ -4013,14 +3778,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					}
 
 					TelemetryService.instance.captureConversationMessage(this.taskId, "assistant")
+
+					// Per-turn persistence: save I/O and thinking to disk
+					this.turnCounter++
+					try {
+						await this.saveTurnData(assistantMessage, assistantContent, reasoningMessage || undefined)
+					} catch (err) {
+						console.warn("[Task] Per-turn persistence failed (non-critical):", err)
+					}
 				}
 
 				// Present any partial blocks that were just completed.
 				// Tool calls are typically presented during streaming via tool_call_partial events,
 				// but we still present here if any partial blocks remain (e.g., malformed streams).
 				// NOTE: This MUST happen AFTER saving the assistant message to API history.
-				// When new_task is in the batch, it triggers delegation which calls flushPendingToolResultsToHistory().
-				// If the assistant message isn't saved yet, tool_results would appear before tool_use blocks.
 				if (partialBlocks.length > 0) {
 					// If there is content to update then it will complete and
 					// update `this.userMessageContentReady` to true, which we
@@ -4279,9 +4050,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					useAgentRules:
 						vscode.workspace.getConfiguration(Package.name).get<boolean>("useAgentRules") ?? true,
 					enableSubfolderRules: enableSubfolderRules ?? false,
-					newTaskRequireTodos: vscode.workspace
-						.getConfiguration(Package.name)
-						.get<boolean>("newTaskRequireTodos", false),
 					isStealthModel: modelInfo?.isStealthModel,
 				},
 				undefined, // todoList
@@ -4348,11 +4116,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		const systemPrompt = await this.getSystemPrompt()
 
-		// Sliding window context: only include [previous key points + previous visible text + current user message].
-		// For tool chains: [synthetic user context] + [assistant: thinking + tool_call] + [user: tool_result].
-		// This replaces the full history pipeline (getEffectiveApiHistory + mergeConsecutiveApiMessages).
-		const slidingWindowMessages = this.buildSlidingWindowMessages(this.apiConversationHistory)
-		const messagesWithoutImages = maybeRemoveImageBlocks(slidingWindowMessages, this.api)
+		// Full history pipeline: apply context stripping, merge consecutive same-role messages, then clean for API submission.
+		const effectiveHistory = this.buildEffectiveHistory()
+		const mergedMessages = mergeConsecutiveApiMessages(effectiveHistory)
+		const messagesWithoutImages = maybeRemoveImageBlocks(mergedMessages, this.api)
 		const cleanConversationHistory = this.buildCleanConversationHistory(messagesWithoutImages as ApiMessage[])
 
 		// Check auto-approval limits
@@ -4444,6 +4211,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				modelId: this.api.getModel().id,
 				provider: this.apiConfiguration?.apiProvider,
 			})
+		}
+
+		// Capture turn input for per-turn persistence
+		this.lastTurnApiInput = {
+			systemPrompt,
+			messages: cleanConversationHistory as any[],
+			tools: allTools,
+			metadata,
+			modelId: this.api.getModel().id,
+			provider: this.apiConfiguration?.apiProvider,
 		}
 
 		// The provider accepts reasoning items alongside standard messages; cast to the expected parameter type.
@@ -4708,8 +4485,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					continue
 				} else if (hasPlainTextReasoning) {
-					// NOTE: After compressThinkingInHistory runs, the reasoning block is replaced
-					// with a standard { type: "text", text: "[Key Points]\n..." } block.
+					// NOTE: After compressThinkingInHistory runs, the reasoning block is removed.
 					// So this branch only triggers for UN-compressed reasoning (e.g. if compression
 					// hasn't run yet, or for Anthropic thinking/encrypted blocks handled above).
 

@@ -639,16 +639,6 @@ export class NativeToolCallParser {
 				}
 				break
 
-			case "new_task":
-				if (partialArgs.mode !== undefined || partialArgs.message !== undefined) {
-					nativeArgs = {
-						mode: partialArgs.mode,
-						message: partialArgs.message,
-						todos: partialArgs.todos,
-					}
-				}
-				break
-
 			default:
 				break
 		}
@@ -996,16 +986,6 @@ export class NativeToolCallParser {
 						nativeArgs = {
 							path: args.path,
 							recursive: this.coerceOptionalBoolean(args.recursive),
-						} as NativeArgsFor<TName>
-					}
-					break
-
-				case "new_task":
-					if (args.mode !== undefined && args.message !== undefined) {
-						nativeArgs = {
-							mode: args.mode,
-							message: args.message,
-							todos: args.todos,
 						} as NativeArgsFor<TName>
 					}
 					break

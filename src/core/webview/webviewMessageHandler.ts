@@ -770,7 +770,7 @@ export const webviewMessageHandler = async (
 			provider.showTaskWithId(message.text!)
 			break
 		case "condenseTaskContextRequest":
-			provider.condenseTaskContext(message.text!)
+			// Context condensation has been removed
 			break
 		case "deleteTaskWithId":
 			provider.deleteTaskWithId(message.text!)

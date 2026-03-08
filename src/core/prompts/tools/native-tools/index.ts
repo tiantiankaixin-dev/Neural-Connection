@@ -13,7 +13,6 @@ import generateImage from "./generate_image"
 import findByName from "./find_by_name"
 import listFiles from "./list_files"
 import multiEdit from "./multi_edit"
-import newTask from "./new_task"
 import readNotebook from "./read_notebook"
 import editNotebook from "./edit_notebook"
 import viewContentChunk from "./view_content_chunk"
@@ -73,7 +72,6 @@ export function getNativeTools(options: NativeToolsOptions = {}): OpenAI.Chat.Ch
 		listFiles,
 		findByName,
 		multiEdit,
-		newTask,
 		readNotebook,
 		editNotebook,
 		viewContentChunk,

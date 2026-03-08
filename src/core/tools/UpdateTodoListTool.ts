@@ -73,6 +73,36 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				)
 			}
 
+			// Track the "active item" — the item currently being worked on.
+			// Active = first in_progress item, or if none, first pending item.
+			// Emit a divider whenever the active item changes, INCLUDING the
+			// very first update_todo_list call. This ensures:
+			//   1. First item gets a border immediately when todo list is created
+			//   2. Each item gets its own separate bordered box
+			//   3. Works regardless of whether AI uses [-] or skips to [x]
+			const getActiveContent = (todos: { content: string; status: string }[]): string | undefined => {
+				const item = todos.find((t) => t.status === "in_progress") || todos.find((t) => t.status === "pending")
+				return item?.content
+			}
+
+			const previousActiveContent = task.todoList ? getActiveContent(task.todoList) : undefined
+			const currentActiveContent = getActiveContent(normalizedTodos)
+			const currentActiveItem = normalizedTodos.find((t) => t.content === currentActiveContent)
+
+			if (currentActiveItem && currentActiveContent !== previousActiveContent) {
+				task.todoItemBoundaries.set(currentActiveItem.id, task.apiConversationHistory.length)
+
+				await task.say(
+					"todo_item_divider",
+					currentActiveItem.content,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{ isNonInteractive: true },
+				)
+			}
+
 			await setTodoListForTask(task, normalizedTodos)
 
 			// Task lock: establishing a task unlocks all tools for subsequent API calls

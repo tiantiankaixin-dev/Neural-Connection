@@ -137,11 +137,44 @@ const ChatRow = memo(
 		// This allows us to detect changes without causing re-renders
 		const prevHeightRef = useRef(0)
 
-		const [chatrow, { height }] = useSize(
+		const todoGroupPos = (message as any)._todoGroupPos as "header" | "body" | "last" | "only" | undefined
+
+		const borderStyle = "1px solid rgba(180, 180, 180, 0.4)"
+		const todoBoxStyle: React.CSSProperties | undefined = todoGroupPos
+			? {
+					borderLeft: borderStyle,
+					borderRight: borderStyle,
+					...((todoGroupPos === "header" || todoGroupPos === "only") && {
+						borderTop: borderStyle,
+						borderTopLeftRadius: "6px",
+						borderTopRightRadius: "6px",
+					}),
+					...((todoGroupPos === "last" || todoGroupPos === "only") && {
+						borderBottom: borderStyle,
+						borderBottomLeftRadius: "6px",
+						borderBottomRightRadius: "6px",
+					}),
+				}
+			: undefined
+
+		const [chatrowInner, { height }] = useSize(
 			<div className="px-[15px] py-[10px] pr-[6px]">
 				<ChatRowContent {...props} />
 			</div>,
 		)
+
+		if (todoGroupPos) {
+			console.log(
+				"[TodoBox] ChatRow todoGroupPos:",
+				todoGroupPos,
+				"say:",
+				message.say,
+				"text:",
+				message.text?.slice(0, 50),
+			)
+		}
+
+		const chatrow = todoBoxStyle ? <div style={todoBoxStyle}>{chatrowInner}</div> : chatrowInner
 
 		useEffect(() => {
 			// used for partials, command output, etc.
@@ -1421,6 +1454,18 @@ export const ChatRowContent = ({
 					const { results = [] } = parsed?.content || {}
 
 					return <CodebaseSearchResultsDisplay results={results} />
+				case "todo_item_divider":
+					return (
+						<div
+							style={{
+								fontSize: "11px",
+								color: "var(--vscode-descriptionForeground)",
+								padding: "2px 0",
+								fontWeight: 500,
+							}}>
+							{message.text || ""}
+						</div>
+					)
 				case "user_edit_todos":
 					return <UpdateTodoListToolBlock userEdited onChange={() => {}} />
 				case "tool" as any:

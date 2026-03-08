@@ -2,7 +2,6 @@ import * as path from "path"
 import { Task } from "../task/Task"
 import { ClineMessage } from "@roo-code/types"
 import { ApiMessage } from "../task-persistence/apiMessages"
-import { cleanupAfterTruncation } from "../condense"
 import { OutputInterceptor } from "../../integrations/terminal/OutputInterceptor"
 import { getTaskDirectoryPath } from "../../utils/storage"
 
@@ -205,12 +204,7 @@ export class MessageManager {
 			})
 		}
 
-		// Step 5: Cleanup orphaned tags (unless skipped)
-		if (!skipCleanup) {
-			apiHistory = cleanupAfterTruncation(apiHistory)
-		}
-
-		// Step 6: Cleanup orphaned command output artifacts
+		// Step 5: Cleanup orphaned command output artifacts
 		// Collect timestamps from remaining messages to identify valid artifact IDs
 		// Artifacts whose IDs don't match any remaining message timestamp will be removed
 		if (!skipCleanup) {
