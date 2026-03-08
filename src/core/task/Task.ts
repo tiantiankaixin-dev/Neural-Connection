@@ -1995,6 +1995,34 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return undefined
 	}
 
+	/**
+	 * Returns the API handler to use for context condensation during todo list transitions.
+	 * If the user has selected a specific condensing model, builds a separate ApiHandler.
+	 * Otherwise falls back to the task's main API handler.
+	 */
+	public async getCondensingApiHandler(): Promise<ApiHandler> {
+		try {
+			const provider = this.providerRef.deref()
+			if (provider) {
+				const condensingBaseUrl = provider.contextProxy.getGlobalState("condensingBaseUrl")
+				const condensingModelId = provider.contextProxy.getGlobalState("condensingModelId")
+
+				if (condensingBaseUrl) {
+					return buildApiHandler({
+						apiProvider: "openai",
+						openAiApiKey: "none",
+						openAiBaseUrl: condensingBaseUrl,
+						openAiModelId: condensingModelId || undefined,
+					})
+				}
+			}
+		} catch (error) {
+			console.error("[Task] Failed to build condensing API handler:", error)
+		}
+		// Fallback to the task's main API handler
+		return this.api
+	}
+
 	public async submitUserMessage(
 		text: string,
 		images?: string[],

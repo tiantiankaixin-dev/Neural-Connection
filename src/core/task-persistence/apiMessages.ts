@@ -45,6 +45,9 @@ export type ApiMessage = Anthropic.MessageParam & {
 	// Rolling summaries accumulate: each new one incorporates the previous rolling summary + new messages.
 	// On task completion, a precise summary replaces the rolling summary.
 	isRollingSummary?: boolean
+	// Identifies a context summary generated during todo list transitions.
+	// Contains condensed context from the previous todo list's conversation to bootstrap the new task.
+	isContextSummary?: boolean
 }
 
 export async function readApiMessages({

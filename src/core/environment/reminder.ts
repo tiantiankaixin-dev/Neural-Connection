@@ -29,10 +29,19 @@ export function formatReminderSection(todoList?: TodoItem[]): string {
 	})
 	lines.push("")
 
-	lines.push(
-		"",
-		"IMPORTANT: When task status changes, remember to call the `update_todo_list` tool to update your progress.",
-		"",
-	)
+	const allCompleted = todoList.length > 0 && todoList.every((item) => item.status === "completed")
+	if (allCompleted) {
+		lines.push(
+			"",
+			"ALL TASKS COMPLETED: Every item in the todo list is marked as completed. If the user has given you a NEW request or follow-up instructions, call `update_todo_list` to create a new task list for it. Otherwise, call `attempt_completion` to present the final result to the user.",
+			"",
+		)
+	} else {
+		lines.push(
+			"",
+			"IMPORTANT: When task status changes, remember to call the `update_todo_list` tool to update your progress.",
+			"",
+		)
+	}
 	return lines.join("\n")
 }
