@@ -32,15 +32,11 @@ export interface TurnOutput {
 	todoItemContent?: string
 	modelId?: string
 	provider?: string
-	input: {
-		systemPrompt: string
-		messages: any[]
-		tools?: any[]
-		metadata?: Record<string, any>
-	}
 	output: {
 		assistantMessage: string
 		toolCalls: any[]
+		/** Tool execution results, appended after tools complete */
+		toolResults?: any[]
 	}
 }
 
@@ -71,6 +67,10 @@ export interface AssembledResult {
 			thinking?: TurnThinking
 		}[]
 	}[]
+	/** Context selection refs from summary/context/<timestamp>/context_refs.json, if available */
+	contextRefs?: any
+	/** Task summary from summary/task/<timestamp>/task_summary.json, if available */
+	taskSummary?: TaskSummary
 }
 
 /**
@@ -151,6 +151,29 @@ export async function saveTurnOutput(
 }
 
 /**
+ * Save tool execution results as a separate message in tools_消息N/ directory.
+ * Called after tools complete execution (post-presentAssistantMessage).
+ */
+export async function saveToolResultsOutput(
+	globalStoragePath: string,
+	taskId: string,
+	taskTimestamp: string,
+	turnNumber: number,
+	itemContent: string | undefined,
+	toolResults: any[],
+): Promise<void> {
+	const baseDir = await getTaskTurnsBaseDir(globalStoragePath, taskId, taskTimestamp)
+	const itemFolder = itemContent ? sanitizeFolderName(itemContent) : "_general"
+	const toolsFolder = path.join(baseDir, itemFolder, `tools_消息${turnNumber}`)
+	await fs.mkdir(toolsFolder, { recursive: true })
+	await safeWriteJson(path.join(toolsFolder, "output.json"), {
+		turnNumber,
+		timestamp: Date.now(),
+		toolResults,
+	})
+}
+
+/**
  * Save turn thinking/reasoning data to disk.
  * Creates: <项目名>/消息N/thinking.json
  * Only called when reasoning content exists.
@@ -164,6 +187,20 @@ export async function saveTurnThinking(
 ): Promise<void> {
 	const turnDir = await getTurnFolderPath(globalStoragePath, taskId, taskTimestamp, thinking.turnNumber, itemContent)
 	await safeWriteJson(path.join(turnDir, "thinking.json"), thinking)
+}
+
+/**
+ * Task summary saved by compressOnCompletion when AI calls attempt_completion.
+ * Contains the AI-compressed summary of ALL conversation messages.
+ */
+export interface TaskSummary {
+	createdAt: number
+	taskTimestamp: string
+	taskId: string
+	originalMessageCount: number
+	compressedSummary: string
+	turnCount: number
+	todoItems?: { content: string; status: string }[]
 }
 
 /**
@@ -239,6 +276,28 @@ export async function assembleTurns(
 		}
 	} catch {
 		// Task turns directory doesn't exist yet — return empty result
+	}
+
+	// Include data from summary folder if available
+	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+	const summaryBase = path.join(taskDir, "summary", "task", taskTimestamp)
+	// Check new summary/context/ path first, then fall back to old summary/task/ path
+	const contextRefsPath = path.join(taskDir, "summary", "context", taskTimestamp, "context_refs.json")
+	const legacyRefsPath = path.join(summaryBase, "context_refs.json")
+	for (const candidate of [contextRefsPath, legacyRefsPath]) {
+		try {
+			const refsContent = await fs.readFile(candidate, "utf8")
+			result.contextRefs = JSON.parse(refsContent)
+			break
+		} catch {
+			// Try next candidate
+		}
+	}
+	try {
+		const summaryContent = await fs.readFile(path.join(summaryBase, "task_summary.json"), "utf8")
+		result.taskSummary = JSON.parse(summaryContent) as TaskSummary
+	} catch {
+		// No task_summary.json — expected if task hasn't completed yet
 	}
 
 	// Save assembled result

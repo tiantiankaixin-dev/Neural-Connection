@@ -6,7 +6,7 @@ import cloneDeep from "clone-deep"
 import crypto from "crypto"
 import { TodoItem, TodoStatus, todoStatusSchema } from "@roo-code/types"
 import { getLatestTodo } from "../../shared/todo"
-import { generateTodoTransitionContext } from "../condense/todo-context-generator"
+import { loadContextSelectionForUI } from "../condense/context-selector"
 
 interface UpdateTodoListParams {
 	todos: string
@@ -86,6 +86,16 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				return item?.content
 			}
 
+			// Load context selection data for UI display (selection itself already happened in attemptApiRequest Phase 1)
+			let contextSelectionResult: import("../condense/context-selector").ContextSelectionResult | undefined
+			if (task.contextRefsPath) {
+				try {
+					contextSelectionResult = await loadContextSelectionForUI(task)
+				} catch (err) {
+					console.warn("[UpdateTodoList] Failed to load context refs for UI:", err)
+				}
+			}
+
 			const previousActiveContent = task.todoList ? getActiveContent(task.todoList) : undefined
 			const currentActiveContent = getActiveContent(normalizedTodos)
 			const currentActiveItem = normalizedTodos.find((t) => t.content === currentActiveContent)
@@ -93,25 +103,17 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 			if (currentActiveItem && currentActiveContent !== previousActiveContent) {
 				task.todoItemBoundaries.set(currentActiveItem.id, task.apiConversationHistory.length)
 
-				await task.say(
-					"todo_item_divider",
-					currentActiveItem.content,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					{ isNonInteractive: true },
-				)
-			}
+				const dividerText = contextSelectionResult
+					? JSON.stringify({
+							content: currentActiveItem.content,
+							summary: contextSelectionResult.summary,
+							turns: contextSelectionResult.turns,
+						})
+					: currentActiveItem.content
 
-			// Todo list transition: if old list exists, generate context summary before replacing
-			const hadPreviousTodoList = task.todoList && task.todoList.length > 0
-			if (hadPreviousTodoList) {
-				try {
-					await generateTodoTransitionContext(task, normalizedTodos)
-				} catch (err) {
-					console.warn("[UpdateTodoList] Context generation failed (non-critical):", err)
-				}
+				await task.say("todo_item_divider", dividerText, undefined, undefined, undefined, undefined, {
+					isNonInteractive: true,
+				})
 			}
 
 			await setTodoListForTask(task, normalizedTodos)
@@ -122,7 +124,7 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 			// Check if all todos are completed
 			const allCompleted = normalizedTodos.length > 0 && normalizedTodos.every((t) => t.status === "completed")
 			const completionHint = allCompleted
-				? "\n\nAll tasks are now completed. Please call attempt_completion to present the final result to the user."
+				? "\n\nAll tasks are now completed. If the user has given you a new request, call update_todo_list to create a new task list. Otherwise, call attempt_completion to present the final result."
 				: ""
 
 			if (isTodoListChanged) {

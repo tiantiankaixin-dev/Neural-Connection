@@ -110,6 +110,155 @@ function getPreviousTodos(messages: ClineMessage[], currentMessageTs: number): a
 	return []
 }
 
+// Parse todo_item_divider text: plain string or JSON { content, summary, turns }
+interface DividerTurn {
+	turnNumber: number
+	todoItemContent?: string
+	reason?: string
+	assistantMessage: string
+	toolNames: string[]
+}
+
+function parseDividerText(text?: string): { content: string; summary?: string; turns?: DividerTurn[] } {
+	if (!text) return { content: "" }
+	try {
+		const parsed = JSON.parse(text)
+		if (parsed && typeof parsed.content === "string") {
+			return { content: parsed.content, summary: parsed.summary, turns: parsed.turns }
+		}
+	} catch {
+		// not JSON, plain string
+	}
+	return { content: text }
+}
+
+function ExpandableTurnItem({ turn }: { turn: DividerTurn }) {
+	const [expanded, setExpanded] = useState(false)
+	const label = turn.todoItemContent ? `Turn ${turn.turnNumber} [${turn.todoItemContent}]` : `Turn ${turn.turnNumber}`
+
+	return (
+		<div style={{ marginTop: 2 }}>
+			<div
+				style={{
+					fontSize: "10px",
+					color: "var(--vscode-descriptionForeground)",
+					opacity: 0.85,
+					cursor: "pointer",
+					display: "flex",
+					alignItems: "center",
+					gap: "3px",
+					userSelect: "none",
+				}}
+				onClick={(e) => {
+					e.stopPropagation()
+					setExpanded(!expanded)
+				}}>
+				<span className={`codicon codicon-chevron-${expanded ? "down" : "right"}`} style={{ fontSize: 9 }} />
+				<span style={{ fontWeight: 500 }}>{label}</span>
+				{turn.reason && <span style={{ opacity: 0.6, marginLeft: 4 }}>— {turn.reason}</span>}
+			</div>
+			{expanded && (
+				<div
+					style={{
+						fontSize: "11px",
+						color: "var(--vscode-descriptionForeground)",
+						opacity: 0.7,
+						marginTop: 3,
+						marginLeft: 12,
+						padding: "6px 8px",
+						background: "var(--vscode-textBlockQuote-background)",
+						borderRadius: 4,
+						whiteSpace: "pre-wrap",
+						lineHeight: 1.4,
+						maxHeight: "60vh",
+						overflowY: "auto",
+					}}>
+					{turn.assistantMessage || "(empty)"}
+					{turn.toolNames.length > 0 && (
+						<div style={{ marginTop: 4, opacity: 0.6, fontSize: "10px" }}>
+							Tools: {turn.toolNames.join(", ")}
+						</div>
+					)}
+				</div>
+			)}
+		</div>
+	)
+}
+
+function TodoItemDividerRow({
+	message,
+	dividerTs,
+	isGroupCollapsed,
+	onToggleTodoGroup,
+}: {
+	message: ClineMessage
+	dividerTs?: number
+	isGroupCollapsed?: boolean
+	onToggleTodoGroup?: (ts: number) => void
+}) {
+	const [refsExpanded, setRefsExpanded] = useState(false)
+	const { content, turns } = parseDividerText(message.text)
+	const hasTurns = turns && turns.length > 0
+
+	return (
+		<div>
+			<div
+				style={{
+					fontSize: "11px",
+					color: "var(--vscode-descriptionForeground)",
+					padding: "2px 0",
+					fontWeight: 500,
+					cursor: dividerTs ? "pointer" : "default",
+					display: "flex",
+					alignItems: "center",
+					gap: "4px",
+					userSelect: "none",
+				}}
+				onClick={() => dividerTs && onToggleTodoGroup?.(dividerTs)}>
+				{dividerTs && (
+					<span
+						className={`codicon codicon-chevron-${isGroupCollapsed ? "right" : "down"}`}
+						style={{ fontSize: 10 }}
+					/>
+				)}
+				{content}
+			</div>
+			{hasTurns && (
+				<div style={{ marginLeft: 14, marginTop: 2 }}>
+					<div
+						style={{
+							fontSize: "10px",
+							color: "var(--vscode-descriptionForeground)",
+							opacity: 0.8,
+							cursor: "pointer",
+							display: "flex",
+							alignItems: "center",
+							gap: "3px",
+							userSelect: "none",
+						}}
+						onClick={(e) => {
+							e.stopPropagation()
+							setRefsExpanded(!refsExpanded)
+						}}>
+						<span
+							className={`codicon codicon-chevron-${refsExpanded ? "down" : "right"}`}
+							style={{ fontSize: 9 }}
+						/>
+						{`已引用 ${turns.length} 条历史消息`}
+					</div>
+					{refsExpanded && (
+						<div style={{ marginLeft: 4, marginTop: 2 }}>
+							{turns.map((turn, idx) => (
+								<ExpandableTurnItem key={idx} turn={turn} />
+							))}
+						</div>
+					)}
+				</div>
+			)}
+		</div>
+	)
+}
+
 interface ChatRowProps {
 	message: ClineMessage
 	lastModifiedMessage?: ClineMessage
@@ -1450,27 +1599,12 @@ export const ChatRowContent = ({
 					const dividerTs = (message as any)._todoGroupDividerTs as number | undefined
 					const isGroupCollapsed = (message as any)._todoGroupCollapsed as boolean | undefined
 					return (
-						<div
-							style={{
-								fontSize: "11px",
-								color: "var(--vscode-descriptionForeground)",
-								padding: "2px 0",
-								fontWeight: 500,
-								cursor: dividerTs ? "pointer" : "default",
-								display: "flex",
-								alignItems: "center",
-								gap: "4px",
-								userSelect: "none",
-							}}
-							onClick={() => dividerTs && onToggleTodoGroup?.(dividerTs)}>
-							{dividerTs && (
-								<span
-									className={`codicon codicon-chevron-${isGroupCollapsed ? "right" : "down"}`}
-									style={{ fontSize: 10 }}
-								/>
-							)}
-							{message.text || ""}
-						</div>
+						<TodoItemDividerRow
+							message={message}
+							dividerTs={dividerTs}
+							isGroupCollapsed={isGroupCollapsed}
+							onToggleTodoGroup={onToggleTodoGroup}
+						/>
 					)
 				}
 				case "user_edit_todos":

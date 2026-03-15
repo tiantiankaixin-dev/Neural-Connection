@@ -1,5 +1,6 @@
 import * as path from "path"
 import * as vscode from "vscode"
+import * as fs from "fs/promises"
 import os from "os"
 import crypto from "crypto"
 import { v7 as uuidv7 } from "uuid"
@@ -138,9 +139,11 @@ import {
 	type TurnThinking,
 	saveTurnOutput,
 	saveTurnThinking,
+	saveToolResultsOutput,
 	assembleTurns,
 	generateTaskTimestamp,
 } from "../task-persistence/turn-persistence"
+import { compressInTaskContext, executeTransitionSelection, injectContextBlocks } from "../condense/context-selector"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -346,15 +349,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	discoveredTools: Set<string> = new Set()
 	// Task lock: tools are parameter-stripped until model establishes a task via update_todo_list
 	taskEstablished: boolean = false
+	// Set when attempt_completion finishes (or is interrupted) so the next update_todo_list compresses old context
+	needsContextCompression: boolean = false
+	// Path to context_refs.json — set after context selection, used during context building
+	contextRefsPath?: string
 
-	// Per-turn persistence: save each LLM call's full I/O and thinking to separate files
+	// Per-turn persistence: save each LLM call's output and thinking to separate files
 	turnCounter: number = 0
 	taskTimestamp?: string
 	lastTurnApiInput?: {
-		systemPrompt: string
-		messages: any[]
-		tools?: any[]
-		metadata?: Record<string, any>
 		modelId?: string
 		provider?: string
 	}
@@ -1273,7 +1276,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				todoItemContent: itemContent,
 				modelId: this.lastTurnApiInput?.modelId,
 				provider: this.lastTurnApiInput?.provider,
-				input: this.lastTurnApiInput || { systemPrompt: "", messages: [] },
 				output: {
 					assistantMessage: assistantText,
 					toolCalls: assistantContent.filter((b: any) => b.type === "tool_use"),
@@ -2323,6 +2325,15 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			// Generate timestamp-based folder name for per-turn persistence
 			this.taskTimestamp = generateTaskTimestamp()
 
+			// Create summary folder structure proactively
+			try {
+				const taskDir = await getTaskDirectoryPath(this.globalStoragePath, this.taskId)
+				const summaryDir = path.join(taskDir, "summary", "task", this.taskTimestamp)
+				await fs.mkdir(summaryDir, { recursive: true })
+			} catch (err) {
+				console.warn("[Task] Failed to create summary directory (non-critical):", err)
+			}
+
 			const imageBlocks: Anthropic.ImageBlockParam[] = formatResponse.imageBlocks(images)
 
 			// Task starting
@@ -2417,6 +2428,48 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			this.taskTimestamp = generateTaskTimestamp()
 		}
 
+		// Create summary folder structure proactively and restore contextRefsPath if exists
+		try {
+			const taskDir = await getTaskDirectoryPath(this.globalStoragePath, this.taskId)
+			const summaryDir = path.join(taskDir, "summary", "task", this.taskTimestamp)
+			await fs.mkdir(summaryDir, { recursive: true })
+
+			// Restore contextRefsPath from disk (check paths in priority order)
+			if (!this.contextRefsPath) {
+				const contextDir = path.join(taskDir, "summary", "context", this.taskTimestamp, "context_refs.json")
+				const oldSummaryPath = path.join(summaryDir, "context_refs.json")
+				const legacyPath = path.join(taskDir, "task", this.taskTimestamp, "context_refs.json")
+				for (const candidate of [contextDir, oldSummaryPath, legacyPath]) {
+					try {
+						await fs.access(candidate)
+						this.contextRefsPath = candidate
+						break
+					} catch {
+						// Try next candidate
+					}
+				}
+			}
+		} catch (err) {
+			console.warn("[Task] Failed to create summary directory (non-critical):", err)
+		}
+
+		// Restore needsContextCompression: if history starts with a compressOnCompletion summary pair
+		// but no context_refs.json exists, the flag was lost on reload — re-set it.
+		if (!this.contextRefsPath && this.apiConversationHistory.length >= 2) {
+			const firstMsg = this.apiConversationHistory[0]
+			if (firstMsg?.isSummary && firstMsg.role === "user") {
+				const textContent = Array.isArray(firstMsg.content)
+					? (firstMsg.content.find((b: any) => b.type === "text") as any)?.text || ""
+					: String(firstMsg.content)
+				if (textContent.includes('<context_summary source="task_completion">')) {
+					this.needsContextCompression = true
+					console.log(
+						"[Task.resumeTask] Detected compressed summary without context_refs — setting needsContextCompression=true",
+					)
+				}
+			}
+		}
+
 		const lastClineMessage = this.clineMessages
 			.slice()
 			.reverse()
@@ -2469,6 +2522,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					const toolUseBlocks = content.filter(
 						(block) => block.type === "tool_use",
 					) as Anthropic.Messages.ToolUseBlock[]
+
+					// If attempt_completion was interrupted, perform the same cleanup
+					// that would have happened in AttemptCompletionTool.execute
+					const hadAttemptCompletion = toolUseBlocks.some((block) => block.name === "attempt_completion")
+					if (hadAttemptCompletion) {
+						this.todoList = []
+						this.taskEstablished = false
+						this.needsContextCompression = true
+					}
+
 					const toolResponses: Anthropic.ToolResultBlockParam[] = toolUseBlocks.map((block) => ({
 						type: "tool_result",
 						tool_use_id: block.id,
@@ -2510,6 +2573,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 								tool_use_id: toolUse.id,
 								content: "Task was interrupted before this tool call could be completed.",
 							}))
+
+						// If attempt_completion was interrupted, perform cleanup
+						if (missingToolResponses.length > 0) {
+							const hadAttemptCompletion = toolUseBlocks.some(
+								(block) => block.name === "attempt_completion",
+							)
+							if (hadAttemptCompletion) {
+								this.todoList = []
+								this.taskEstablished = false
+								this.needsContextCompression = true
+							}
+						}
 
 						modifiedApiConversationHistory = existingApiConversationHistory.slice(0, -1) // removes the last user message
 						modifiedOldUserContent = [...existingUserContent, ...missingToolResponses]
@@ -3846,6 +3921,28 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					await pWaitFor(() => this.userMessageContentReady)
 
+					// Per-turn persistence: save tool results as separate tools_消息N/output.json
+					try {
+						const toolResultBlocks = this.userMessageContent.filter(
+							(block: any) => block.type === "tool_result",
+						)
+						if (toolResultBlocks.length > 0) {
+							const currentItem =
+								this.todoList?.find((t) => t.status === "in_progress") ||
+								this.todoList?.find((t) => t.status === "pending")
+							await saveToolResultsOutput(
+								this.globalStoragePath,
+								this.taskId,
+								this.taskTimestamp || generateTaskTimestamp(),
+								this.turnCounter,
+								currentItem?.content,
+								toolResultBlocks,
+							)
+						}
+					} catch (err) {
+						console.warn("[Task] saveToolResultsOutput failed (non-critical):", err)
+					}
+
 					// If the model did not tool use, then we need to tell it to
 					// either use a tool or attempt_completion.
 					const didToolUse = this.assistantMessageContent.some(
@@ -4144,6 +4241,39 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		const systemPrompt = await this.getSystemPrompt()
 
+		// Phase 1: Cross-task transition selection (one-time, when needsContextCompression is set)
+		console.log(
+			`[attemptApiRequest] Phase 1 check: needsContextCompression=${this.needsContextCompression}, taskTimestamp=${this.taskTimestamp}, contextRefsPath=${this.contextRefsPath}`,
+		)
+		if (this.needsContextCompression) {
+			try {
+				await executeTransitionSelection(this)
+				console.log(
+					`[attemptApiRequest] Phase 1: Transition selection completed, contextRefsPath=${this.contextRefsPath}`,
+				)
+			} catch (err) {
+				console.warn("[attemptApiRequest] Phase 1: Transition selection failed (non-critical):", err)
+			}
+			this.needsContextCompression = false
+		}
+
+		// Phase 2: Dynamic context block injection (every API call)
+		try {
+			await injectContextBlocks(this)
+		} catch (err) {
+			console.warn("[attemptApiRequest] Phase 2: Context block injection failed (non-critical):", err)
+		}
+
+		// Phase 3: Safety net — token overflow compression
+		try {
+			const compressed = await compressInTaskContext(this)
+			if (compressed) {
+				console.log("[attemptApiRequest] Phase 3: In-task context compression applied")
+			}
+		} catch (err) {
+			console.warn("[attemptApiRequest] Phase 3: In-task compression failed (non-critical):", err)
+		}
+
 		// Full history pipeline: apply context stripping, merge consecutive same-role messages, then clean for API submission.
 		const effectiveHistory = this.buildEffectiveHistory()
 		const mergedMessages = mergeConsecutiveApiMessages(effectiveHistory)
@@ -4241,12 +4371,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			})
 		}
 
-		// Capture turn input for per-turn persistence
+		// Capture turn metadata for per-turn persistence (only modelId/provider, not full context)
 		this.lastTurnApiInput = {
-			systemPrompt,
-			messages: cleanConversationHistory as any[],
-			tools: allTools,
-			metadata,
 			modelId: this.api.getModel().id,
 			provider: this.apiConfiguration?.apiProvider,
 		}

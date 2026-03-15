@@ -48,6 +48,9 @@ export type ApiMessage = Anthropic.MessageParam & {
 	// Identifies a context summary generated during todo list transitions.
 	// Contains condensed context from the previous todo list's conversation to bootstrap the new task.
 	isContextSummary?: boolean
+	// Identifies a dynamically injected context block from context_refs.json.
+	// These messages are managed by injectContextBlocks and may be added/removed each API call.
+	isContextBlock?: boolean
 }
 
 export async function readApiMessages({

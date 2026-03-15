@@ -189,11 +189,11 @@ function findPreserveBoundary(messages: ApiMessage[]): number {
  * @param task - The current Task instance
  * @param newTodos - The new todo list items
  */
-export async function generateTodoTransitionContext(task: Task, newTodos: TodoItem[]): Promise<void> {
+export async function generateTodoTransitionContext(task: Task, newTodos: TodoItem[]): Promise<string | undefined> {
 	const allMessages = task.apiConversationHistory
 	if (!allMessages || allMessages.length === 0) {
 		console.log("[TodoContextGen] No old messages to summarize, skipping")
-		return
+		return undefined
 	}
 
 	// Find boundary: preserve messages from the current request onward
@@ -203,7 +203,7 @@ export async function generateTodoTransitionContext(task: Task, newTodos: TodoIt
 
 	if (messagesToCompress.length === 0) {
 		console.log("[TodoContextGen] No old messages to compress (all belong to current request), skipping")
-		return
+		return undefined
 	}
 
 	console.log(
@@ -325,4 +325,6 @@ export async function generateTodoTransitionContext(task: Task, newTodos: TodoIt
 	task.todoItemBoundaries.clear()
 
 	console.log(`[TodoContextGen] Context generated: ${finalSummary.length} chars from ${batches.length} batch(es)`)
+
+	return finalSummary
 }

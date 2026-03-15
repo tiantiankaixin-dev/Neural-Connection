@@ -11,6 +11,8 @@ import { t } from "../../i18n"
 
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import { assembleTurns } from "../task-persistence/turn-persistence"
+import { setTodoListForTask } from "./UpdateTodoListTool"
+import { compressOnCompletion } from "../condense/context-selector"
 
 interface AttemptCompletionParams {
 	result: string
@@ -69,6 +71,17 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 
 			await task.say("completion_result", result, undefined, false)
 
+			// Compress ALL conversation messages into a summary.
+			// Uses the same compression mechanism as compressInTaskContext (Phase 3 safety net),
+			// but runs unconditionally at task completion.
+			// Result: apiConversationHistory is replaced with [summary pair].
+			// Summary is also saved to summary/task/<timestamp>/task_summary.json.
+			try {
+				await compressOnCompletion(task)
+			} catch (err) {
+				console.warn("[AttemptCompletionTool] compressOnCompletion failed (non-critical):", err)
+			}
+
 			// Force final token usage update before emitting TaskCompleted
 			task.emitFinalTokenUsageUpdate()
 
@@ -81,8 +94,8 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 				// Task accepted — mark boundary and continue in same conversation
 				await task.say("task_completed", result)
 
-				// Assemble all per-turn files into a final result JSON (non-critical)
-				if (task.taskTimestamp && task.turnCounter > 0) {
+				// Assemble all per-turn files (including context_refs.json) into a final result JSON
+				if (task.taskTimestamp) {
 					try {
 						await assembleTurns(task.globalStoragePath, task.taskId, task.taskTimestamp)
 					} catch (err) {
@@ -92,8 +105,15 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 
 				// Mark task boundary: next messages belong to a new sub-task
 				task.currentTaskStartIndex = task.apiConversationHistory.length
+				// Clear todo list so next turn doesn't see stale "ALL TASKS COMPLETED"
+				await setTodoListForTask(task, [])
 				// Reset task lock so model must re-establish task for next work
 				task.taskEstablished = false
+				// Flag for attemptApiRequest to do history replacement on next call
+				task.needsContextCompression = true
+				console.log(
+					`[AttemptCompletionTool] yesButtonClicked: needsContextCompression=${task.needsContextCompression}, taskTimestamp=${task.taskTimestamp}`,
+				)
 
 				pushToolResult("Task marked as complete. Awaiting user's next instruction.")
 				return
@@ -102,8 +122,15 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 			// User provided feedback - push tool result to continue the conversation
 			await task.say("user_feedback", text ?? "", images)
 
+			// Clear todo list so next turn doesn't see stale "ALL TASKS COMPLETED"
+			await setTodoListForTask(task, [])
 			// Task lock: re-lock tools after completion feedback so model must re-establish task
 			task.taskEstablished = false
+			// Flag for attemptApiRequest to do history replacement on next call
+			task.needsContextCompression = true
+			console.log(
+				`[AttemptCompletionTool] userFeedback: needsContextCompression=${task.needsContextCompression}, taskTimestamp=${task.taskTimestamp}`,
+			)
 
 			const feedbackText = `<user_message>\n${text}\n</user_message>`
 			pushToolResult(formatResponse.toolResult(feedbackText, images))

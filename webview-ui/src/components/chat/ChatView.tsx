@@ -1386,7 +1386,19 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		const hiddenIndices = new Set<number>()
 		for (let d = 0; d < dividerIndices.length; d++) {
 			const startIdx = dividerIndices[d]
-			const endIdx = d + 1 < dividerIndices.length ? dividerIndices[d + 1] : result.length
+			let endIdx = d + 1 < dividerIndices.length ? dividerIndices[d + 1] : result.length
+			// Completion events terminate the todo group — messages after should not be grouped
+			for (let i = startIdx + 1; i < endIdx; i++) {
+				if (
+					result[i].say === "task_completed" ||
+					result[i].say === "user_feedback" ||
+					result[i].say === "completion_result" ||
+					result[i].ask === "completion_result"
+				) {
+					endIdx = i + 1
+					break
+				}
+			}
 			const dividerTs = result[startIdx].ts
 			const isCollapsed = collapsedTodoGroups.has(dividerTs)
 

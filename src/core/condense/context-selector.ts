@@ -1,0 +1,1521 @@
+/**
+ * Context Selector
+ *
+ * When transitioning between tasks (new todo list created after a previous task completed),
+ * this module uses the selection model to decide which previous turns are relevant to the
+ * new task. Instead of compressing everything into a text summary, it preserves the original
+ * turn data (output.json files) and creates a reference file (context_refs.json) pointing
+ * to the selected turns.
+ *
+ * Flow:
+ * 1. Scan per-turn output files from the previous task's timestamp directory
+ * 2. Build compact summaries of each turn (assistant response + tool calls)
+ * 3. Send summaries + new todo list to the selection model in batches
+ * 4. Model returns which turns are relevant
+ * 5. Save selected turn paths to context_refs.json
+ *
+ * Loading:
+ * 1. Read context_refs.json
+ * 2. Load referenced output.json files
+ * 3. Format as <previous_context> blocks for injection into conversation history
+ */
+
+import * as fs from "fs/promises"
+import * as path from "path"
+
+import Anthropic from "@anthropic-ai/sdk"
+
+import { ApiHandler } from "../../api"
+import { tiktoken } from "../../utils/tiktoken"
+import { getTaskDirectoryPath } from "../../utils/storage"
+import type { TurnOutput } from "../task-persistence/turn-persistence"
+import type { Task } from "../task/Task"
+import type { TodoItem } from "@roo-code/types"
+import type { ApiMessage } from "../task-persistence/apiMessages"
+
+// Reserve tokens for: system prompt + todo list + output buffer
+const RESERVED_TOKENS = 3000
+// Fallback context window size
+const DEFAULT_CONTEXT_WINDOW = 32_000
+// Max chars of assistant message to include in compact summary sent to selection model
+const SUMMARY_PREVIEW_CHARS = 600
+
+const CONTEXT_REFS_FILENAME = "context_refs.json"
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+export interface ContextRef {
+	/** Relative path from task base dir to the output.json file */
+	relativePath: string
+	/** Turn number from the output.json */
+	turnNumber: number
+	/** Todo item this turn was working on */
+	todoItemContent?: string
+	/** Model's reason for selecting this turn */
+	reason?: string
+}
+
+export interface ContextRefsFile {
+	createdAt: number
+	taskTimestamp: string
+	newTodoItems: string[]
+	selectedTurns: ContextRef[]
+}
+
+/** Detailed turn data for UI display (passed to todo_item_divider) */
+export interface DetailedTurn {
+	turnNumber: number
+	todoItemContent?: string
+	reason?: string
+	/** Full assistant message text */
+	assistantMessage: string
+	/** Tool names called */
+	toolNames: string[]
+}
+
+export interface ContextSelectionResult {
+	/** Display-friendly summary text */
+	summary: string
+	/** Detailed turn data for expandable UI */
+	turns: DetailedTurn[]
+}
+
+/** A single context block loaded from a selected turn. Each block is independent and can be individually included/excluded by the knapsack fitter. */
+export interface ContextBlock {
+	/** Reference info from context_refs.json */
+	ref: ContextRef
+	/** Independent user+assistant message pair for this turn */
+	messages: ApiMessage[]
+	/** Token count for this block's messages */
+	tokenCount: number
+}
+
+interface TurnSummary {
+	turnNumber: number
+	todoItemContent?: string
+	/** Compact preview of assistant response */
+	assistantPreview: string
+	/** Tool names called in this turn */
+	toolNames: string[]
+	/** Full relative path to the output.json */
+	relativePath: string
+	/** Token count for this summary entry */
+	tokenCount?: number
+}
+
+// ── Selection Model Prompt ────────────────────────────────────────────────
+
+const SELECTION_SYSTEM_PROMPT = `你是一个上下文选择助手。你会收到一系列之前任务的消息摘要和一个新的任务列表。
+你的工作是判断哪些消息与新任务相关，应该被保留作为上下文。
+
+选择标准：
+- 与新任务直接相关的代码修改、文件路径、架构决策
+- 项目结构和配置信息
+- 遇到过的问题和解决方案（如果与新任务相关）
+- 关键的技术决策和设计模式
+
+不要选择：
+- 纯粹的调试信息（除非与新任务相关）
+- 重复的消息（选择最终版本即可）
+- 与新任务无关的操作
+
+输出格式：JSON 数组，包含你选择保留的消息编号和原因。
+示例：
+[
+  {"turn": 3, "reason": "包含项目架构设计决策"},
+  {"turn": 7, "reason": "修改了与新任务相关的核心文件"}
+]
+
+只输出 JSON 数组，不要其他文字。`
+
+// ── Scanning ──────────────────────────────────────────────────────────────
+
+/**
+ * Scan the task's turn directory for all output.json files.
+ * Returns TurnSummary objects with compact previews for the selection model.
+ */
+async function scanTurnFiles(globalStoragePath: string, taskId: string, taskTimestamp: string): Promise<TurnSummary[]> {
+	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+	const taskBaseDir = path.join(taskDir, "task")
+
+	// Discover which timestamp folders to scan.
+	// Primary: the specified taskTimestamp. Fallback: scan ALL timestamp folders
+	// (handles case where taskTimestamp was regenerated on resume and doesn't match turn files).
+	let timestampsToScan: string[] = [taskTimestamp]
+	try {
+		const primaryDir = path.join(taskBaseDir, taskTimestamp)
+		const primaryEntries = await fs.readdir(primaryDir)
+		const hasTurnDirs = primaryEntries.some((e) => !e.endsWith(".json"))
+		if (!hasTurnDirs) {
+			// Primary timestamp has no turn data — scan all timestamps
+			const allTimestamps = await fs.readdir(taskBaseDir)
+			timestampsToScan = allTimestamps.filter((d) => /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$/.test(d))
+			console.log(
+				`[scanTurnFiles] Primary timestamp ${taskTimestamp} empty, scanning all: ${timestampsToScan.join(", ")}`,
+			)
+		}
+	} catch {
+		// Primary dir doesn't exist — scan all timestamps
+		try {
+			const allTimestamps = await fs.readdir(taskBaseDir)
+			timestampsToScan = allTimestamps.filter((d) => /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$/.test(d))
+			console.log(
+				`[scanTurnFiles] Primary timestamp ${taskTimestamp} not found, scanning all: ${timestampsToScan.join(", ")}`,
+			)
+		} catch {
+			return []
+		}
+	}
+
+	const summaries: TurnSummary[] = []
+
+	for (const ts of timestampsToScan) {
+		const baseDir = path.join(taskBaseDir, ts)
+		try {
+			const itemDirs = await fs.readdir(baseDir)
+
+			for (const itemDir of itemDirs) {
+				if (!itemDir || itemDir.endsWith(".json")) continue
+
+				const itemPath = path.join(baseDir, itemDir)
+				const stat = await fs.stat(itemPath)
+				if (!stat.isDirectory()) continue
+
+				// List turn folders (消息1, 消息2, ...)
+				const turnDirs = await fs.readdir(itemPath)
+				const messageDirs = turnDirs
+					.filter((d) => /^消息\d+$/.test(d))
+					.sort((a, b) => {
+						const numA = parseInt(a.replace("消息", ""), 10)
+						const numB = parseInt(b.replace("消息", ""), 10)
+						return numA - numB
+					})
+
+				for (const msgDir of messageDirs) {
+					const outputPath = path.join(itemPath, msgDir, "output.json")
+					// Include timestamp in relativePath so loadContextBlocks can find the file
+					const relativePath = path.join(ts, itemDir, msgDir, "output.json")
+
+					try {
+						const content = await fs.readFile(outputPath, "utf8")
+						const turnOutput = JSON.parse(content) as TurnOutput
+
+						// Build compact summary
+						const assistantMsg = turnOutput.output?.assistantMessage || ""
+						const toolCalls = turnOutput.output?.toolCalls || []
+						const toolNames = toolCalls.map((tc: any) => tc.name || "unknown")
+
+						summaries.push({
+							turnNumber: turnOutput.turnNumber,
+							todoItemContent: turnOutput.todoItemContent,
+							assistantPreview: assistantMsg.substring(0, SUMMARY_PREVIEW_CHARS),
+							toolNames,
+							relativePath,
+						})
+					} catch {
+						// Skip unreadable files
+					}
+				}
+			}
+		} catch {
+			// Timestamp directory doesn't exist or can't be read
+		}
+	}
+
+	// Sort by turn number
+	summaries.sort((a, b) => a.turnNumber - b.turnNumber)
+
+	return summaries
+}
+
+// ── Formatting ────────────────────────────────────────────────────────────
+
+/**
+ * Format a turn summary for the selection model prompt.
+ */
+function formatTurnSummary(summary: TurnSummary): string {
+	const lines: string[] = []
+	lines.push(`Turn ${summary.turnNumber}${summary.todoItemContent ? ` [项目: ${summary.todoItemContent}]` : ""}:`)
+	if (summary.assistantPreview) {
+		lines.push(
+			`  Response: ${summary.assistantPreview}${summary.assistantPreview.length >= SUMMARY_PREVIEW_CHARS ? "..." : ""}`,
+		)
+	}
+	if (summary.toolNames.length > 0) {
+		lines.push(`  Tools: ${summary.toolNames.join(", ")}`)
+	}
+	return lines.join("\n")
+}
+
+/**
+ * Format the new todo list for the selection prompt.
+ */
+function formatNewTodoList(todos: TodoItem[]): string {
+	return todos
+		.map((t) => {
+			let box = "[ ]"
+			if (t.status === "completed") box = "[x]"
+			else if (t.status === "in_progress") box = "[-]"
+			return `${box} ${t.content}`
+		})
+		.join("\n")
+}
+
+// ── Selection ─────────────────────────────────────────────────────────────
+
+/**
+ * Count tokens for a text string.
+ */
+async function countTextTokens(text: string): Promise<number> {
+	return tiktoken([{ type: "text", text }])
+}
+
+/**
+ * Pack turn summaries into batches that fit within the model's context window.
+ */
+async function packSummariesIntoBatches(summaries: TurnSummary[], capacity: number): Promise<TurnSummary[][]> {
+	// Count tokens for each summary
+	for (const summary of summaries) {
+		const text = formatTurnSummary(summary)
+		summary.tokenCount = await countTextTokens(text)
+	}
+
+	const batches: TurnSummary[][] = []
+	let currentBatch: TurnSummary[] = []
+	let currentSize = 0
+
+	for (const summary of summaries) {
+		const tokens = summary.tokenCount || 0
+
+		if (currentSize + tokens > capacity && currentBatch.length > 0) {
+			batches.push(currentBatch)
+			currentBatch = []
+			currentSize = 0
+		}
+
+		currentBatch.push(summary)
+		currentSize += tokens
+	}
+
+	if (currentBatch.length > 0) {
+		batches.push(currentBatch)
+	}
+
+	return batches
+}
+
+/**
+ * Call the selection model to pick relevant turns from a batch.
+ */
+async function callSelectionModel(apiHandler: ApiHandler, systemPrompt: string, userMessage: string): Promise<string> {
+	const messages: Anthropic.Messages.MessageParam[] = [{ role: "user", content: userMessage }]
+
+	let result = ""
+	const stream = apiHandler.createMessage(systemPrompt, messages)
+
+	for await (const chunk of stream) {
+		if (chunk.type === "text") {
+			result += chunk.text
+		}
+	}
+
+	return result.trim()
+}
+
+/**
+ * Parse the selection model's response to extract selected turn numbers.
+ */
+function parseSelectionResponse(response: string): { turn: number; reason?: string }[] {
+	// Try to extract JSON array from the response
+	const jsonMatch = response.match(/\[[\s\S]*\]/)
+	if (!jsonMatch) return []
+
+	try {
+		const parsed = JSON.parse(jsonMatch[0])
+		if (!Array.isArray(parsed)) return []
+
+		return parsed
+			.filter((item: any) => typeof item.turn === "number")
+			.map((item: any) => ({
+				turn: item.turn,
+				reason: item.reason,
+			}))
+	} catch {
+		return []
+	}
+}
+
+// ── Main Entry Points ─────────────────────────────────────────────────────
+
+/**
+ * Select relevant turns from the previous task and save references.
+ *
+ * Called during todo list transition (update_todo_list with shouldCompress=true).
+ * Replaces the old generateTodoTransitionContext approach.
+ *
+ * @returns The context refs file content, or undefined if no turns were found/selected
+ */
+export async function selectAndSaveContextRefs(task: Task, newTodos: TodoItem[]): Promise<ContextRefsFile | undefined> {
+	const taskTimestamp = task.taskTimestamp
+	if (!taskTimestamp) {
+		console.log("[ContextSelector] No taskTimestamp, skipping selection")
+		return undefined
+	}
+
+	// 1. Scan turn files
+	const summaries = await scanTurnFiles(task.globalStoragePath, task.taskId, taskTimestamp)
+	if (summaries.length === 0) {
+		console.log("[ContextSelector] No turn files found, skipping selection")
+		return undefined
+	}
+
+	console.log(`[ContextSelector] Found ${summaries.length} turns to evaluate`)
+
+	// 2. Get selection model
+	const apiHandler = await task.getCondensingApiHandler()
+	const modelInfo = apiHandler.getModel().info
+	const contextWindow = modelInfo?.contextWindow || DEFAULT_CONTEXT_WINDOW
+	const capacity = contextWindow - RESERVED_TOKENS
+
+	// 3. Pack summaries into batches
+	const batches = await packSummariesIntoBatches(summaries, capacity)
+	console.log(`[ContextSelector] Packed into ${batches.length} batch(es)`)
+
+	// 4. Send each batch to selection model
+	const allSelections: { turn: number; reason?: string }[] = []
+	const todoListText = formatNewTodoList(newTodos)
+
+	for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+		const batch = batches[batchIdx]
+		const summaryTexts = batch.map(formatTurnSummary).join("\n\n")
+
+		const userMessage = `以下是之前任务的消息列表：
+
+${summaryTexts}
+
+新的任务列表：
+${todoListText}
+
+请选择哪些消息与新任务相关，应该被保留作为上下文。`
+
+		try {
+			const response = await callSelectionModel(apiHandler, SELECTION_SYSTEM_PROMPT, userMessage)
+			const selections = parseSelectionResponse(response)
+			allSelections.push(...selections)
+			console.log(`[ContextSelector] Batch ${batchIdx + 1}: selected ${selections.length} turns`)
+		} catch (err) {
+			console.warn(`[ContextSelector] Batch ${batchIdx + 1} failed:`, err)
+		}
+	}
+
+	if (allSelections.length === 0) {
+		console.log("[ContextSelector] No turns selected by model")
+		return undefined
+	}
+
+	// 5. Build context refs
+	const selectedTurns: ContextRef[] = []
+	for (const selection of allSelections) {
+		const summary = summaries.find((s) => s.turnNumber === selection.turn)
+		if (summary) {
+			selectedTurns.push({
+				relativePath: summary.relativePath,
+				turnNumber: summary.turnNumber,
+				todoItemContent: summary.todoItemContent,
+				reason: selection.reason,
+			})
+		}
+	}
+
+	const contextRefs: ContextRefsFile = {
+		createdAt: Date.now(),
+		taskTimestamp,
+		newTodoItems: newTodos.map((t) => t.content),
+		selectedTurns,
+	}
+
+	// 6. Save context_refs.json to summary/context/<timestamp>/
+	const taskDir = await getTaskDirectoryPath(task.globalStoragePath, task.taskId)
+	const contextDir = path.join(taskDir, "summary", "context", taskTimestamp)
+	await fs.mkdir(contextDir, { recursive: true })
+	const refsPath = path.join(contextDir, CONTEXT_REFS_FILENAME)
+	await fs.writeFile(refsPath, JSON.stringify(contextRefs, null, 2), "utf8")
+
+	console.log(`[ContextSelector] Saved ${selectedTurns.length} turn references to ${refsPath}`)
+
+	// Store the refs path on the task for easy access during context building
+	task.contextRefsPath = refsPath
+
+	return contextRefs
+}
+
+/**
+ * Load context refs and build context messages for injection into conversation history.
+ *
+ * Called during attemptApiRequest to prepend relevant previous context.
+ *
+ * @returns Array of ApiMessages to prepend, or empty array if no refs exist
+ */
+export async function loadContextAsMessages(task: Task): Promise<ApiMessage[]> {
+	if (!task.contextRefsPath) {
+		return []
+	}
+
+	let refsFile: ContextRefsFile
+	try {
+		const content = await fs.readFile(task.contextRefsPath, "utf8")
+		refsFile = JSON.parse(content) as ContextRefsFile
+	} catch {
+		return []
+	}
+
+	if (!refsFile.selectedTurns || refsFile.selectedTurns.length === 0) {
+		return []
+	}
+
+	// Load each referenced output.json and extract the assistant's response
+	const taskDir = await getTaskDirectoryPath(task.globalStoragePath, task.taskId)
+	// relativePath already includes the timestamp prefix (e.g., "2026-03-15_22-00-00/item/消息1/output.json")
+	const baseDir = path.join(taskDir, "task")
+
+	const contextBlocks: string[] = []
+
+	for (const ref of refsFile.selectedTurns) {
+		const outputPath = path.join(baseDir, ref.relativePath)
+
+		try {
+			const content = await fs.readFile(outputPath, "utf8")
+			const turnOutput = JSON.parse(content) as TurnOutput
+
+			const assistantMsg = turnOutput.output?.assistantMessage || ""
+			const toolCalls = turnOutput.output?.toolCalls || []
+
+			// Format this turn's contribution
+			const lines: string[] = []
+			lines.push(`--- Turn ${ref.turnNumber}${ref.todoItemContent ? ` [${ref.todoItemContent}]` : ""} ---`)
+			if (assistantMsg) {
+				lines.push(assistantMsg)
+			}
+			if (toolCalls.length > 0) {
+				const toolSummary = toolCalls
+					.map((tc: any) => {
+						const name = tc.name || "unknown"
+						const params = tc.input || {}
+						// Show key parameter values for context
+						const paramKeys = Object.keys(params).slice(0, 3)
+						const paramStr = paramKeys
+							.map((k) => {
+								const val = String(params[k] || "").substring(0, 100)
+								return `${k}=${val}`
+							})
+							.join(", ")
+						return `[${name}(${paramStr})]`
+					})
+					.join("\n")
+				lines.push(toolSummary)
+			}
+
+			contextBlocks.push(lines.join("\n"))
+		} catch {
+			// Skip unreadable files
+		}
+	}
+
+	if (contextBlocks.length === 0) {
+		return []
+	}
+
+	// Build a single user+assistant pair with the previous context
+	const contextText = contextBlocks.join("\n\n")
+
+	const userMessage: ApiMessage = {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `<previous_context source="selected_turns">\n${contextText}\n</previous_context>`,
+			},
+		],
+		ts: Date.now(),
+		isSummary: true,
+		isContextSummary: true,
+	}
+
+	const assistantMessage: ApiMessage = {
+		role: "assistant",
+		content: [
+			{
+				type: "text",
+				text: "I have reviewed the selected context from the previous task. I'm ready to proceed with the new tasks.",
+			},
+		],
+		ts: Date.now(),
+		isContextSummary: true,
+	}
+
+	return [userMessage, assistantMessage]
+}
+
+// ── History Management ────────────────────────────────────────────────────
+
+/**
+ * Find the boundary index where the user's current (new) request starts.
+ * Everything before this index belongs to the old task.
+ * Everything from this index onward is the current conversation turn and must be preserved.
+ */
+function findPreserveBoundary(messages: ApiMessage[]): number {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i]
+		if (msg.role !== "user") continue
+
+		const content = msg.content
+		if (typeof content === "string" && content.trim().length > 0) {
+			return i
+		}
+		if (Array.isArray(content)) {
+			const hasUserText = content.some((block: any) => {
+				if (block.type !== "text") return false
+				const text = block.text?.trim() || ""
+				if (text.startsWith("<environment_details>")) return false
+				return text.length > 0
+			})
+			if (hasUserText) return i
+		}
+	}
+	return messages.length
+}
+
+/**
+ * Load detailed turn content for UI display.
+ */
+async function loadDetailedTurns(
+	globalStoragePath: string,
+	taskId: string,
+	refsFile: ContextRefsFile,
+): Promise<DetailedTurn[]> {
+	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+	// relativePath already includes the timestamp prefix from scanTurnFiles
+	const baseDir = path.join(taskDir, "task")
+	const result: DetailedTurn[] = []
+
+	for (const ref of refsFile.selectedTurns) {
+		const outputPath = path.join(baseDir, ref.relativePath)
+		try {
+			const content = await fs.readFile(outputPath, "utf8")
+			const turnOutput = JSON.parse(content) as TurnOutput
+			const toolCalls = turnOutput.output?.toolCalls || []
+			const toolNames = toolCalls.map((tc: any) => tc.name || "unknown")
+			const parts: string[] = []
+
+			const rawText = turnOutput.output?.assistantMessage || ""
+			console.log(
+				`[loadDetailedTurns] Turn ${ref.turnNumber}: file=${outputPath}, fileSize=${content.length}, assistantMsg=${rawText.length}chars, toolCalls=${toolCalls.length}`,
+			)
+
+			// Include assistant text if present
+			if (rawText.trim()) {
+				parts.push(rawText)
+			}
+
+			// Append comprehensive tool call details
+			for (const tc of toolCalls) {
+				const name = tc.name || "unknown"
+				const params = (tc as any).input || {}
+				const paramEntries = Object.entries(params)
+				const lines: string[] = [`── ${name} ──`]
+				for (const [key, rawVal] of paramEntries) {
+					const val = String(rawVal ?? "")
+					lines.push(`  ${key}: ${val}`)
+				}
+				parts.push(lines.join("\n"))
+			}
+
+			// Load tool results from separate tools_消息N/output.json (or legacy toolResults field)
+			let toolResultItems: any[] = turnOutput.output?.toolResults || []
+			if (toolResultItems.length === 0) {
+				// Try reading from separate tools_消息N/output.json file
+				const turnDir = path.dirname(outputPath)
+				const parentDir = path.dirname(turnDir)
+				const toolsDir = path.join(parentDir, `tools_消息${ref.turnNumber}`)
+				try {
+					const toolsContent = await fs.readFile(path.join(toolsDir, "output.json"), "utf8")
+					const toolsData = JSON.parse(toolsContent)
+					toolResultItems = toolsData.toolResults || []
+				} catch {
+					// No tools_消息N file — expected for old data or text-only turns
+				}
+			}
+			if (toolResultItems.length > 0) {
+				parts.push(`── tool results ──`)
+				for (const tr of toolResultItems) {
+					const resultContent = Array.isArray(tr.content)
+						? tr.content.map((b: any) => b.text || "").join("\n")
+						: String(tr.content ?? "")
+					if (resultContent.trim()) {
+						parts.push(resultContent)
+					}
+				}
+			}
+
+			const assembled = parts.join("\n\n")
+			console.log(`[loadDetailedTurns] Turn ${ref.turnNumber}: assembledMessage=${assembled.length}chars`)
+
+			result.push({
+				turnNumber: ref.turnNumber,
+				todoItemContent: ref.todoItemContent,
+				reason: ref.reason,
+				assistantMessage: assembled,
+				toolNames,
+			})
+		} catch (err) {
+			console.warn(`[loadDetailedTurns] Turn ${ref.turnNumber}: FAILED to read ${outputPath}:`, err)
+		}
+	}
+
+	return result
+}
+
+/**
+ * Full context selection flow: select relevant turns, load them, and replace old history.
+ *
+ * 1. Calls selectAndSaveContextRefs to scan turns and ask the model which are relevant
+ * 2. Loads selected turns as ApiMessage pairs
+ * 3. Finds the preserve boundary (current request messages)
+ * 4. Replaces apiConversationHistory with [context messages + current request messages]
+ *
+ * @returns Structured result with summary + detailed turns for UI, or undefined if nothing selected
+ */
+export async function applyContextSelection(
+	task: Task,
+	newTodos: TodoItem[],
+): Promise<ContextSelectionResult | undefined> {
+	// 1. Select and save refs
+	const refs = await selectAndSaveContextRefs(task, newTodos)
+	if (!refs || refs.selectedTurns.length === 0) {
+		return undefined
+	}
+
+	// 2. Load selected turns as context messages
+	const contextMessages = await loadContextAsMessages(task)
+	if (contextMessages.length === 0) {
+		return undefined
+	}
+
+	// 3. Find preserve boundary in current history
+	const allMessages = task.apiConversationHistory
+	const preserveBoundary = findPreserveBoundary(allMessages)
+	const messagesToPreserve = allMessages.slice(preserveBoundary)
+
+	console.log(
+		`[ContextSelector] Replacing ${preserveBoundary} old messages with ${contextMessages.length} context messages, preserving ${messagesToPreserve.length} current messages`,
+	)
+
+	// 4. Replace history: [selected context] + [current request messages]
+	await task.overwriteApiConversationHistory([...contextMessages, ...messagesToPreserve])
+
+	// Reset boundaries since old messages are gone
+	task.todoItemBoundaries.clear()
+
+	// 5. Load detailed turns for UI display
+	const detailedTurns = await loadDetailedTurns(task.globalStoragePath, task.taskId, refs)
+
+	// 6. Build summary text
+	const summaryLines = refs.selectedTurns.map((ref) => {
+		const label = ref.todoItemContent ? `Turn ${ref.turnNumber} [${ref.todoItemContent}]` : `Turn ${ref.turnNumber}`
+		return ref.reason ? `• ${label}: ${ref.reason}` : `• ${label}`
+	})
+	const summary = `已引用 ${refs.selectedTurns.length} 条历史消息:\n${summaryLines.join("\n")}`
+
+	return { summary, turns: detailedTurns }
+}
+
+// ── Context Block Loading & Knapsack Fitting ─────────────────────────────
+
+const TRANSITION_SYSTEM_PROMPT = `你是一个上下文选择助手。你会收到一系列之前任务的消息摘要。
+你的工作是判断哪些消息包含重要的项目信息，应该被保留作为后续任务的上下文。
+
+选择标准：
+- 项目结构和配置信息
+- 关键的代码修改和文件路径
+- 架构决策和设计模式
+- 遇到的问题和解决方案
+- 重要的技术选型
+
+不要选择：
+- 纯粹的调试信息
+- 重复的消息（选择最终版本即可）
+- 临时性的操作
+
+输出格式：JSON 数组，包含你选择保留的消息编号和原因。
+示例：
+[
+  {"turn": 3, "reason": "包含项目架构设计决策"},
+  {"turn": 7, "reason": "修改了核心文件"}
+]
+
+只输出 JSON 数组，不要其他文字。`
+
+/**
+ * Load each selected turn from context_refs.json as an independent ContextBlock.
+ * Each block contains its own user+assistant message pair and token count.
+ */
+export async function loadContextBlocks(task: Task): Promise<ContextBlock[]> {
+	if (!task.contextRefsPath) return []
+
+	let refsFile: ContextRefsFile
+	try {
+		const content = await fs.readFile(task.contextRefsPath, "utf8")
+		refsFile = JSON.parse(content) as ContextRefsFile
+	} catch {
+		return []
+	}
+
+	if (!refsFile.selectedTurns || refsFile.selectedTurns.length === 0) return []
+
+	const taskDir = await getTaskDirectoryPath(task.globalStoragePath, task.taskId)
+	// relativePath already includes the timestamp prefix from scanTurnFiles
+	const baseDir = path.join(taskDir, "task")
+	const blocks: ContextBlock[] = []
+
+	for (const ref of refsFile.selectedTurns) {
+		const outputPath = path.join(baseDir, ref.relativePath)
+		try {
+			const content = await fs.readFile(outputPath, "utf8")
+			const turnOutput = JSON.parse(content) as TurnOutput
+
+			const assistantMsg = turnOutput.output?.assistantMessage || ""
+			const toolCalls = turnOutput.output?.toolCalls || []
+
+			// Build turn content
+			const lines: string[] = []
+			lines.push(`--- Turn ${ref.turnNumber}${ref.todoItemContent ? ` [${ref.todoItemContent}]` : ""} ---`)
+			if (assistantMsg) lines.push(assistantMsg)
+			if (toolCalls.length > 0) {
+				const toolSummary = toolCalls
+					.map((tc: any) => {
+						const name = tc.name || "unknown"
+						const params = tc.input || {}
+						const paramKeys = Object.keys(params).slice(0, 3)
+						const paramStr = paramKeys
+							.map((k) => {
+								const val = String(params[k] || "").substring(0, 100)
+								return `${k}=${val}`
+							})
+							.join(", ")
+						return `[${name}(${paramStr})]`
+					})
+					.join("\n")
+				lines.push(toolSummary)
+			}
+
+			const turnContent = lines.join("\n")
+
+			const userMsg: ApiMessage = {
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: `<previous_context turn="${ref.turnNumber}">\n${turnContent}\n</previous_context>`,
+					},
+				],
+				ts: Date.now(),
+				isSummary: true,
+				isContextBlock: true,
+			}
+
+			const assistantReply: ApiMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "Noted." }],
+				ts: Date.now(),
+				isContextBlock: true,
+			}
+
+			const tokenCount = (await countMessageTokens(userMsg)) + (await countMessageTokens(assistantReply))
+
+			blocks.push({
+				ref,
+				messages: [userMsg, assistantReply],
+				tokenCount,
+			})
+		} catch {
+			// Skip unreadable files
+		}
+	}
+
+	return blocks
+}
+
+/**
+ * Greedy knapsack: fit context blocks into the available token budget.
+ * Blocks are tried in order (by turn number). If a block doesn't fit, it's skipped but not discarded.
+ */
+export function fitContextBlocks(
+	blocks: ContextBlock[],
+	budgetTokens: number,
+): { included: ContextBlock[]; excluded: ContextBlock[] } {
+	const included: ContextBlock[] = []
+	const excluded: ContextBlock[] = []
+	let remaining = budgetTokens
+
+	for (const block of blocks) {
+		if (block.tokenCount <= remaining) {
+			included.push(block)
+			remaining -= block.tokenCount
+		} else {
+			excluded.push(block)
+		}
+	}
+
+	return { included, excluded }
+}
+
+/**
+ * Selection-only phase: scan turn files, ask AI which are relevant, save context_refs.json.
+ * Does NOT replace conversation history — that's handled by injectContextBlocks.
+ *
+ * Called from AttemptCompletionTool (at task completion time) to prepare context for next task.
+ * Also called from attemptApiRequest as a fallback if selection wasn't done at completion time.
+ *
+ * @returns Number of selected turns, or 0 if nothing was selected
+ */
+export async function performContextSelection(task: Task): Promise<number> {
+	const taskTimestamp = task.taskTimestamp
+	if (!taskTimestamp) {
+		console.log("[ContextSelection] No taskTimestamp, skipping")
+		return 0
+	}
+
+	// 1. Scan turn files
+	const summaries = await scanTurnFiles(task.globalStoragePath, task.taskId, taskTimestamp)
+	if (summaries.length === 0) {
+		console.log("[ContextSelection] No turn files found, skipping")
+		return 0
+	}
+
+	console.log(`[ContextSelection] Found ${summaries.length} turns to evaluate`)
+
+	// 2. Get selection model
+	const apiHandler = await task.getCondensingApiHandler()
+	const modelInfo = apiHandler.getModel().info
+	const modelId = apiHandler.getModel().id
+	const contextWindow = modelInfo?.contextWindow || DEFAULT_CONTEXT_WINDOW
+	const capacity = contextWindow - RESERVED_TOKENS
+	console.log(`[ContextSelection] Using model: ${modelId}, contextWindow: ${contextWindow}, capacity: ${capacity}`)
+
+	// 3. Pack summaries into batches
+	const batches = await packSummariesIntoBatches(summaries, capacity)
+	console.log(`[ContextSelection] Packed into ${batches.length} batch(es)`)
+
+	// 4. Send each batch to selection model (using transition prompt — no todo list)
+	const allSelections: { turn: number; reason?: string }[] = []
+
+	for (let batchIdx = 0; batchIdx < batches.length; batchIdx++) {
+		const batch = batches[batchIdx]
+		const summaryTexts = batch.map(formatTurnSummary).join("\n\n")
+
+		const userMessage = `以下是之前任务的消息列表：\n\n${summaryTexts}\n\n请选择哪些消息包含重要信息，应该被保留作为后续任务的上下文。`
+
+		try {
+			console.log(`[ContextSelection] Sending batch ${batchIdx + 1}/${batches.length} (${batch.length} turns)`)
+			const response = await callSelectionModel(apiHandler, TRANSITION_SYSTEM_PROMPT, userMessage)
+			console.log(
+				`[ContextSelection] Batch ${batchIdx + 1} response (${response.length} chars): ${response.substring(0, 200)}`,
+			)
+			const selections = parseSelectionResponse(response)
+			console.log(`[ContextSelection] Batch ${batchIdx + 1} parsed ${selections.length} selections`)
+			allSelections.push(...selections)
+		} catch (err) {
+			console.warn(`[ContextSelection] Batch ${batchIdx + 1} failed:`, err)
+		}
+	}
+
+	if (allSelections.length === 0) {
+		console.log("[ContextSelection] No turns selected")
+		return 0
+	}
+
+	// 5. Build and save context_refs.json
+	const selectedTurns: ContextRef[] = []
+	for (const selection of allSelections) {
+		const summary = summaries.find((s) => s.turnNumber === selection.turn)
+		if (summary) {
+			selectedTurns.push({
+				relativePath: summary.relativePath,
+				turnNumber: summary.turnNumber,
+				todoItemContent: summary.todoItemContent,
+				reason: selection.reason,
+			})
+		}
+	}
+
+	const contextRefs: ContextRefsFile = {
+		createdAt: Date.now(),
+		taskTimestamp,
+		newTodoItems: [],
+		selectedTurns,
+	}
+
+	const taskDir = await getTaskDirectoryPath(task.globalStoragePath, task.taskId)
+	const contextDir = path.join(taskDir, "summary", "context", taskTimestamp)
+	await fs.mkdir(contextDir, { recursive: true })
+	const refsPath = path.join(contextDir, CONTEXT_REFS_FILENAME)
+	await fs.writeFile(refsPath, JSON.stringify(contextRefs, null, 2), "utf8")
+	task.contextRefsPath = refsPath
+
+	console.log(`[ContextSelection] Saved ${selectedTurns.length} refs to ${refsPath}`)
+	return selectedTurns.length
+}
+
+/**
+ * Phase 1 fallback: Cross-task transition selection + history replacement.
+ * Called from attemptApiRequest when needsContextCompression=true AND selection
+ * wasn't already done at attempt_completion time.
+ */
+export async function executeTransitionSelection(task: Task): Promise<void> {
+	// Run selection if not already done
+	if (!task.contextRefsPath) {
+		const count = await performContextSelection(task)
+		if (count === 0) return
+	}
+
+	// Load blocks, fit, and replace history
+	const blocks = await loadContextBlocks(task)
+	if (blocks.length === 0) return
+
+	// Calculate budget: preserve current user request messages
+	const allMessages = task.apiConversationHistory
+	const preserveBoundary = findPreserveBoundary(allMessages)
+	const messagesToPreserve = allMessages.slice(preserveBoundary)
+
+	let currentTokens = 0
+	for (const msg of messagesToPreserve) {
+		currentTokens += await countMessageTokens(msg)
+	}
+
+	const mainModelInfo = task.api.getModel().info
+	const mainContextWindow = mainModelInfo?.contextWindow || DEFAULT_CONTEXT_WINDOW
+	const budget = Math.floor(mainContextWindow * COMPRESS_THRESHOLD) - currentTokens
+
+	const { included } = fitContextBlocks(blocks, budget)
+
+	const blockMessages = included.flatMap((b) => b.messages)
+	const newHistory = [...blockMessages, ...messagesToPreserve]
+	await task.overwriteApiConversationHistory(newHistory)
+	task.todoItemBoundaries.clear()
+
+	console.log(
+		`[TransitionSelection] Injected ${included.length}/${blocks.length} blocks, preserved ${messagesToPreserve.length} messages`,
+	)
+}
+
+/**
+ * Phase 2: Dynamic context block injection.
+ * Called every API call from attemptApiRequest.
+ * Loads context blocks, calculates available budget, and fits blocks into history.
+ */
+export async function injectContextBlocks(task: Task): Promise<void> {
+	if (!task.contextRefsPath) return
+
+	const blocks = await loadContextBlocks(task)
+	if (blocks.length === 0) return
+
+	// Calculate token count of current (non-block) messages
+	const currentMessages = task.apiConversationHistory.filter((m) => !m.isContextBlock)
+	let currentTokens = 0
+	for (const msg of currentMessages) {
+		currentTokens += await countMessageTokens(msg)
+	}
+
+	const modelInfo = task.api.getModel().info
+	const contextWindow = modelInfo?.contextWindow || DEFAULT_CONTEXT_WINDOW
+	const budget = Math.floor(contextWindow * COMPRESS_THRESHOLD) - currentTokens
+
+	// Remove existing context blocks from history
+	const nonBlockMessages = task.apiConversationHistory.filter((m) => !m.isContextBlock)
+
+	if (budget <= 0) {
+		// No budget — remove all context blocks
+		if (nonBlockMessages.length !== task.apiConversationHistory.length) {
+			task.apiConversationHistory = nonBlockMessages
+		}
+		return
+	}
+
+	const { included } = fitContextBlocks(blocks, budget)
+
+	if (included.length === 0) {
+		if (nonBlockMessages.length !== task.apiConversationHistory.length) {
+			task.apiConversationHistory = nonBlockMessages
+		}
+		return
+	}
+
+	// Rebuild: [context blocks] + [non-block messages]
+	const blockMessages = included.flatMap((b) => b.messages)
+	task.apiConversationHistory = [...blockMessages, ...nonBlockMessages]
+}
+
+/**
+ * Load context selection data for UI display (used by UpdateTodoListTool for divider).
+ */
+export async function loadContextSelectionForUI(task: Task): Promise<ContextSelectionResult | undefined> {
+	console.log(`[loadContextSelectionForUI] contextRefsPath=${task.contextRefsPath}`)
+	if (!task.contextRefsPath) return undefined
+
+	let refsFile: ContextRefsFile
+	try {
+		const content = await fs.readFile(task.contextRefsPath, "utf8")
+		refsFile = JSON.parse(content) as ContextRefsFile
+		console.log(
+			`[loadContextSelectionForUI] Loaded ${refsFile.selectedTurns?.length ?? 0} refs, taskTimestamp=${refsFile.taskTimestamp}`,
+		)
+	} catch (err) {
+		console.warn(`[loadContextSelectionForUI] Failed to read refs file:`, err)
+		return undefined
+	}
+
+	if (!refsFile.selectedTurns || refsFile.selectedTurns.length === 0) return undefined
+
+	const detailedTurns = await loadDetailedTurns(task.globalStoragePath, task.taskId, refsFile)
+	console.log(
+		`[loadContextSelectionForUI] detailedTurns=${detailedTurns.length}, totalMsgChars=${detailedTurns.reduce((s, t) => s + t.assistantMessage.length, 0)}`,
+	)
+
+	const summaryLines = refsFile.selectedTurns.map((ref) => {
+		const label = ref.todoItemContent ? `Turn ${ref.turnNumber} [${ref.todoItemContent}]` : `Turn ${ref.turnNumber}`
+		return ref.reason ? `• ${label}: ${ref.reason}` : `• ${label}`
+	})
+	const summary = `已引用 ${refsFile.selectedTurns.length} 条历史消息:\n${summaryLines.join("\n")}`
+
+	return { summary, turns: detailedTurns }
+}
+
+// ── In-Task Context Compression ───────────────────────────────────────────
+
+// Compress when effective history exceeds this fraction of context window
+const COMPRESS_THRESHOLD = 0.75
+// After compression, keep the most recent messages (this fraction of the threshold)
+const KEEP_RECENT_FRACTION = 0.4
+// Minimum messages to keep uncompressed (never compress if fewer than this)
+const MIN_MESSAGES_FOR_COMPRESSION = 10
+
+const IN_TASK_COMPRESS_SYSTEM_PROMPT = `你是一个上下文压缩助手。你会收到一段 AI 助手执行任务时的对话消息。
+请将这些消息压缩为简洁的上下文摘要，保留：
+- 已执行的关键操作和结果
+- 修改过的文件路径和具体变更
+- 遇到的问题和解决方案
+- 当前进度和待完成的工作
+
+输出格式：简洁的结构化摘要，不要遗漏关键信息。不要输出多余的解释。`
+
+/**
+ * Count tokens for a single ApiMessage.
+ */
+async function countMessageTokens(msg: ApiMessage): Promise<number> {
+	const content = msg.content
+	if (typeof content === "string") {
+		return tiktoken([{ type: "text", text: content }])
+	}
+	if (Array.isArray(content)) {
+		return tiktoken(content as Anthropic.Messages.ContentBlockParam[])
+	}
+	return tiktoken([{ type: "text", text: String(content) }])
+}
+
+/**
+ * Extract text content from an ApiMessage for display/compression.
+ */
+function extractMessageText(msg: ApiMessage): string {
+	const content = msg.content
+	if (typeof content === "string") return content
+	if (Array.isArray(content)) {
+		return content
+			.map((block: any) => {
+				if (block.type === "text") return block.text || ""
+				if (block.type === "tool_use") {
+					// Include tool input parameters so compression model gets real content
+					const input = block.input || {}
+					const paramParts: string[] = []
+					for (const [key, val] of Object.entries(input)) {
+						if (val === undefined || val === null) continue
+						const valStr = typeof val === "string" ? val : (JSON.stringify(val) ?? "")
+						// Truncate very long values (e.g. file content) to keep input manageable
+						paramParts.push(`${key}: ${valStr.substring(0, 500)}`)
+					}
+					const params = paramParts.length > 0 ? `\n${paramParts.join("\n")}` : ""
+					return `[Tool: ${block.name}]${params}`
+				}
+				if (block.type === "tool_result") {
+					const rc = block.content
+					if (typeof rc === "string") return rc
+					if (Array.isArray(rc)) {
+						return rc
+							.filter((b: any) => b.type === "text")
+							.map((b: any) => b.text || "")
+							.join("\n")
+					}
+					return "[tool_result]"
+				}
+				return ""
+			})
+			.filter(Boolean)
+			.join("\n")
+	}
+	return String(content)
+}
+
+/**
+ * Compress older messages within the current task when token count approaches the model's context window.
+ *
+ * Called from attemptApiRequest after buildEffectiveHistory. Permanently modifies apiConversationHistory
+ * by replacing older messages with a summary pair.
+ *
+ * @returns true if compression was performed, false otherwise
+ */
+export async function compressInTaskContext(task: Task): Promise<boolean> {
+	const modelInfo = task.api.getModel().info
+	const contextWindow = modelInfo?.contextWindow || DEFAULT_CONTEXT_WINDOW
+	const threshold = Math.floor(contextWindow * COMPRESS_THRESHOLD)
+
+	// Count tokens of effective history
+	const effectiveHistory = task.buildEffectiveHistory()
+	if (effectiveHistory.length < MIN_MESSAGES_FOR_COMPRESSION) {
+		return false
+	}
+
+	let totalTokens = 0
+	const tokenCounts: number[] = []
+	for (const msg of effectiveHistory) {
+		const count = await countMessageTokens(msg)
+		tokenCounts.push(count)
+		totalTokens += count
+	}
+
+	if (totalTokens <= threshold) {
+		return false
+	}
+
+	console.log(
+		`[ContextCompressor] Token count ${totalTokens} exceeds threshold ${threshold} (${contextWindow} * ${COMPRESS_THRESHOLD}), compressing...`,
+	)
+
+	// Find the split point: keep enough recent messages to stay under the keep fraction
+	const keepTokenTarget = Math.floor(threshold * KEEP_RECENT_FRACTION)
+	let keepFromIndex = effectiveHistory.length
+	let keptTokens = 0
+	for (let i = effectiveHistory.length - 1; i >= 0; i--) {
+		keptTokens += tokenCounts[i]
+		if (keptTokens > keepTokenTarget) {
+			keepFromIndex = i + 1
+			break
+		}
+	}
+
+	// Ensure we always keep at least a few recent messages
+	keepFromIndex = Math.min(keepFromIndex, effectiveHistory.length - 4)
+	if (keepFromIndex <= 2) {
+		// Not enough old messages to compress
+		return false
+	}
+
+	// Messages to compress: indices 0..keepFromIndex-1 in effectiveHistory
+	// But we need to map back to apiConversationHistory indices.
+	// Since effectiveHistory may have filtered out some messages, we work on apiConversationHistory directly.
+
+	// Find the boundary in apiConversationHistory:
+	// The effective history's keepFromIndex-th message corresponds to some index in the full history.
+	// We use the timestamp to find the mapping.
+	const splitEffectiveMsg = effectiveHistory[keepFromIndex]
+	let splitIndexInFull = -1
+	for (let i = 0; i < task.apiConversationHistory.length; i++) {
+		if (task.apiConversationHistory[i] === splitEffectiveMsg) {
+			splitIndexInFull = i
+			break
+		}
+	}
+
+	if (splitIndexInFull <= 0) {
+		return false
+	}
+
+	// Ensure we don't split a tool_use/tool_result pair
+	if (splitIndexInFull < task.apiConversationHistory.length) {
+		const msgAtSplit = task.apiConversationHistory[splitIndexInFull]
+		if (
+			msgAtSplit.role === "user" &&
+			Array.isArray(msgAtSplit.content) &&
+			msgAtSplit.content.some((b: any) => b.type === "tool_result")
+		) {
+			splitIndexInFull--
+		}
+	}
+
+	const messagesToCompress = task.apiConversationHistory.slice(0, splitIndexInFull)
+	const messagesToPreserve = task.apiConversationHistory.slice(splitIndexInFull)
+
+	if (messagesToCompress.length < 4) {
+		return false
+	}
+
+	// Build compression text from old messages
+	const compressTexts = messagesToCompress.map((msg) => `[${msg.role}]: ${extractMessageText(msg)}`).join("\n\n")
+
+	// Count tokens for compression text, split into batches if needed
+	const apiHandler = await task.getCondensingApiHandler()
+	const condenserInfo = apiHandler.getModel().info
+	const condenserWindow = condenserInfo?.contextWindow || DEFAULT_CONTEXT_WINDOW
+	const batchCapacity = condenserWindow - RESERVED_TOKENS
+
+	const compressTokens = await tiktoken([{ type: "text", text: compressTexts }])
+	let finalSummary: string
+
+	if (compressTokens <= batchCapacity) {
+		// Single batch
+		const userMessage = `以下是任务执行过程中的对话记录，请压缩为简洁的上下文摘要：\n\n${compressTexts}`
+		finalSummary = await callCompressionModel(apiHandler, IN_TASK_COMPRESS_SYSTEM_PROMPT, userMessage)
+	} else {
+		// Multiple batches
+		const batchSize = Math.ceil(messagesToCompress.length * (batchCapacity / compressTokens))
+		const partialSummaries: string[] = []
+
+		for (let start = 0; start < messagesToCompress.length; start += batchSize) {
+			const batch = messagesToCompress.slice(start, start + batchSize)
+			const batchText = batch.map((msg) => `[${msg.role}]: ${extractMessageText(msg)}`).join("\n\n")
+			const userMessage = `以下是任务执行过程中的部分对话记录（第 ${Math.floor(start / batchSize) + 1} 批），请压缩为简洁的上下文摘要：\n\n${batchText}`
+			const partial = await callCompressionModel(apiHandler, IN_TASK_COMPRESS_SYSTEM_PROMPT, userMessage)
+			partialSummaries.push(partial)
+		}
+
+		finalSummary = partialSummaries.join("\n\n---\n\n")
+	}
+
+	// Build summary message pair
+	const summaryUserMessage: ApiMessage = {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `<context_summary source="in_task_compression">\n${finalSummary}\n</context_summary>`,
+			},
+		],
+		ts: Date.now(),
+		isSummary: true,
+	}
+
+	const summaryAssistantMessage: ApiMessage = {
+		role: "assistant",
+		content: [
+			{
+				type: "text",
+				text: "I've reviewed the compressed context summary. Continuing with the current task.",
+			},
+		],
+		ts: Date.now(),
+	}
+
+	// Replace old messages with summary + preserved messages
+	const newHistory = [summaryUserMessage, summaryAssistantMessage, ...messagesToPreserve]
+	await task.overwriteApiConversationHistory(newHistory)
+
+	console.log(
+		`[ContextCompressor] Compressed ${messagesToCompress.length} messages (${totalTokens - keptTokens} tokens) into summary (${finalSummary.length} chars), kept ${messagesToPreserve.length} recent messages`,
+	)
+
+	return true
+}
+
+/**
+ * Compress ALL conversation messages at task completion time.
+ *
+ * Same compression mechanism as compressInTaskContext (calls condensing model),
+ * but runs UNCONDITIONALLY when attempt_completion is called.
+ * Replaces the entire apiConversationHistory with a [summary pair].
+ *
+ * Also saves the summary text to summary/task/<timestamp>/task_summary.json.
+ *
+ * @returns The summary text, or undefined if compression failed
+ */
+export async function compressOnCompletion(task: Task): Promise<string | undefined> {
+	const allMessages = task.apiConversationHistory
+	if (allMessages.length < 2) {
+		console.log("[compressOnCompletion] Too few messages to compress")
+		return undefined
+	}
+
+	// Show in-progress spinner in UI
+	await task.say("condense_context", undefined, undefined, true)
+
+	// Build compression text from ALL messages
+	const compressTexts = allMessages.map((msg) => `[${msg.role}]: ${extractMessageText(msg)}`).join("\n\n")
+
+	// Get condensing model
+	const apiHandler = await task.getCondensingApiHandler()
+	const condenserInfo = apiHandler.getModel().info
+	const condenserWindow = condenserInfo?.contextWindow || DEFAULT_CONTEXT_WINDOW
+	const batchCapacity = condenserWindow - RESERVED_TOKENS
+
+	const compressTokens = await tiktoken([{ type: "text", text: compressTexts }])
+	let finalSummary: string
+
+	const modelId = apiHandler.getModel().id
+	console.log(
+		`[compressOnCompletion] Model: ${modelId}, contextWindow: ${condenserWindow}, batchCapacity: ${batchCapacity}`,
+	)
+	console.log(`[compressOnCompletion] Compressing ${allMessages.length} messages (${compressTokens} tokens)`)
+
+	if (compressTokens <= batchCapacity) {
+		// Single batch
+		const userMessage = `以下是一个已完成任务的完整对话记录，请压缩为简洁的上下文摘要：\n\n${compressTexts}`
+		finalSummary = await callCompressionModel(apiHandler, IN_TASK_COMPRESS_SYSTEM_PROMPT, userMessage)
+	} else {
+		// Multiple batches
+		const batchSize = Math.ceil(allMessages.length * (batchCapacity / compressTokens))
+		const partialSummaries: string[] = []
+
+		for (let start = 0; start < allMessages.length; start += batchSize) {
+			const batch = allMessages.slice(start, start + batchSize)
+			const batchText = batch.map((msg) => `[${msg.role}]: ${extractMessageText(msg)}`).join("\n\n")
+			const userMessage = `以下是已完成任务的部分对话记录（第 ${Math.floor(start / batchSize) + 1} 批），请压缩为简洁的上下文摘要：\n\n${batchText}`
+			const partial = await callCompressionModel(apiHandler, IN_TASK_COMPRESS_SYSTEM_PROMPT, userMessage)
+			partialSummaries.push(partial)
+		}
+
+		finalSummary = partialSummaries.join("\n\n---\n\n")
+	}
+
+	// Replace history with summary pair
+	const summaryUserMessage: ApiMessage = {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `<context_summary source="task_completion">\n${finalSummary}\n</context_summary>`,
+			},
+		],
+		ts: Date.now(),
+		isSummary: true,
+	}
+
+	const summaryAssistantMessage: ApiMessage = {
+		role: "assistant",
+		content: [
+			{
+				type: "text",
+				text: "I've reviewed the task summary. Ready for the next task.",
+			},
+		],
+		ts: Date.now(),
+	}
+
+	console.log(
+		`[compressOnCompletion] Model returned summary (${finalSummary.length} chars): ${finalSummary.substring(0, 200)}`,
+	)
+
+	if (finalSummary.length < 50) {
+		console.warn(
+			`[compressOnCompletion] WARNING: Summary suspiciously short (${finalSummary.length} chars). Model may not be working correctly.`,
+		)
+	}
+
+	await task.overwriteApiConversationHistory([summaryUserMessage, summaryAssistantMessage])
+
+	// Calculate new token count for UI display
+	const newTokens = await tiktoken([{ type: "text", text: finalSummary }])
+
+	// Update UI: replace spinner with expandable result
+	await task.say(
+		"condense_context",
+		undefined,
+		undefined,
+		false,
+		undefined,
+		undefined,
+		{},
+		{
+			cost: 0,
+			prevContextTokens: compressTokens,
+			newContextTokens: newTokens,
+			summary: finalSummary,
+		},
+	)
+
+	console.log(
+		`[compressOnCompletion] Compressed ${allMessages.length} messages into summary (${finalSummary.length} chars)`,
+	)
+
+	// Save summary to summary/ folder
+	if (task.taskTimestamp) {
+		try {
+			const taskDir = await getTaskDirectoryPath(task.globalStoragePath, task.taskId)
+			const summaryDir = path.join(taskDir, "summary", "task", task.taskTimestamp)
+			await fs.mkdir(summaryDir, { recursive: true })
+			const summaryPath = path.join(summaryDir, "task_summary.json")
+			const summaryData = {
+				createdAt: Date.now(),
+				taskTimestamp: task.taskTimestamp,
+				taskId: task.taskId,
+				originalMessageCount: allMessages.length,
+				compressedSummary: finalSummary,
+				turnCount: task.turnCounter,
+				todoItems: task.todoList?.map((t) => ({ content: t.content, status: t.status })),
+			}
+			await fs.writeFile(summaryPath, JSON.stringify(summaryData, null, 2), "utf8")
+			console.log(`[compressOnCompletion] Summary saved to ${summaryPath}`)
+		} catch (err) {
+			console.warn("[compressOnCompletion] Failed to save summary file:", err)
+		}
+	}
+
+	return finalSummary
+}
+
+/**
+ * Call the compression/condensing model.
+ */
+async function callCompressionModel(
+	apiHandler: ApiHandler,
+	systemPrompt: string,
+	userMessage: string,
+): Promise<string> {
+	const messages: Anthropic.Messages.MessageParam[] = [{ role: "user", content: userMessage }]
+
+	let result = ""
+	const stream = apiHandler.createMessage(systemPrompt, messages)
+
+	for await (const chunk of stream) {
+		if (chunk.type === "text") {
+			result += chunk.text
+		}
+	}
+
+	return result.trim()
+}
+
+/**
+ * Get a display-friendly summary of the context refs for UI display.
+ */
+export async function getContextRefsSummary(task: Task): Promise<string | undefined> {
+	if (!task.contextRefsPath) {
+		return undefined
+	}
+
+	try {
+		const content = await fs.readFile(task.contextRefsPath, "utf8")
+		const refsFile = JSON.parse(content) as ContextRefsFile
+
+		if (!refsFile.selectedTurns || refsFile.selectedTurns.length === 0) {
+			return undefined
+		}
+
+		const lines = refsFile.selectedTurns.map((ref) => {
+			const label = ref.todoItemContent
+				? `Turn ${ref.turnNumber} [${ref.todoItemContent}]`
+				: `Turn ${ref.turnNumber}`
+			return ref.reason ? `• ${label}: ${ref.reason}` : `• ${label}`
+		})
+
+		return `已引用 ${refsFile.selectedTurns.length} 条历史消息:\n${lines.join("\n")}`
+	} catch {
+		return undefined
+	}
+}
