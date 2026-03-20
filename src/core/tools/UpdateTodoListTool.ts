@@ -6,7 +6,7 @@ import cloneDeep from "clone-deep"
 import crypto from "crypto"
 import { TodoItem, TodoStatus, todoStatusSchema } from "@roo-code/types"
 import { getLatestTodo } from "../../shared/todo"
-import { loadContextSelectionForUI } from "../condense/context-selector"
+import { applyContextSelection, refreshContextSelection } from "../condense/context-selector"
 
 interface UpdateTodoListParams {
 	todos: string
@@ -86,13 +86,36 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				return item?.content
 			}
 
-			// Load context selection data for UI display (selection itself already happened in attemptApiRequest Phase 1)
+			// Context selection: if this is the first todo list creation and no context selection
+			// has been done yet, trigger selection now (scans existing turn files, asks condensing
+			// model to pick relevant turns, replaces old history with selected context blocks).
+			// If Phase 1 already ran (contextRefsPath set), just load the existing result for UI.
 			let contextSelectionResult: import("../condense/context-selector").ContextSelectionResult | undefined
-			if (task.contextRefsPath) {
+			if (!task.taskEstablished && !task.contextRefsPath) {
 				try {
-					contextSelectionResult = await loadContextSelectionForUI(task)
+					contextSelectionResult = await applyContextSelection(task, normalizedTodos)
+					if (contextSelectionResult) {
+						console.log(
+							`[UpdateTodoList] Context selection applied: ${contextSelectionResult.summary.substring(0, 100)}`,
+						)
+					} else {
+						console.log(
+							"[UpdateTodoList] Context selection returned no results (no turn files or nothing selected)",
+						)
+					}
 				} catch (err) {
-					console.warn("[UpdateTodoList] Failed to load context refs for UI:", err)
+					console.warn("[UpdateTodoList] Context selection failed (non-critical):", err)
+				}
+			} else if (task.contextRefsPath) {
+				try {
+					contextSelectionResult = await refreshContextSelection(task, normalizedTodos)
+					if (contextSelectionResult) {
+						console.log(
+							`[UpdateTodoList] Context selection refreshed: ${contextSelectionResult.summary.substring(0, 100)}`,
+						)
+					}
+				} catch (err) {
+					console.warn("[UpdateTodoList] Failed to refresh context selection (non-critical):", err)
 				}
 			}
 
@@ -108,6 +131,7 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 							content: currentActiveItem.content,
 							summary: contextSelectionResult.summary,
 							turns: contextSelectionResult.turns,
+							contextSummaryText: contextSelectionResult.contextSummaryText,
 						})
 					: currentActiveItem.content
 

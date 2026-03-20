@@ -12,7 +12,6 @@ import { t } from "../../i18n"
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import { assembleTurns } from "../task-persistence/turn-persistence"
 import { setTodoListForTask } from "./UpdateTodoListTool"
-import { compressOnCompletion } from "../condense/context-selector"
 
 interface AttemptCompletionParams {
 	result: string
@@ -70,17 +69,6 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 			task.consecutiveMistakeCount = 0
 
 			await task.say("completion_result", result, undefined, false)
-
-			// Compress ALL conversation messages into a summary.
-			// Uses the same compression mechanism as compressInTaskContext (Phase 3 safety net),
-			// but runs unconditionally at task completion.
-			// Result: apiConversationHistory is replaced with [summary pair].
-			// Summary is also saved to summary/task/<timestamp>/task_summary.json.
-			try {
-				await compressOnCompletion(task)
-			} catch (err) {
-				console.warn("[AttemptCompletionTool] compressOnCompletion failed (non-critical):", err)
-			}
 
 			// Force final token usage update before emitting TaskCompleted
 			task.emitFinalTokenUsageUpdate()

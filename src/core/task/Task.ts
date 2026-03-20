@@ -2423,9 +2423,25 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// the task first.
 		this.apiConversationHistory = await this.getSavedApiConversationHistory()
 
-		// Generate timestamp for per-turn persistence on resume (if not already set)
+		// Restore taskTimestamp from existing turn directories on disk, or generate new one.
+		// Turn files and context_refs.json are stored under <taskDir>/task/<timestamp>/,
+		// so we must reuse the old timestamp to find them.
 		if (!this.taskTimestamp) {
-			this.taskTimestamp = generateTaskTimestamp()
+			try {
+				const taskDir = await getTaskDirectoryPath(this.globalStoragePath, this.taskId)
+				const taskSubDir = path.join(taskDir, "task")
+				const entries = await fs.readdir(taskSubDir)
+				const timestamps = entries.filter((e) => /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$/.test(e)).sort()
+				if (timestamps.length > 0) {
+					this.taskTimestamp = timestamps[timestamps.length - 1]
+					console.log(`[Task.resumeTaskFromHistory] Restored taskTimestamp from disk: ${this.taskTimestamp}`)
+				}
+			} catch {
+				// task/ directory doesn't exist yet — will generate new timestamp below
+			}
+			if (!this.taskTimestamp) {
+				this.taskTimestamp = generateTaskTimestamp()
+			}
 		}
 
 		// Create summary folder structure proactively and restore contextRefsPath if exists
@@ -2453,20 +2469,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.warn("[Task] Failed to create summary directory (non-critical):", err)
 		}
 
-		// Restore needsContextCompression: if history starts with a compressOnCompletion summary pair
-		// but no context_refs.json exists, the flag was lost on reload — re-set it.
-		if (!this.contextRefsPath && this.apiConversationHistory.length >= 2) {
-			const firstMsg = this.apiConversationHistory[0]
-			if (firstMsg?.isSummary && firstMsg.role === "user") {
-				const textContent = Array.isArray(firstMsg.content)
-					? (firstMsg.content.find((b: any) => b.type === "text") as any)?.text || ""
-					: String(firstMsg.content)
-				if (textContent.includes('<context_summary source="task_completion">')) {
-					this.needsContextCompression = true
-					console.log(
-						"[Task.resumeTask] Detected compressed summary without context_refs — setting needsContextCompression=true",
-					)
-				}
+		// Restore needsContextCompression: if clineMessages show a completed task
+		// but no context_refs.json exists, Phase 1 (transition selection) hasn't run yet.
+		// This handles the case where the user completed a task, then closed VSCode
+		// before the next attemptApiRequest could execute Phase 1.
+		if (!this.contextRefsPath) {
+			const hasTaskCompleted = this.clineMessages.some(
+				(m) => m.say === "task_completed" || m.say === "user_feedback",
+			)
+			if (hasTaskCompleted) {
+				this.needsContextCompression = true
+				console.log(
+					"[Task.resumeTask] Detected completed task without context_refs — setting needsContextCompression=true",
+				)
 			}
 		}
 

@@ -119,12 +119,22 @@ interface DividerTurn {
 	toolNames: string[]
 }
 
-function parseDividerText(text?: string): { content: string; summary?: string; turns?: DividerTurn[] } {
+function parseDividerText(text?: string): {
+	content: string
+	summary?: string
+	turns?: DividerTurn[]
+	contextSummaryText?: string
+} {
 	if (!text) return { content: "" }
 	try {
 		const parsed = JSON.parse(text)
 		if (parsed && typeof parsed.content === "string") {
-			return { content: parsed.content, summary: parsed.summary, turns: parsed.turns }
+			return {
+				content: parsed.content,
+				summary: parsed.summary,
+				turns: parsed.turns,
+				contextSummaryText: parsed.contextSummaryText,
+			}
 		}
 	} catch {
 		// not JSON, plain string
@@ -197,8 +207,10 @@ function TodoItemDividerRow({
 	onToggleTodoGroup?: (ts: number) => void
 }) {
 	const [refsExpanded, setRefsExpanded] = useState(false)
-	const { content, turns } = parseDividerText(message.text)
+	const [summaryExpanded, setSummaryExpanded] = useState(false)
+	const { content, turns, contextSummaryText } = parseDividerText(message.text)
 	const hasTurns = turns && turns.length > 0
+	const hasSummary = !!contextSummaryText?.trim()
 
 	return (
 		<div>
@@ -251,6 +263,50 @@ function TodoItemDividerRow({
 							{turns.map((turn, idx) => (
 								<ExpandableTurnItem key={idx} turn={turn} />
 							))}
+						</div>
+					)}
+				</div>
+			)}
+			{hasSummary && (
+				<div style={{ marginLeft: 14, marginTop: hasTurns ? 3 : 2 }}>
+					<div
+						style={{
+							fontSize: "10px",
+							color: "var(--vscode-descriptionForeground)",
+							opacity: 0.8,
+							cursor: "pointer",
+							display: "flex",
+							alignItems: "center",
+							gap: "3px",
+							userSelect: "none",
+						}}
+						onClick={(e) => {
+							e.stopPropagation()
+							setSummaryExpanded(!summaryExpanded)
+						}}>
+						<span
+							className={`codicon codicon-chevron-${summaryExpanded ? "down" : "right"}`}
+							style={{ fontSize: 9 }}
+						/>
+						{"上下文概要"}
+					</div>
+					{summaryExpanded && (
+						<div
+							style={{
+								fontSize: "11px",
+								color: "var(--vscode-descriptionForeground)",
+								opacity: 0.7,
+								marginTop: 3,
+								marginLeft: 12,
+								padding: "6px 8px",
+								background: "var(--vscode-textBlockQuote-background)",
+								borderRadius: 4,
+								whiteSpace: "pre-wrap",
+								lineHeight: 1.4,
+								maxHeight: "60vh",
+								overflowY: "auto",
+							}}>
+							{contextSummaryText}
 						</div>
 					)}
 				</div>

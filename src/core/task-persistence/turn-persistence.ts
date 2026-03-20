@@ -69,8 +69,6 @@ export interface AssembledResult {
 	}[]
 	/** Context selection refs from summary/context/<timestamp>/context_refs.json, if available */
 	contextRefs?: any
-	/** Task summary from summary/task/<timestamp>/task_summary.json, if available */
-	taskSummary?: TaskSummary
 }
 
 /**
@@ -190,20 +188,6 @@ export async function saveTurnThinking(
 }
 
 /**
- * Task summary saved by compressOnCompletion when AI calls attempt_completion.
- * Contains the AI-compressed summary of ALL conversation messages.
- */
-export interface TaskSummary {
-	createdAt: number
-	taskTimestamp: string
-	taskId: string
-	originalMessageCount: number
-	compressedSummary: string
-	turnCount: number
-	todoItems?: { content: string; status: string }[]
-}
-
-/**
  * Assemble all turn files for a task into a single result JSON.
  *
  * Walks: <taskDir>/task/<taskTimestamp>/<项目名>/消息N/{output.json, thinking.json}
@@ -293,13 +277,6 @@ export async function assembleTurns(
 			// Try next candidate
 		}
 	}
-	try {
-		const summaryContent = await fs.readFile(path.join(summaryBase, "task_summary.json"), "utf8")
-		result.taskSummary = JSON.parse(summaryContent) as TaskSummary
-	} catch {
-		// No task_summary.json — expected if task hasn't completed yet
-	}
-
 	// Save assembled result
 	const resultPath = path.join(baseDir, "assembled_result.json")
 	await safeWriteJson(resultPath, result)
