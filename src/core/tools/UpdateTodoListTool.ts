@@ -90,8 +90,25 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 			// has been done yet, trigger selection now (scans existing turn files, asks condensing
 			// model to pick relevant turns, replaces old history with selected context blocks).
 			// If Phase 1 already ran (contextRefsPath set), just load the existing result for UI.
+			// Skipped entirely when autoCondenseContext is enabled (Phase 3 handles compression instead).
 			let contextSelectionResult: import("../condense/context-selector").ContextSelectionResult | undefined
-			if (!task.taskEstablished && !task.contextRefsPath) {
+			if (task.autoCondenseContext) {
+				// In auto-condense mode, if context refs exist (set by Phase 1), refresh for UI display
+				if (task.contextRefsPath) {
+					try {
+						contextSelectionResult = await refreshContextSelection(task, normalizedTodos)
+						if (contextSelectionResult) {
+							console.log(
+								`[UpdateTodoList] Context selection refreshed for UI (autoCondenseContext mode): ${contextSelectionResult.summary.substring(0, 100)}`,
+							)
+						}
+					} catch (err) {
+						console.warn("[UpdateTodoList] Context refresh for UI failed (non-critical):", err)
+					}
+				} else {
+					console.log("[UpdateTodoList] Context selection skipped (autoCondenseContext mode, no refs yet)")
+				}
+			} else if (!task.taskEstablished && !task.contextRefsPath) {
 				try {
 					contextSelectionResult = await applyContextSelection(task, normalizedTodos)
 					if (contextSelectionResult) {

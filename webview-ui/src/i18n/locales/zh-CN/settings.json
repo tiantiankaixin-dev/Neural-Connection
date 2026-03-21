@@ -661,9 +661,16 @@
 			"reset": "重置为默认值",
 			"hint": "留空 = 使用默认提示词"
 		},
+		"compressionMode": {
+			"hint": "两种压缩模式互斥——启用一个会自动禁用另一个。"
+		},
 		"autoCondenseContext": {
-			"name": "自动触发智能上下文压缩",
-			"description": "启用时，Roo 将在达到阈值时自动压缩上下文。禁用时，您仍可以手动触发上下文压缩。"
+			"name": "自动压缩（背包选择 + 概括）",
+			"description": "启用时，当 token 达到阈值，Roo 将自动执行上下文块选择和概括生成。"
+		},
+		"contextRetentionTasks": {
+			"label": "保留完整上下文的任务数量",
+			"description": "保留完整上下文的最近任务项数量。超出此数量的较早任务将被压缩为概要和上下文块。（1-10，默认：2）"
 		},
 		"openTabs": {
 			"label": "标签页数量限制",

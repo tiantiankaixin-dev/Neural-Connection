@@ -43,6 +43,7 @@
 	"settings.useAgentRules.description": "Enable loading of AGENTS.md files for agent-specific rules (see https://agent-rules.org/)",
 	"settings.apiRequestTimeout.description": "Maximum time in seconds to wait for API responses (0 = no timeout, 1-3600s, default: 600s). Higher values are recommended for local providers like LM Studio and Ollama that may need more processing time.",
 	"settings.newTaskRequireTodos.description": "Require todos parameter when creating new tasks with the new_task tool",
+	"settings.contextRetentionTasks.description": "Number of recent todo items to retain full context for during context compression and block selection. Older items beyond this count will be compressed into summaries and context blocks. (1-10, default: 2)",
 	"settings.codeIndex.embeddingBatchSize.description": "The batch size for embedding operations during code indexing. Adjust this based on your API provider's limits. Default is 60.",
 	"settings.codeIndex.graphExpansion.enabled.description": "Enable code graph expansion for enriched search results. When enabled, search results are expanded by traversing code relationships (calls, references, class hierarchy) and ranked using PageRank.",
 	"settings.codeIndex.graphExpansion.maxDepth.description": "Maximum depth for graph traversal when expanding search results. Higher values find more distant relationships but take longer. Default is 1.",

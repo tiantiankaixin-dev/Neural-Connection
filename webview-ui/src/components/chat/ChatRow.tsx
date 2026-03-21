@@ -1599,16 +1599,21 @@ export const ChatRowContent = ({
 							checkpoint={message.checkpoint}
 						/>
 					)
-				case "condense_context":
+				case "condense_context": {
 					// In-progress state
 					if (message.partial) {
 						return <InProgressRow eventType="condense_context" />
 					}
-					// Completed state
-					if (message.contextCondense) {
-						return <CondensationResultRow data={message.contextCondense} />
-					}
-					return null
+					// Completed state — reuse the same UI as TodoItemDividerRow
+					return (
+						<TodoItemDividerRow
+							message={message}
+							dividerTs={undefined}
+							isGroupCollapsed={undefined}
+							onToggleTodoGroup={undefined}
+						/>
+					)
+				}
 				case "condense_context_error":
 					return <CondensationErrorRow errorText={message.text} />
 				case "sliding_window_truncation":

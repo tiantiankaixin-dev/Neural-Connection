@@ -28,6 +28,7 @@ import { vscode } from "@/utils/vscode"
 type ContextManagementSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	autoCondenseContext: boolean
 	autoCondenseContextPercent: number
+	contextRetentionTasks: number
 	listApiConfigMeta: any[]
 	maxOpenTabsContext: number
 	maxWorkspaceFiles: number
@@ -60,12 +61,14 @@ type ContextManagementSettingsProps = HTMLAttributes<HTMLDivElement> & {
 		| "includeCurrentTime"
 		| "includeCurrentCost"
 		| "maxGitStatusFiles"
+		| "contextRetentionTasks"
 	>
 }
 
 export const ContextManagementSettings = ({
 	autoCondenseContext,
 	autoCondenseContextPercent,
+	contextRetentionTasks,
 	listApiConfigMeta,
 	maxOpenTabsContext,
 	maxWorkspaceFiles,
@@ -472,7 +475,45 @@ export const ContextManagementSettings = ({
 					/>
 				</SearchableSetting>
 
-				{/* Auto Condense Context */}
+				{/* ── Compression Mode: mutually exclusive ── */}
+				<div className="text-vscode-descriptionForeground text-xs mb-1 mt-2">
+					{t("settings:contextManagement.compressionMode.hint")}
+				</div>
+
+				{/* Mode A: Context Retention Tasks (cross-task, Phase 1) */}
+				<SearchableSetting
+					settingId="context-retention-tasks"
+					section="contextManagement"
+					label={t("settings:contextManagement.contextRetentionTasks.label")}>
+					<VSCodeCheckbox
+						checked={!autoCondenseContext}
+						onChange={(e: any) => setCachedStateField("autoCondenseContext", !e.target.checked)}
+						data-testid="context-retention-mode-checkbox">
+						<span className="font-medium">
+							{t("settings:contextManagement.contextRetentionTasks.label")}
+						</span>
+					</VSCodeCheckbox>
+					<div className="text-vscode-descriptionForeground text-sm mt-1">
+						{t("settings:contextManagement.contextRetentionTasks.description")}
+					</div>
+				</SearchableSetting>
+				{!autoCondenseContext && (
+					<div className="flex flex-col gap-3 pl-3 border-l-2 border-vscode-button-background">
+						<div className="flex items-center gap-2">
+							<Slider
+								min={1}
+								max={10}
+								step={1}
+								value={[contextRetentionTasks ?? 2]}
+								onValueChange={([value]) => setCachedStateField("contextRetentionTasks", value)}
+								data-testid="context-retention-tasks-slider"
+							/>
+							<span className="w-10">{contextRetentionTasks ?? 2}</span>
+						</div>
+					</div>
+				)}
+
+				{/* Mode B: Auto Condense Context (in-task, Phase 3) */}
 				<SearchableSetting
 					settingId="context-auto-condense"
 					section="contextManagement"

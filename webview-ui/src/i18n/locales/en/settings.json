@@ -698,9 +698,16 @@
 			"reset": "Reset to Default",
 			"hint": "Empty = use default prompt"
 		},
+		"compressionMode": {
+			"hint": "Choose one compression mode — enabling one disables the other."
+		},
 		"autoCondenseContext": {
-			"name": "Automatically trigger intelligent context condensing",
-			"description": "When enabled, Roo will automatically condense the context when the threshold is reached. When disabled, you can still manually trigger context condensing."
+			"name": "Auto Condense (backpack + summary)",
+			"description": "When enabled, Roo will automatically run context block selection and summary generation when the token threshold is reached."
+		},
+		"contextRetentionTasks": {
+			"label": "Full context retention (recent tasks)",
+			"description": "Number of recent todo items to retain full context for. Older items beyond this count will be compressed into summaries and context blocks. (1-10, default: 2)"
 		},
 		"openTabs": {
 			"label": "Open tabs context limit",

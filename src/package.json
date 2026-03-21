@@ -440,6 +440,13 @@
 					"default": false,
 					"description": "%settings.newTaskRequireTodos.description%"
 				},
+				"roo-cline.contextRetentionTasks": {
+					"type": "number",
+					"default": 2,
+					"minimum": 1,
+					"maximum": 10,
+					"description": "%settings.contextRetentionTasks.description%"
+				},
 				"roo-cline.codeIndex.embeddingBatchSize": {
 					"type": "number",
 					"default": 60,

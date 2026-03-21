@@ -143,7 +143,13 @@ import {
 	assembleTurns,
 	generateTaskTimestamp,
 } from "../task-persistence/turn-persistence"
-import { compressInTaskContext, executeTransitionSelection, injectContextBlocks } from "../condense/context-selector"
+import {
+	compressInTaskContext,
+	executeTransitionSelection,
+	injectContextBlocks,
+	loadCondenseDetail,
+	performContextSelection,
+} from "../condense/context-selector"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -282,6 +288,28 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	providerRef: WeakRef<ClineProvider>
 	public readonly globalStoragePath: string
+
+	/** Number of recent todo items to retain full context for (read from globalState setting) */
+	get contextRetentionTasks(): number {
+		const provider = this.providerRef.deref()
+		const value = provider?.contextProxy?.getGlobalState("contextRetentionTasks")
+		return typeof value === "number" ? value : 2
+	}
+
+	/** Whether auto-condense (backpack+summary compression) is enabled */
+	get autoCondenseContext(): boolean {
+		const provider = this.providerRef.deref()
+		const value = provider?.contextProxy?.getGlobalState("autoCondenseContext")
+		return typeof value === "boolean" ? value : true
+	}
+
+	/** Threshold percentage of context window to trigger auto-condense (10-100) */
+	get autoCondenseContextPercent(): number {
+		const provider = this.providerRef.deref()
+		const value = provider?.contextProxy?.getGlobalState("autoCondenseContextPercent")
+		return typeof value === "number" ? value : 100
+	}
+
 	abort: boolean = false
 	currentRequestAbortController?: AbortController
 	skipPrevResponseIdOnce: boolean = false
@@ -2151,6 +2179,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					lastMessage.images = images
 					lastMessage.partial = false
 					lastMessage.progressStatus = progressStatus
+					if (contextCondense) {
+						lastMessage.contextCondense = contextCondense
+					}
+					if (contextTruncation) {
+						lastMessage.contextTruncation = contextTruncation
+					}
 
 					// Instead of streaming partialMessage events, we do a save
 					// and post like normal to persist to disk.
@@ -4257,10 +4291,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const systemPrompt = await this.getSystemPrompt()
 
 		// Phase 1: Cross-task transition selection (one-time, when needsContextCompression is set)
+		// Skipped when autoCondenseContext is enabled (mutually exclusive with Phase 3)
 		console.log(
-			`[attemptApiRequest] Phase 1 check: needsContextCompression=${this.needsContextCompression}, taskTimestamp=${this.taskTimestamp}, contextRefsPath=${this.contextRefsPath}`,
+			`[attemptApiRequest] Phase 1 check: needsContextCompression=${this.needsContextCompression}, autoCondenseContext=${this.autoCondenseContext}, taskTimestamp=${this.taskTimestamp}, contextRefsPath=${this.contextRefsPath}`,
 		)
-		if (this.needsContextCompression) {
+		if (this.needsContextCompression && !this.autoCondenseContext) {
 			try {
 				await executeTransitionSelection(this)
 				console.log(
@@ -4268,6 +4303,35 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				)
 			} catch (err) {
 				console.warn("[attemptApiRequest] Phase 1: Transition selection failed (non-critical):", err)
+			}
+			// Emit a non-partial condense_context message with backpack+summary detail
+			const condenseDetailText = await loadCondenseDetail(this)
+			const condenseText =
+				condenseDetailText ?? JSON.stringify({ content: "Context Retention: transition selection completed" })
+			await this.say("condense_context", condenseText, undefined, undefined, undefined, undefined, {
+				isNonInteractive: true,
+			})
+			this.needsContextCompression = false
+		} else if (this.needsContextCompression && this.autoCondenseContext) {
+			// In auto-condense mode, still run context selection (read-only, no history replacement)
+			// so we can display context info in the UI and enable Phase 2 injection
+			try {
+				const count = await performContextSelection(this)
+				console.log(
+					`[attemptApiRequest] Phase 1 (auto-condense): Context selection completed, ${count} blocks selected`,
+				)
+			} catch (err) {
+				console.warn(
+					"[attemptApiRequest] Phase 1 (auto-condense): Context selection failed (non-critical):",
+					err,
+				)
+			}
+			// Emit condense_context message with whatever detail is available
+			const condenseDetailText = await loadCondenseDetail(this)
+			if (condenseDetailText) {
+				await this.say("condense_context", condenseDetailText, undefined, undefined, undefined, undefined, {
+					isNonInteractive: true,
+				})
 			}
 			this.needsContextCompression = false
 		}
@@ -4279,14 +4343,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.warn("[attemptApiRequest] Phase 2: Context block injection failed (non-critical):", err)
 		}
 
-		// Phase 3: Safety net — token overflow compression
+		// Phase 3: Auto-condense — backpack filling + summary compression (when autoCondenseContext is enabled)
 		try {
 			const compressed = await compressInTaskContext(this)
 			if (compressed) {
-				console.log("[attemptApiRequest] Phase 3: In-task context compression applied")
+				console.log("[attemptApiRequest] Phase 3: Auto-condense (backpack+summary) compression applied")
 			}
 		} catch (err) {
-			console.warn("[attemptApiRequest] Phase 3: In-task compression failed (non-critical):", err)
+			console.warn("[attemptApiRequest] Phase 3: Auto-condense compression failed (non-critical):", err)
 		}
 
 		// Full history pipeline: apply context stripping, merge consecutive same-role messages, then clean for API submission.
