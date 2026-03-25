@@ -15,15 +15,43 @@ interface TodoItem {
  */
 interface UpdateTodoListToolBlockProps {
 	todos?: TodoItem[]
+	previousTodos?: TodoItem[]
 	content?: string
 	/**
 	 * Callback when todos change, be sure to implement and notify the model with the latest todos
 	 * @param todos Latest todo list
 	 */
 	onChange: (todos: TodoItem[]) => void
+	/** Callback when user clicks refine on todo items */
+	onRefine?: (todoItemIds: string[]) => void
 	/** Whether editing is allowed (controlled externally) */
 	editable?: boolean
 	userEdited?: boolean
+}
+
+type TodoChangeType = "added" | "status_changed" | "content_changed" | "unchanged"
+
+function computeTodoChanges(prev: TodoItem[] | undefined, current: TodoItem[]): Map<string, TodoChangeType> {
+	const changes = new Map<string, TodoChangeType>()
+	if (!prev || prev.length === 0) return changes
+	const prevMap = new Map<string, TodoItem>()
+	for (const t of prev) {
+		if (t.id) prevMap.set(t.id, t)
+	}
+	for (const t of current) {
+		const id = t.id || t.content
+		const old = t.id ? prevMap.get(t.id) : prev.find((p) => p.content === t.content)
+		if (!old) {
+			changes.set(id, "added")
+		} else if ((old.status || "") !== (t.status || "")) {
+			changes.set(id, "status_changed")
+		} else if (old.content !== t.content) {
+			changes.set(id, "content_changed")
+		} else {
+			changes.set(id, "unchanged")
+		}
+	}
+	return changes
 }
 
 const STATUS_OPTIONS = [
@@ -46,13 +74,26 @@ const STATUS_OPTIONS = [
 
 const genId = () => Math.random().toString(36).slice(2, 10)
 
+const CHANGE_COLORS: Record<TodoChangeType, string> = {
+	added: "var(--vscode-charts-blue)",
+	status_changed: "var(--vscode-charts-yellow)",
+	content_changed: "var(--vscode-charts-orange)",
+	unchanged: "transparent",
+}
+
 const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	todos = [],
+	previousTodos,
 	content,
 	onChange,
+	onRefine,
 	editable = true,
 	userEdited = false,
 }) => {
+	const changeMap = React.useMemo(
+		() => (userEdited && previousTodos ? computeTodoChanges(previousTodos, todos) : new Map()),
+		[userEdited, previousTodos, todos],
+	)
 	const [editTodos, setEditTodos] = useState<TodoItem[]>(
 		todos.length > 0 ? todos.map((todo) => ({ ...todo, id: todo.id || genId() })) : [],
 	)
@@ -61,6 +102,8 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	const newInputRef = useRef<HTMLInputElement>(null)
 	const [deleteId, setDeleteId] = useState<string | null>(null)
 	const [isEditing, setIsEditing] = useState(false)
+	const [selectedForRefine, setSelectedForRefine] = useState<Set<string>>(new Set())
+	const [isRefineMode, setIsRefineMode] = useState(false)
 
 	// Automatically exit edit mode when external editable becomes false
 	useEffect(() => {
@@ -144,43 +187,83 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 		}
 	}
 
-	if (userEdited) {
-		return (
-			<ToolUseBlock>
-				<ToolUseBlockHeader>
-					<div className="flex items-center w-full" style={{ width: "100%" }}>
-						<span
-							className="codicon codicon-feedback mr-1.5"
-							style={{ color: "var(--vscode-charts-yellow)" }}
-						/>
-						<span className="font-bold mr-2" style={{ fontWeight: "bold" }}>
-							User Edit
-						</span>
-						<div className="flex-grow" />
-					</div>
-				</ToolUseBlockHeader>
-				<div className="overflow-x-auto max-w-full" style={{ padding: "12px 0 8px 0" }}>
-					<span className="text-vscode-descriptionForeground">User Edits</span>
-				</div>
-			</ToolUseBlock>
-		)
-	}
-
 	return (
 		<>
 			<ToolUseBlock>
 				<ToolUseBlockHeader>
 					<div className="flex items-center w-full" style={{ width: "100%" }}>
 						<span
-							className="codicon codicon-checklist mr-1.5"
-							style={{ color: "var(--vscode-foreground)" }}
+							className={userEdited ? "codicon codicon-sync mr-1.5" : "codicon codicon-checklist mr-1.5"}
+							style={{ color: userEdited ? "var(--vscode-charts-yellow)" : "var(--vscode-foreground)" }}
 						/>
 						<span className="font-bold mr-2" style={{ fontWeight: "bold" }}>
-							Todo List Updated
+							{userEdited ? "Todo List Modified" : "Todo List Updated"}
 						</span>
 						<div className="flex-grow" />
-						{editable && (
+						{editable && onRefine && !isEditing && (
 							<button
+								type="button"
+								onClick={() => {
+									if (isRefineMode) {
+										// Send selected items for refinement
+										if (selectedForRefine.size > 0) {
+											onRefine(Array.from(selectedForRefine))
+										}
+										setIsRefineMode(false)
+										setSelectedForRefine(new Set())
+									} else {
+										setIsRefineMode(true)
+									}
+								}}
+								style={{
+									border: isRefineMode
+										? "1px solid var(--vscode-charts-blue)"
+										: "1px solid var(--vscode-button-secondaryBorder)",
+									background: isRefineMode
+										? "var(--vscode-charts-blue)"
+										: "var(--vscode-button-secondaryBackground)",
+									color: isRefineMode ? "#fff" : "var(--vscode-button-secondaryForeground)",
+									borderRadius: 4,
+									padding: "2px 8px",
+									cursor: "pointer",
+									fontSize: 12,
+									marginLeft: 6,
+								}}>
+								<span className="codicon codicon-wand mr-1" style={{ fontSize: 12 }} />
+								{isRefineMode
+									? selectedForRefine.size > 0
+										? `Refine (${selectedForRefine.size})`
+										: "Cancel"
+									: "Refine"}
+							</button>
+						)}
+						{isRefineMode && onRefine && (
+							<button
+								type="button"
+								onClick={() => {
+									const allIds = editTodos.map((t) => t.id).filter(Boolean) as string[]
+									if (selectedForRefine.size === allIds.length) {
+										setSelectedForRefine(new Set())
+									} else {
+										setSelectedForRefine(new Set(allIds))
+									}
+								}}
+								style={{
+									border: "1px solid var(--vscode-button-secondaryBorder)",
+									background: "var(--vscode-button-secondaryBackground)",
+									color: "var(--vscode-button-secondaryForeground)",
+									borderRadius: 4,
+									padding: "2px 8px",
+									cursor: "pointer",
+									fontSize: 12,
+									marginLeft: 4,
+								}}>
+								{selectedForRefine.size === editTodos.length ? "Deselect All" : "Select All"}
+							</button>
+						)}
+						{editable && !isRefineMode && (
+							<button
+								type="button"
 								onClick={() => setIsEditing(!isEditing)}
 								style={{
 									border: isEditing
@@ -255,6 +338,8 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 										/>
 									)
 								}
+								const changeType = changeMap.get(todo.id || todo.content) as TodoChangeType | undefined
+								const changeColor = changeType ? CHANGE_COLORS[changeType] : "transparent"
 								return (
 									<li
 										key={todo.id || idx}
@@ -263,8 +348,35 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 											display: "flex",
 											alignItems: "flex-start",
 											minHeight: 20,
+											borderLeft:
+												changeColor !== "transparent" ? `3px solid ${changeColor}` : undefined,
+											paddingLeft: changeColor !== "transparent" ? 6 : undefined,
+											borderRadius: 2,
 										}}>
-										{icon}
+										{isRefineMode && todo.id && (
+											<input
+												type="checkbox"
+												checked={selectedForRefine.has(todo.id)}
+												onChange={() => {
+													setSelectedForRefine((prev) => {
+														const next = new Set(prev)
+														if (next.has(todo.id!)) {
+															next.delete(todo.id!)
+														} else {
+															next.add(todo.id!)
+														}
+														return next
+													})
+												}}
+												style={{
+													marginRight: 6,
+													marginTop: 5,
+													cursor: "pointer",
+													accentColor: "var(--vscode-charts-blue)",
+												}}
+											/>
+										)}
+										{!isRefineMode && icon}
 										{isEditing ? (
 											<input
 												type="text"
@@ -332,6 +444,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 										)}
 										{isEditing && (
 											<button
+												type="button"
 												onClick={() => handleDelete(todo.id!)}
 												style={{
 													border: "none",
@@ -375,6 +488,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 										}}
 									/>
 									<button
+										type="button"
 										onClick={handleAdd}
 										disabled={!newContent.trim()}
 										style={{
@@ -390,6 +504,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 										Add
 									</button>
 									<button
+										type="button"
 										onClick={() => {
 											setAdding(false)
 											setNewContent("")
@@ -410,6 +525,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 								<li style={{ marginTop: 2 }}>
 									{isEditing && (
 										<button
+											type="button"
 											onClick={() => setAdding(true)}
 											style={{
 												border: "1px dashed var(--vscode-button-secondaryBorder)",
@@ -461,6 +577,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 							</div>
 							<div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
 								<button
+									type="button"
 									onClick={cancelDelete}
 									style={{
 										border: "1px solid #bbb",
@@ -474,6 +591,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 									Cancel
 								</button>
 								<button
+									type="button"
 									onClick={confirmDelete}
 									style={{
 										border: "1px solid #f14c4c",

@@ -42,6 +42,7 @@ import { askFollowupQuestionTool } from "../tools/AskFollowupQuestionTool"
 import { switchModeTool } from "../tools/SwitchModeTool"
 import { attemptCompletionTool, AttemptCompletionCallbacks } from "../tools/AttemptCompletionTool"
 import { updateTodoListTool } from "../tools/UpdateTodoListTool"
+import { writeTodoPlanTool } from "../tools/WriteTodoPlanTool"
 import { runSlashCommandTool } from "../tools/RunSlashCommandTool"
 import { skillTool } from "../tools/SkillTool"
 import { generateImageTool } from "../tools/GenerateImageTool"
@@ -120,12 +121,15 @@ export async function presentAssistantMessage(cline: Task) {
 			// their original name in API history
 			const mcpBlock = block as McpToolUse
 
-			if (cline.didRejectTool) {
+			if (cline.didRejectTool || cline.pendingRefineRequest) {
 				// For native protocol, we must send a tool_result for every tool_use to avoid API errors
 				const toolCallId = mcpBlock.id
+				const skipReason = cline.pendingRefineRequest
+					? "pending refine request"
+					: "user rejecting a previous tool"
 				const errorMessage = !mcpBlock.partial
-					? `Skipping MCP tool ${mcpBlock.name} due to user rejecting a previous tool.`
-					: `MCP tool ${mcpBlock.name} was interrupted and not executed due to user rejecting a previous tool.`
+					? `Skipping MCP tool ${mcpBlock.name} due to ${skipReason}.`
+					: `MCP tool ${mcpBlock.name} was interrupted and not executed due to ${skipReason}.`
 
 				if (toolCallId) {
 					cline.pushToolResultToUserContent({
@@ -385,6 +389,8 @@ export async function presentAssistantMessage(cline: Task) {
 						return `[${block.name} for '${block.params.artifact_id}']`
 					case "update_todo_list":
 						return `[${block.name}]`
+					case "write_todo_plan":
+						return `[${block.name} for '${block.params.todo_item_id}']`
 					case "run_slash_command":
 						return `[${block.name} for '${block.params.command}'${block.params.args ? ` with args: ${block.params.args}` : ""}]`
 					case "skill":
@@ -396,12 +402,15 @@ export async function presentAssistantMessage(cline: Task) {
 				}
 			}
 
-			if (cline.didRejectTool) {
-				// Ignore any tool content after user has rejected tool once.
+			if (cline.didRejectTool || cline.pendingRefineRequest) {
+				// Ignore any tool content after user has rejected tool once or requested refine.
 				// For native tool calling, we must send a tool_result for every tool_use to avoid API errors
+				const skipReason = cline.pendingRefineRequest
+					? "pending refine request"
+					: "user rejecting a previous tool"
 				const errorMessage = !block.partial
-					? `Skipping tool ${toolDescription()} due to user rejecting a previous tool.`
-					: `Tool ${toolDescription()} was interrupted and not executed due to user rejecting a previous tool.`
+					? `Skipping tool ${toolDescription()} due to ${skipReason}.`
+					: `Tool ${toolDescription()} was interrupted and not executed due to ${skipReason}.`
 
 				cline.pushToolResultToUserContent({
 					type: "tool_result",
@@ -739,6 +748,13 @@ export async function presentAssistantMessage(cline: Task) {
 						pushToolResult,
 					})
 					break
+				case "write_todo_plan":
+					await writeTodoPlanTool.handle(cline, block as ToolUse<"write_todo_plan">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
 				case "apply_diff":
 					await checkpointSaveAndMark(cline)
 					await applyDiffToolClass.handle(cline, block as ToolUse<"apply_diff">, {
@@ -1064,7 +1080,7 @@ export async function presentAssistantMessage(cline: Task) {
 	// skip execution since `didRejectTool` and iterate until `contentIndex` is
 	// set to message length and it sets userMessageContentReady to true itself
 	// (instead of preemptively doing it in iterator).
-	if (!block.partial || cline.didRejectTool || cline.didAlreadyUseTool) {
+	if (!block.partial || cline.didRejectTool || cline.didAlreadyUseTool || cline.pendingRefineRequest) {
 		// Block is finished streaming and executing.
 		if (cline.currentStreamingContentIndex === cline.assistantMessageContent.length - 1) {
 			// It's okay that we increment if !didCompleteReadingStream, it'll

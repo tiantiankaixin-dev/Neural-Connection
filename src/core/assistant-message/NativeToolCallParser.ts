@@ -567,6 +567,15 @@ export class NativeToolCallParser {
 				}
 				break
 
+			case "write_todo_plan":
+				if (partialArgs.todo_item_id !== undefined || partialArgs.plans !== undefined) {
+					nativeArgs = {
+						todo_item_id: partialArgs.todo_item_id,
+						plans: partialArgs.plans,
+					}
+				}
+				break
+
 			case "use_mcp_tool":
 				if (partialArgs.server_name !== undefined || partialArgs.tool_name !== undefined) {
 					nativeArgs = {
@@ -901,6 +910,15 @@ export class NativeToolCallParser {
 					if (args.todos !== undefined) {
 						nativeArgs = {
 							todos: args.todos,
+						} as NativeArgsFor<TName>
+					}
+					break
+
+				case "write_todo_plan":
+					if (args.todo_item_id !== undefined && args.plans !== undefined) {
+						nativeArgs = {
+							todo_item_id: args.todo_item_id,
+							plans: typeof args.plans === "string" ? args.plans : JSON.stringify(args.plans),
 						} as NativeArgsFor<TName>
 					}
 					break

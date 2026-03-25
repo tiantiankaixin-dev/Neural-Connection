@@ -94,6 +94,9 @@ export const toolParamNames = [
 	"max_depth",
 	"type",
 	"full_path",
+	// write_todo_plan parameters
+	"todo_item_id",
+	"plans",
 ] as const
 
 export type ToolParamName = (typeof toolParamNames)[number]
@@ -128,6 +131,7 @@ export type NativeToolArgs = {
 	search_files: { path: string; regex: string; file_pattern?: string | null }
 	switch_mode: { mode_slug: string; reason: string }
 	update_todo_list: { todos: string }
+	write_todo_plan: { todo_item_id: string; plans: string }
 	use_mcp_tool: { server_name: string; tool_name: string; arguments?: Record<string, unknown> }
 	write_to_file: { path: string; content: string }
 	find_by_name: {
@@ -369,6 +373,7 @@ export const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
 	new_task: "create new task",
 	codebase_search: "codebase search",
 	update_todo_list: "update todo list",
+	write_todo_plan: "write todo plan",
 	run_slash_command: "run slash command",
 	skill: "load skill",
 	generate_image: "generate images",
@@ -435,6 +440,7 @@ export const ALWAYS_AVAILABLE_TOOLS: ToolName[] = [
 	"switch_mode",
 	"new_task",
 	"update_todo_list",
+	"write_todo_plan",
 	"run_slash_command",
 	"skill",
 	"create_memory",

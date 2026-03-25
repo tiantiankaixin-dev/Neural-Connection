@@ -16,6 +16,7 @@ import pWaitFor from "p-wait-for"
 import { serializeError } from "serialize-error"
 import { Package } from "../../shared/package"
 import { formatToolInvocation } from "../tools/helpers/toolResultFormatting"
+import { readPlanFiles } from "../task-persistence/plan-persistence"
 
 import {
 	type TaskLike,
@@ -310,6 +311,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return typeof value === "number" ? value : 100
 	}
 
+	/** Minimum number of recent messages to preserve during auto-condense compression (1-20) */
+	get minPreserveMessages(): number {
+		const provider = this.providerRef.deref()
+		const value = provider?.contextProxy?.getGlobalState("minPreserveMessages")
+		return typeof value === "number" ? value : 4
+	}
+
 	abort: boolean = false
 	currentRequestAbortController?: AbortController
 	skipPrevResponseIdOnce: boolean = false
@@ -576,6 +584,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	didAlreadyUseTool = false
 	didToolFailInCurrentTurn = false
 	didCompleteReadingStream = false
+	pendingTodoEdit: { oldTodos: TodoItem[]; newTodos: TodoItem[] } | null = null
+	pendingRefineRequest: { todoItemIds: string[] } | null = null
 	private _started = false
 	// No streaming parser is required.
 	assistantMessageParser?: undefined
@@ -1352,7 +1362,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 *   - No item is currently in_progress
 	 *   - No boundaries have been recorded
 	 */
-	public buildEffectiveHistory(): ApiMessage[] {
+	public async buildEffectiveHistory(): Promise<ApiMessage[]> {
 		// If no todo list or no boundaries, return full history
 		if (!this.todoList || this.todoList.length === 0 || this.todoItemBoundaries.size === 0) {
 			return this.apiConversationHistory
@@ -1443,7 +1453,44 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			} as ApiMessage)
 		}
 
-		// 3. Keep all messages from the current item's boundary onwards
+		// 3. Inject plan files for current item (if any exist)
+		try {
+			const planFiles = await readPlanFiles(
+				this.globalStoragePath,
+				this.taskId,
+				this.taskTimestamp,
+				currentItem.id,
+			)
+			if (planFiles.length > 0) {
+				const planText = planFiles.map((pf) => `### ${pf.filePath}\n${pf.content}`).join("\n\n")
+
+				result.push({
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: `[IMPLEMENTATION PLAN for "${currentItem.content}"]\nThe following per-file plans were created during the refine phase. Follow them closely:\n\n${planText}`,
+						},
+					],
+					ts: Date.now(),
+				} as ApiMessage)
+
+				result.push({
+					role: "assistant",
+					content: [
+						{
+							type: "text",
+							text: `Understood. I will follow the implementation plan for "${currentItem.content}" covering ${planFiles.length} file(s).`,
+						},
+					],
+					ts: Date.now(),
+				} as ApiMessage)
+			}
+		} catch (err) {
+			console.warn("[buildEffectiveHistory] Failed to read plan files (non-critical):", err)
+		}
+
+		// 4. Keep all messages from the current item's boundary onwards
 		for (let i = currentItemStart; i < this.apiConversationHistory.length; i++) {
 			result.push(this.apiConversationHistory[i])
 		}
@@ -1610,6 +1657,31 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			if (msg.partial !== true) {
 				this.cloudSyncedMessageTimestamps.add(msg.ts)
 			}
+		}
+	}
+
+	/**
+	 * Update or create a user_edit_todos message. If the last user_edit_todos
+	 * message exists, update its text in-place instead of creating a duplicate.
+	 */
+	public async upsertUserEditTodos(text: string): Promise<void> {
+		const lastIdx = findLastIndex(this.clineMessages, (m) => m.type === "say" && m.say === "user_edit_todos")
+		if (lastIdx !== -1) {
+			// Preserve the original previousTodos from the first edit in this session
+			try {
+				const existingData = JSON.parse(this.clineMessages[lastIdx].text || "{}")
+				const newData = JSON.parse(text)
+				if (existingData.previousTodos && !newData._preservedPrevious) {
+					newData.previousTodos = existingData.previousTodos
+				}
+				this.clineMessages[lastIdx].text = JSON.stringify(newData)
+			} catch {
+				this.clineMessages[lastIdx].text = text
+			}
+			await this.saveClineMessages()
+			await this.updateClineMessage(this.clineMessages[lastIdx])
+		} else {
+			await this.say("user_edit_todos", text)
 		}
 	}
 
@@ -3459,6 +3531,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							break
 						}
 
+						if (this.pendingTodoEdit) {
+							assistantMessage += "\n\n[Response interrupted by user todo list edit]"
+							break
+						}
+
+						if (this.pendingRefineRequest) {
+							assistantMessage += "\n\n[Response interrupted by user refine request]"
+							break
+						}
+
 						if (this.didAlreadyUseTool) {
 							assistantMessage +=
 								"\n\n[Response interrupted by a tool use result. Only one tool may be used at a time and should be placed at the end of the message.]"
@@ -3645,20 +3727,102 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					// Cline instance to finish aborting (error is thrown here when
 					// any function in the for loop throws due to this.abort).
 					if (!this.abandoned) {
-						// Determine cancellation reason
-						const cancelReason: ClineApiReqCancelReason = this.abort ? "user_cancelled" : "streaming_failed"
+						// PRIORITY: Check for intentional interrupts BEFORE abortStream.
+						// abortStream updates UI with error messages which corrupts state
+						// for refine/edit requests that are not actual errors.
+						if (this.pendingRefineRequest) {
+							// Stream was intentionally aborted for a refine request.
+							// Consume it here and push refine prompt onto the stack.
+							const { todoItemIds } = this.pendingRefineRequest
+							this.pendingRefineRequest = null
+							console.log(
+								`[Task#${this.taskId}.${this.instanceId}] Stream aborted for refine request, injecting refine prompt`,
+							)
 
+							const itemsToRefine = (this.todoList ?? []).filter((t) => todoItemIds.includes(t.id))
+							if (itemsToRefine.length > 0) {
+								const itemDescriptions = itemsToRefine.map((t) => `- [${t.id}] ${t.content}`).join("\n")
+
+								const refinePrompt = [
+									"[REFINE REQUEST] The user wants you to create detailed per-file implementation plans for the following todo item(s):",
+									"",
+									itemDescriptions,
+									"",
+									"For each todo item, analyze what files in the project need to be modified or created. Then use the `write_todo_plan` tool to write detailed .md plan files.",
+									"",
+									"Each plan entry should include:",
+									"- filePath: the relative path to the project file that needs changes",
+									"- content: detailed markdown describing WHAT changes are needed, WHY, and HOW",
+									"",
+									"Think carefully about:",
+									"1. Which existing files need modification",
+									"2. Which new files need to be created",
+									"3. The specific changes required in each file (functions to add/modify, imports, etc.)",
+									"4. Dependencies between files",
+									"",
+									"Call `write_todo_plan` once per todo item with all its plan files.",
+								].join("\n")
+
+								stack.push({
+									userContent: [{ type: "text", text: refinePrompt }],
+									includeFileDetails: false,
+								})
+							}
+							continue
+						} else if (this.pendingTodoEdit) {
+							// Stream was intentionally aborted for a todo edit.
+							// Consume it here and push the diff onto the stack.
+							const { oldTodos, newTodos } = this.pendingTodoEdit
+							this.pendingTodoEdit = null
+							console.log(
+								`[Task#${this.taskId}.${this.instanceId}] Stream aborted for todo edit, injecting diff`,
+							)
+
+							const formatTodoList = (todos: TodoItem[]) =>
+								todos.length === 0
+									? "(empty)"
+									: todos
+											.map((t) => {
+												const mark =
+													t.status === "completed"
+														? "x"
+														: t.status === "in_progress"
+															? "-"
+															: " "
+												return `[${mark}] ${t.content}`
+											})
+											.join("\n")
+
+							const diffText = [
+								"[USER TODO LIST EDIT] The user has manually modified the todo list while you were working.",
+								"",
+								"Previous todo list:",
+								formatTodoList(oldTodos),
+								"",
+								"Updated todo list (user-edited):",
+								formatTodoList(newTodos),
+								"",
+								"Adjust your plan accordingly.",
+							].join("\n")
+
+							stack.push({
+								userContent: [{ type: "text", text: diffText }],
+								includeFileDetails: false,
+							})
+							continue
+						}
+
+						// Normal error handling path (not a refine/edit interrupt)
+						const cancelReason: ClineApiReqCancelReason = this.abort ? "user_cancelled" : "streaming_failed"
 						const rawErrorMessage = error.message ?? JSON.stringify(serializeError(error), null, 2)
 
-						// Check auto-retry state BEFORE abortStream so we can suppress the error
-						// message on the api_req_started row when backoffAndAnnounce will display it instead.
 						const stateForBackoff = await this.providerRef.deref()?.getState()
 						const willAutoRetry = !this.abort && stateForBackoff?.autoApprovalEnabled
 
 						const streamingFailedMessage = this.abort
 							? undefined
 							: willAutoRetry
-								? undefined // backoffAndAnnounce will display the error with retry countdown
+								? undefined
 								: `${t("common:interruption.streamTerminatedByProvider")}: ${rawErrorMessage}`
 
 						// Clean up partial state
@@ -3670,7 +3834,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							await this.abortTask()
 						} else {
 							// Stream failed - log the error and retry with the same content
-							// The existing rate limiting will prevent rapid retries
 							console.error(
 								`[Task#${this.taskId}.${this.instanceId}] Stream failed, will retry: ${rawErrorMessage}`,
 							)
@@ -3684,21 +3847,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 									console.log(
 										`[Task#${this.taskId}.${this.instanceId}] Task aborted during mid-stream retry backoff`,
 									)
-									// Abort the entire task
 									this.abortReason = "user_cancelled"
 									await this.abortTask()
 									break
 								}
 							}
 
-							// Push the same content back onto the stack to retry, incrementing the retry attempt counter
+							// Push the same content back onto the stack to retry
 							stack.push({
 								userContent: currentUserContent,
 								includeFileDetails: false,
 								retryAttempt: (currentItem.retryAttempt ?? 0) + 1,
 							})
 
-							// Continue to retry the request
 							continue
 						}
 					}
@@ -4017,6 +4178,76 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					} else {
 						// Reset counter when tools are used successfully
 						this.consecutiveNoToolUseCount = 0
+					}
+
+					// If user edited the todo list mid-execution, inject a diff message
+					if (this.pendingTodoEdit) {
+						const { oldTodos, newTodos } = this.pendingTodoEdit
+						this.pendingTodoEdit = null
+
+						const formatTodoList = (todos: TodoItem[]) =>
+							todos.length === 0
+								? "(empty)"
+								: todos
+										.map((t) => {
+											const mark =
+												t.status === "completed" ? "x" : t.status === "in_progress" ? "-" : " "
+											return `[${mark}] ${t.content}`
+										})
+										.join("\n")
+
+						const diffText = [
+							"[USER TODO LIST EDIT] The user has manually modified the todo list while you were working. Please review the changes and adjust your plan accordingly.",
+							"",
+							"Previous todo list:",
+							formatTodoList(oldTodos),
+							"",
+							"Updated todo list (user-edited):",
+							formatTodoList(newTodos),
+							"",
+							"Analyze the differences. If items were removed or changed, you may need to roll back or skip related work. If items were added or re-prioritized, adjust your execution plan. Respond with your assessment and continue working on the updated list.",
+						].join("\n")
+
+						this.userMessageContent.push({
+							type: "text",
+							text: diffText,
+						})
+					}
+
+					// If user requested todo item refinement, inject a prompt asking AI to create plans
+					if (this.pendingRefineRequest) {
+						const { todoItemIds } = this.pendingRefineRequest
+						this.pendingRefineRequest = null
+
+						const itemsToRefine = (this.todoList ?? []).filter((t) => todoItemIds.includes(t.id))
+						if (itemsToRefine.length > 0) {
+							const itemDescriptions = itemsToRefine.map((t) => `- [${t.id}] ${t.content}`).join("\n")
+
+							const refinePrompt = [
+								"[REFINE REQUEST] The user wants you to create detailed per-file implementation plans for the following todo item(s):",
+								"",
+								itemDescriptions,
+								"",
+								"For each todo item, analyze what files in the project need to be modified or created. Then use the `write_todo_plan` tool to write detailed .md plan files.",
+								"",
+								"Each plan entry should include:",
+								"- filePath: the relative path to the project file that needs changes",
+								"- content: detailed markdown describing WHAT changes are needed, WHY, and HOW",
+								"",
+								"Think carefully about:",
+								"1. Which existing files need modification",
+								"2. Which new files need to be created",
+								"3. The specific changes required in each file (functions to add/modify, imports, etc.)",
+								"4. Dependencies between files",
+								"",
+								"Call `write_todo_plan` once per todo item with all its plan files.",
+							].join("\n")
+
+							this.userMessageContent.push({
+								type: "text",
+								text: refinePrompt,
+							})
+						}
 					}
 
 					// Push to stack if there's content OR if we're paused waiting for a subtask.
@@ -4354,7 +4585,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		// Full history pipeline: apply context stripping, merge consecutive same-role messages, then clean for API submission.
-		const effectiveHistory = this.buildEffectiveHistory()
+		const effectiveHistory = await this.buildEffectiveHistory()
 		const mergedMessages = mergeConsecutiveApiMessages(effectiveHistory)
 		const messagesWithoutImages = maybeRemoveImageBlocks(mergedMessages, this.api)
 		const cleanConversationHistory = this.buildCleanConversationHistory(messagesWithoutImages as ApiMessage[])
@@ -4492,6 +4723,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		} catch (error) {
 			this.isWaitingForFirstChunk = false
 			this.currentRequestAbortController = undefined
+
+			if (this.abort || this.pendingRefineRequest || this.pendingTodoEdit) {
+				throw error
+			}
 
 			// note that this api_req_failed ask is unique in that we only present this option if the api hasn't streamed any content yet (ie it fails on the first chunk due), as it would allow them to hit a retry button. However if the api failed mid-stream, it could be in any arbitrary state where some tools may have executed, so that error is handled differently and requires cancelling the task entirely.
 			if (autoApprovalEnabled) {

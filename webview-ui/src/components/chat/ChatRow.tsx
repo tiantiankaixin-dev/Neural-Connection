@@ -25,7 +25,6 @@ import { formatPathTooltip } from "@src/utils/formatPathTooltip"
 
 import { ToolUseBlock, ToolUseBlockHeader } from "../common/ToolUseBlock"
 import UpdateTodoListToolBlock from "./UpdateTodoListToolBlock"
-import { TodoChangeDisplay } from "./TodoChangeDisplay"
 import CodeAccordian from "../common/CodeAccordian"
 import MarkdownBlock from "../common/MarkdownBlock"
 import { ReasoningBlock } from "./ReasoningBlock"
@@ -49,6 +48,7 @@ import { CommandExecutionError } from "./CommandExecutionError"
 import { AutoApprovedRequestLimitWarning } from "./AutoApprovedRequestLimitWarning"
 import { InProgressRow, CondensationErrorRow, TruncationResultRow } from "./context-management"
 import CodebaseSearchResultsDisplay from "./CodebaseSearchResultsDisplay"
+import RefineResultBlock from "./RefineResultBlock"
 import { appendImages } from "@src/utils/imageUtils"
 import { McpExecution } from "./McpExecution"
 import { ChatTextArea } from "./ChatTextArea"
@@ -76,39 +76,6 @@ import {
 import { cn } from "@/lib/utils"
 import { PathTooltip } from "../ui/PathTooltip"
 import { OpenMarkdownPreviewButton } from "./OpenMarkdownPreviewButton"
-
-// Helper function to get previous todos before a specific message
-function getPreviousTodos(messages: ClineMessage[], currentMessageTs: number): any[] {
-	// Find the previous updateTodoList message before the current one
-	const previousUpdateIndex = messages
-		.slice()
-		.reverse()
-		.findIndex((msg) => {
-			if (msg.ts >= currentMessageTs) return false
-			if (msg.type === "ask" && msg.ask === "tool") {
-				try {
-					const tool = JSON.parse(msg.text || "{}")
-					return tool.tool === "updateTodoList"
-				} catch {
-					return false
-				}
-			}
-			return false
-		})
-
-	if (previousUpdateIndex !== -1) {
-		const previousMessage = messages.slice().reverse()[previousUpdateIndex]
-		try {
-			const tool = JSON.parse(previousMessage.text || "{}")
-			return tool.todos || []
-		} catch {
-			return []
-		}
-	}
-
-	// If no previous updateTodoList message, return empty array
-	return []
-}
 
 // Parse todo_item_divider text: plain string or JSON { content, summary, turns }
 interface DividerTurn {
@@ -331,6 +298,8 @@ interface ChatRowProps {
 	editable?: boolean
 	hasCheckpoint?: boolean
 	onToggleTodoGroup?: (dividerTs: number) => void
+	showRefiningIndicator?: boolean
+	onRefineTodoItems?: (todoItemIds: string[]) => void
 }
 
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
@@ -407,6 +376,8 @@ export const ChatRowContent = ({
 	isFollowUpAnswered,
 	isFollowUpAutoApprovalPaused,
 	onToggleTodoGroup,
+	showRefiningIndicator,
+	onRefineTodoItems,
 }: ChatRowContentProps) => {
 	const { t, i18n } = useTranslation()
 
@@ -794,10 +765,16 @@ export const ChatRowContent = ({
 			}
 			case "updateTodoList" as any: {
 				const todos = (tool as any).todos || []
-				// Get previous todos from the latest todos in the task context
-				const previousTodos = getPreviousTodos(clineMessages, message.ts)
-
-				return <TodoChangeDisplay previousTodos={previousTodos} newTodos={todos} />
+				return (
+					<UpdateTodoListToolBlock
+						todos={todos}
+						editable={true}
+						onChange={(newTodos) =>
+							vscode.postMessage({ type: "editTodoList", payload: { todos: newTodos } })
+						}
+						onRefine={onRefineTodoItems}
+					/>
+				)
 			}
 			case "readFile":
 				// Check if this is a batch file permission request
@@ -1298,12 +1275,17 @@ export const ChatRowContent = ({
 					)
 				case "reasoning":
 					return (
-						<ReasoningBlock
-							content={message.text || ""}
-							ts={message.ts}
-							isStreaming={isStreaming}
-							isLast={isLast}
-						/>
+						<>
+							<ReasoningBlock
+								content={message.text || ""}
+								ts={message.ts}
+								isStreaming={isStreaming}
+								isLast={isLast}
+							/>
+							{showRefiningIndicator && isLast && isStreaming && (
+								<div className="mt-1 ml-1 text-xs text-vscode-descriptionForeground">refining...</div>
+							)}
+						</>
 					)
 				case "api_req_started":
 					// Determine if the API request is in progress
@@ -1335,6 +1317,9 @@ export const ChatRowContent = ({
 									${Number(cost || 0)?.toFixed(4)}
 								</div>
 							</div>
+							{showRefiningIndicator && isLast && isApiRequestInProgress && (
+								<div className="mt-1 ml-7 text-xs text-vscode-descriptionForeground">refining...</div>
+							)}
 							{(((cost === null || cost === undefined) && apiRequestFailedMessage) ||
 								apiReqStreamingFailedMessage) && (
 								<ErrorRow
@@ -1668,8 +1653,39 @@ export const ChatRowContent = ({
 						/>
 					)
 				}
-				case "user_edit_todos":
-					return <UpdateTodoListToolBlock userEdited onChange={() => {}} />
+				case "user_edit_todos": {
+					let editedTodos: any[] = []
+					let prevTodos: any[] | undefined
+					try {
+						const parsed = JSON.parse(message.text || "{}")
+						editedTodos = parsed.todos || []
+						prevTodos = parsed.previousTodos
+					} catch {
+						// ignore parse errors
+					}
+					return (
+						<UpdateTodoListToolBlock
+							todos={editedTodos}
+							previousTodos={prevTodos}
+							userEdited
+							editable={true}
+							onChange={(newTodos) =>
+								vscode.postMessage({ type: "editTodoList", payload: { todos: newTodos } })
+							}
+							onRefine={onRefineTodoItems}
+						/>
+					)
+				}
+				case "refine_result": {
+					let refineData: any = null
+					try {
+						refineData = JSON.parse(message.text || "{}")
+					} catch {
+						// ignore parse errors
+					}
+					if (!refineData || !Array.isArray(refineData.plans)) return null
+					return <RefineResultBlock data={refineData} />
+				}
 				case "tool" as any:
 					// Handle say tool messages
 					const sayTool = safeJsonParse<ClineSayTool>(message.text)

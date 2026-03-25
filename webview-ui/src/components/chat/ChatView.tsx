@@ -168,6 +168,8 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		{ type: "WAIT_TIMEOUT" | "INIT_TIMEOUT"; timeout: number } | undefined
 	>(undefined)
 	const [isCondensing, setIsCondensing] = useState<boolean>(false)
+	const [isRefining, setIsRefining] = useState<boolean>(false)
+	const hasSeenStreamingSinceRefine = useRef(false)
 	const [collapsedTodoGroups, setCollapsedTodoGroups] = useState<Set<number>>(new Set())
 	const autoCollapsedRef = useRef(false)
 	const [showAnnouncementModal, setShowAnnouncementModal] = useState(false)
@@ -249,6 +251,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	const [playProgressLoop] = useSound(`${audioBaseUri}/progress_loop.wav`, { volume, soundEnabled, interrupt: true })
 
 	const lastPlayedRef = useRef<Record<string, number>>({})
+
+	const handleRefineTodoItems = useCallback((todoItemIds: string[]) => {
+		setIsRefining(true)
+		vscode.postMessage({ type: "refineTodoItems", payload: { todoItemIds } })
+	}, [])
 
 	const playSound = useCallback(
 		(audioType: AudioType) => {
@@ -646,6 +653,39 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 		return false
 	}, [modifiedMessages, clineAsk, enableButtons, primaryButtonText])
+
+	useEffect(() => {
+		if (!isRefining) {
+			hasSeenStreamingSinceRefine.current = false
+			return
+		}
+
+		// Track whether streaming has started since refine was requested.
+		// There is a gap between clicking Refine and the new API request
+		// starting, during which isStreaming is false. We must not reset
+		// the indicator until we have seen at least one streaming cycle.
+		if (isStreaming) {
+			hasSeenStreamingSinceRefine.current = true
+		}
+
+		if (!hasSeenStreamingSinceRefine.current) {
+			return
+		}
+
+		if (!isStreaming) {
+			setIsRefining(false)
+			return
+		}
+
+		if (lastMessage?.type === "ask") {
+			setIsRefining(false)
+			return
+		}
+
+		if (lastMessage?.type === "say" && lastMessage.say !== "api_req_started" && lastMessage.say !== "reasoning") {
+			setIsRefining(false)
+		}
+	}, [isRefining, isStreaming, lastMessage])
 
 	const markFollowUpAsAnswered = useCallback(() => {
 		const lastFollowUpMessage = messagesRef.current.findLast((msg: ClineMessage) => msg.ask === "followup")
@@ -1634,6 +1674,8 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				<ChatRow
 					key={messageOrGroup.ts}
 					message={messageOrGroup}
+					showRefiningIndicator={isRefining}
+					onRefineTodoItems={handleRefineTodoItems}
 					isExpanded={expandedRows[messageOrGroup.ts] || false}
 					onToggleExpand={toggleRowExpansion} // This was already stabilized
 					lastModifiedMessage={modifiedMessages.at(-1)} // Original direct access
@@ -1669,7 +1711,9 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			toggleRowExpansion,
 			modifiedMessages,
 			groupedMessages.length,
+			isRefining,
 			handleRowHeightChange,
+			handleRefineTodoItems,
 			isStreaming,
 			handleSuggestionClickInRow,
 			handleBatchFileResponse,

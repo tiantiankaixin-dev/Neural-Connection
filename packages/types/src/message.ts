@@ -185,6 +185,7 @@ export const clineSays = [
 	"tool",
 	"task_completed",
 	"todo_item_divider",
+	"refine_result",
 ] as const
 
 export const clineSaySchema = z.enum(clineSays)

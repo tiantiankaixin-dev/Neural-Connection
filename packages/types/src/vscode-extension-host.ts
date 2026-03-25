@@ -379,6 +379,7 @@ export type ExtensionState = Pick<
 	autoCondenseContext: boolean
 	autoCondenseContextPercent: number
 	contextRetentionTasks: number
+	minPreserveMessages: number
 	marketplaceItems?: MarketplaceItem[]
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	marketplaceInstalledMetadata?: { project: Record<string, any>; global: Record<string, any> }
@@ -616,6 +617,8 @@ export interface WebviewMessage {
 		| "exportConversationMemory"
 		| "importConversationMemory"
 		| "importConversationMemoryAsNewTask"
+		| "editTodoList"
+		| "refineTodoItems"
 	text?: string
 	editedMessageContent?: string
 	tab?: "settings" | "history" | "mcp" | "modes" | "chat" | "marketplace" | "cloud"
@@ -766,6 +769,10 @@ export type InstallMarketplaceItemWithParametersPayload = z.infer<
 	typeof installMarketplaceItemWithParametersPayloadSchema
 >
 
+export interface RefineTodoItemsPayload {
+	todoItemIds: string[]
+}
+
 export type WebViewMessagePayload =
 	| CheckpointDiffPayload
 	| CheckpointRestorePayload
@@ -774,6 +781,7 @@ export type WebViewMessagePayload =
 	| InstallMarketplaceItemWithParametersPayload
 	| UpdateTodoListPayload
 	| EditQueuedMessagePayload
+	| RefineTodoItemsPayload
 
 export interface IndexingStatus {
 	systemStatus: string

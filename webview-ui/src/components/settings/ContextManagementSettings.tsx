@@ -29,6 +29,7 @@ type ContextManagementSettingsProps = HTMLAttributes<HTMLDivElement> & {
 	autoCondenseContext: boolean
 	autoCondenseContextPercent: number
 	contextRetentionTasks: number
+	minPreserveMessages: number
 	listApiConfigMeta: any[]
 	maxOpenTabsContext: number
 	maxWorkspaceFiles: number
@@ -62,6 +63,7 @@ type ContextManagementSettingsProps = HTMLAttributes<HTMLDivElement> & {
 		| "includeCurrentCost"
 		| "maxGitStatusFiles"
 		| "contextRetentionTasks"
+		| "minPreserveMessages"
 	>
 }
 
@@ -69,6 +71,7 @@ export const ContextManagementSettings = ({
 	autoCondenseContext,
 	autoCondenseContextPercent,
 	contextRetentionTasks,
+	minPreserveMessages,
 	listApiConfigMeta,
 	maxOpenTabsContext,
 	maxWorkspaceFiles,
@@ -527,6 +530,30 @@ export const ContextManagementSettings = ({
 				</SearchableSetting>
 				{autoCondenseContext && (
 					<div className="flex flex-col gap-3 pl-3 border-l-2 border-vscode-button-background">
+						{/* Min preserve messages slider */}
+						<SearchableSetting
+							settingId="context-min-preserve-messages"
+							section="contextManagement"
+							label={t("settings:contextManagement.minPreserveMessages.label")}>
+							<span className="block font-medium mb-1">
+								{t("settings:contextManagement.minPreserveMessages.label")}
+							</span>
+							<div className="flex items-center gap-2">
+								<Slider
+									min={1}
+									max={20}
+									step={1}
+									value={[minPreserveMessages ?? 4]}
+									onValueChange={([value]) => setCachedStateField("minPreserveMessages", value)}
+									data-testid="min-preserve-messages-slider"
+								/>
+								<span className="w-10">{minPreserveMessages ?? 4}</span>
+							</div>
+							<div className="text-vscode-descriptionForeground text-sm mt-1">
+								{t("settings:contextManagement.minPreserveMessages.description")}
+							</div>
+						</SearchableSetting>
+
 						<div className="flex items-center gap-4 font-bold">
 							<FoldVertical size={16} />
 							<div>{t("settings:contextManagement.condensingThreshold.label")}</div>

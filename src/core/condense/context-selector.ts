@@ -1575,8 +1575,9 @@ export async function compressInTaskContext(task: Task): Promise<boolean> {
 		}
 	}
 
-	// Ensure we always keep at least a few recent messages
-	keepFromIndex = Math.min(keepFromIndex, coreMessages.length - 4)
+	// Ensure we always keep at least minPreserveMessages recent messages
+	const minKeep = task.minPreserveMessages
+	keepFromIndex = Math.min(keepFromIndex, coreMessages.length - minKeep)
 	if (keepFromIndex <= 2) {
 		return false
 	}

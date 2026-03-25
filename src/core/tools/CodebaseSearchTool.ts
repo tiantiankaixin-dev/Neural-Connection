@@ -74,6 +74,50 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 		}
 
 		task.consecutiveMistakeCount = 0
+		const SEARCH_INTERRUPTED = Symbol("codebase_search_interrupted")
+		const isInterrupted = () =>
+			task.abort || task.didRejectTool || !!task.pendingRefineRequest || !!task.pendingTodoEdit
+		const runInterruptibly = async <T>(operation: Promise<T>): Promise<T | typeof SEARCH_INTERRUPTED> => {
+			if (isInterrupted()) {
+				return SEARCH_INTERRUPTED
+			}
+
+			let interval: NodeJS.Timeout | undefined
+			const guardedOperation = operation.then(
+				(value) => ({ type: "value" as const, value }),
+				(error) => ({ type: "error" as const, error }),
+			)
+			const interruptPromise = new Promise<typeof SEARCH_INTERRUPTED>((resolve) => {
+				const check = () => {
+					if (isInterrupted()) {
+						if (interval) {
+							clearInterval(interval)
+						}
+						resolve(SEARCH_INTERRUPTED)
+					}
+				}
+
+				check()
+				if (!interval) {
+					interval = setInterval(check, 50)
+				}
+			})
+
+			try {
+				const result = await Promise.race([guardedOperation, interruptPromise])
+				if (result === SEARCH_INTERRUPTED) {
+					return SEARCH_INTERRUPTED
+				}
+				if (result.type === "error") {
+					throw result.error
+				}
+				return result.value
+			} finally {
+				if (interval) {
+					clearInterval(interval)
+				}
+			}
+		}
 
 		try {
 			const context = task.providerRef.deref()?.context
@@ -97,7 +141,16 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 			// Search with each query and merge results (dedup by ID, keep highest score)
 			const mergedMap = new Map<string | number, VectorStoreSearchResult>()
 			for (const q of queries) {
-				const results = await manager.searchIndex(q, directoryPrefix, resolved)
+				// Early exit if user requested refine/rejection while searching
+				if (task.didRejectTool || task.pendingRefineRequest) {
+					pushToolResult("[Tool interrupted by user action]")
+					return
+				}
+				const results = await runInterruptibly(manager.searchIndex(q, directoryPrefix, resolved))
+				if (results === SEARCH_INTERRUPTED) {
+					pushToolResult("[Tool interrupted by user action]")
+					return
+				}
 				if (results) {
 					for (const r of results) {
 						const existing = mergedMap.get(r.id)
@@ -160,6 +213,12 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 					refs: p.refs as string[] | undefined,
 				})
 			})
+
+			// Early exit if interrupted during result processing
+			if (task.didRejectTool || task.pendingRefineRequest) {
+				pushToolResult("[Tool interrupted by user action]")
+				return
+			}
 
 			// Send raw results to webview (unchanged)
 			const jsonResult = { query: queries, results: allResults }
@@ -305,6 +364,10 @@ export class CodebaseSearchTool extends BaseTool<"codebase_search"> {
 				const merged: EnrichedResult[] = []
 
 				for (const [, blocks] of byFile) {
+					// Bail out of merge if interrupted
+					if (task.didRejectTool || task.pendingRefineRequest) {
+						return results // Return unmerged results instead of partial
+					}
 					if (blocks.length < MERGE_MIN_BLOCKS) {
 						merged.push(...blocks)
 						continue

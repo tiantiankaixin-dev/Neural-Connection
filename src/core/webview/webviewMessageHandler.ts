@@ -1848,6 +1848,57 @@ export const webviewMessageHandler = async (
 			}
 			break
 		}
+		case "editTodoList": {
+			const payload = message.payload as { todos?: any[] }
+			const todos = payload?.todos
+			const task = provider.getCurrentTask()
+			if (Array.isArray(todos) && task) {
+				const oldTodos = task.todoList ? [...task.todoList] : []
+				task.todoList = todos
+
+				// If task is actively running (streaming or processing), set pending edit
+				// to interrupt and inject the diff into AI context
+				if (task.isStreaming || task.isInitialized) {
+					task.pendingTodoEdit = { oldTodos, newTodos: todos }
+				}
+
+				// Upsert: update last user_edit_todos message instead of creating duplicates
+				// previousTodos is preserved from the first edit in the session by upsertUserEditTodos
+				await task.upsertUserEditTodos(
+					JSON.stringify({
+						tool: "updateTodoList",
+						todos,
+						previousTodos: oldTodos,
+					}),
+				)
+			}
+			break
+		}
+		case "refineTodoItems": {
+			const payload = message.payload as { todoItemIds?: string[] }
+			const todoItemIds = payload?.todoItemIds
+			const task = provider.getCurrentTask()
+			if (Array.isArray(todoItemIds) && todoItemIds.length > 0 && task) {
+				// Always set pendingRefineRequest so the refine prompt is injected
+				// into the conversation loop (consumed at userMessageContentReady).
+				task.pendingRefineRequest = { todoItemIds }
+				// Mark tool as rejected so presentAssistantMessage skips remaining
+				// tool blocks quickly — the refine prompt will replace them.
+				task.didRejectTool = true
+
+				if (task.isStreaming) {
+					// Task is actively streaming — abort stream; pendingRefineRequest
+					// will be picked up when the stream abort is handled.
+					task.cancelCurrentRequest()
+				} else {
+					// Task is not streaming but may have a pending ask (e.g. tool approval)
+					// or an auto-approved tool executing. Respond to unblock any pending ask.
+					// For executing tools, didRejectTool ensures subsequent blocks are skipped.
+					task.handleWebviewAskResponse("messageResponse")
+				}
+			}
+			break
+		}
 		case "refreshCustomTools": {
 			try {
 				const toolDirs = getRooDirectoriesForCwd(getCurrentCwd()).map((dir) => path.join(dir, "tools"))

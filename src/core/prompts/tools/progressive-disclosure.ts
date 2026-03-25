@@ -21,6 +21,7 @@ const PRIORITIZED_TOOLS = new Set([
 	"attempt_completion",
 	"ask_followup_question",
 	"update_todo_list",
+	"write_todo_plan",
 ])
 
 // Brief one-line descriptions for stripped tools
@@ -59,6 +60,7 @@ const TOOL_BRIEFS: Record<string, string> = {
 	view_content_chunk: "View a specific chunk of a web or knowledge base document content",
 	create_memory: "Save important context relevant to the USER and their task to a memory database",
 	recall_memory: "Deep memory recall — drill down from summaries to retrieve original conversation messages",
+	write_todo_plan: "Write detailed per-file implementation plans for a todo item",
 }
 
 // Tools that remain fully exposed when task is NOT yet established (task lock)

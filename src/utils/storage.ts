@@ -98,6 +98,31 @@ export async function getTaskMemoryPath(globalStoragePath: string, taskId: strin
 }
 
 /**
+ * Gets the task_optimize subdirectory path for a task (stores per-todo-item .md plan files)
+ */
+export async function getTaskOptimizePath(globalStoragePath: string, taskId: string): Promise<string> {
+	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+	const optimizeDir = path.join(taskDir, "task_optimize")
+	await fs.mkdir(optimizeDir, { recursive: true })
+	return optimizeDir
+}
+
+/**
+ * Gets the fixed timestamp subdirectory under task_optimize for a task list.
+ * All refined plan .md files for the same task list live inside this folder.
+ */
+export async function getTaskOptimizeTimestampPath(
+	globalStoragePath: string,
+	taskId: string,
+	taskTimestamp: string,
+): Promise<string> {
+	const optimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
+	const timestampDir = path.join(optimizeDir, taskTimestamp)
+	await fs.mkdir(timestampDir, { recursive: true })
+	return timestampDir
+}
+
+/**
  * Gets the summaries subdirectory path within memory/ for a task
  */
 export async function getTaskSummariesPath(globalStoragePath: string, taskId: string): Promise<string> {

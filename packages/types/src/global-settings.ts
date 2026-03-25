@@ -120,6 +120,7 @@ export const globalSettingsSchema = z.object({
 	autoCondenseContext: z.boolean().optional(),
 	autoCondenseContextPercent: z.number().optional(),
 	contextRetentionTasks: z.number().optional(),
+	minPreserveMessages: z.number().optional(),
 
 	/**
 	 * Whether to include current time in the environment details

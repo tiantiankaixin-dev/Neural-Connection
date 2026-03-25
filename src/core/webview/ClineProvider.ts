@@ -2406,6 +2406,7 @@ export class ClineProvider
 			autoCondenseContext,
 			autoCondenseContextPercent,
 			contextRetentionTasks,
+			minPreserveMessages,
 			soundEnabled,
 			ttsEnabled,
 			ttsSpeed,
@@ -2530,6 +2531,7 @@ export class ClineProvider
 			autoCondenseContext: autoCondenseContext ?? true,
 			autoCondenseContextPercent: autoCondenseContextPercent ?? 100,
 			contextRetentionTasks: contextRetentionTasks ?? 2,
+			minPreserveMessages: minPreserveMessages ?? 4,
 			uriScheme: vscode.env.uriScheme,
 			currentTaskItem: this.getCurrentTask()?.taskId
 				? (taskHistory || []).find((item: HistoryItem) => item.id === this.getCurrentTask()?.taskId)
@@ -2784,6 +2786,7 @@ export class ClineProvider
 			autoCondenseContext: stateValues.autoCondenseContext ?? true,
 			autoCondenseContextPercent: stateValues.autoCondenseContextPercent ?? 100,
 			contextRetentionTasks: stateValues.contextRetentionTasks ?? 2,
+			minPreserveMessages: stateValues.minPreserveMessages ?? 4,
 			taskHistory: stateValues.taskHistory ?? [],
 			allowedCommands: stateValues.allowedCommands,
 			deniedCommands: stateValues.deniedCommands,

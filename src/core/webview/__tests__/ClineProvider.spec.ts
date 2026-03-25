@@ -581,6 +581,7 @@ describe("ClineProvider", () => {
 			autoCondenseContext: true,
 			autoCondenseContextPercent: 100,
 			contextRetentionTasks: 2,
+			minPreserveMessages: 4,
 			cloudIsAuthenticated: false,
 			sharingEnabled: false,
 			publicSharingEnabled: false,

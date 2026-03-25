@@ -171,6 +171,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>(({ onDone, t
 		autoCondenseContext,
 		autoCondenseContextPercent,
 		contextRetentionTasks,
+		minPreserveMessages,
 		browserToolEnabled,
 		browserViewportSize,
 		enableCheckpoints,
@@ -399,6 +400,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>(({ onDone, t
 					autoCondenseContext,
 					autoCondenseContextPercent,
 					contextRetentionTasks,
+					minPreserveMessages,
 					browserToolEnabled: browserToolEnabled ?? true,
 					soundEnabled: soundEnabled ?? true,
 					soundVolume: soundVolume ?? 0.5,
@@ -872,6 +874,7 @@ const SettingsView = forwardRef<SettingsViewRef, SettingsViewProps>(({ onDone, t
 								autoCondenseContext={autoCondenseContext}
 								autoCondenseContextPercent={autoCondenseContextPercent}
 								contextRetentionTasks={contextRetentionTasks ?? 2}
+								minPreserveMessages={minPreserveMessages ?? 4}
 								listApiConfigMeta={listApiConfigMeta ?? []}
 								maxOpenTabsContext={maxOpenTabsContext}
 								maxWorkspaceFiles={maxWorkspaceFiles ?? 200}

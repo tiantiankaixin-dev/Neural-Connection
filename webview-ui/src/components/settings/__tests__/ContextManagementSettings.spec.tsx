@@ -89,6 +89,7 @@ describe("ContextManagementSettings", () => {
 		autoCondenseContext: false,
 		autoCondenseContextPercent: 80,
 		contextRetentionTasks: 2,
+		minPreserveMessages: 4,
 		listApiConfigMeta: [],
 		maxOpenTabsContext: 20,
 		maxWorkspaceFiles: 200,

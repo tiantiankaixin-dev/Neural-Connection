@@ -505,7 +505,14 @@
 		"complete": "{{total}} to-dos done",
 		"updated": "Updated the to-do list",
 		"completed": "Completed",
-		"started": "Started"
+		"started": "Started",
+		"edit": "Edit",
+		"doneEditing": "Done editing",
+		"delete": "Delete",
+		"add": "Add",
+		"cancel": "Cancel",
+		"addItem": "Add item",
+		"addPlaceholder": "New todo item, press Enter to add"
 	},
 	"tooManyTools": {
 		"title": "Too many tools enabled",

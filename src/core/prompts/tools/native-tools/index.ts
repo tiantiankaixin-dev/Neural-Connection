@@ -30,6 +30,7 @@ import edit_file from "./edit_file"
 import searchFiles from "./search_files"
 import switchMode from "./switch_mode"
 import updateTodoList from "./update_todo_list"
+import writeTodoPlan from "./write_todo_plan"
 import writeToFile from "./write_to_file"
 
 export { getMcpServerTools } from "./mcp_server"
@@ -90,6 +91,7 @@ export function getNativeTools(options: NativeToolsOptions = {}): OpenAI.Chat.Ch
 		searchFiles,
 		switchMode,
 		updateTodoList,
+		writeTodoPlan,
 		writeToFile,
 	] satisfies OpenAI.Chat.ChatCompletionTool[]
 }
