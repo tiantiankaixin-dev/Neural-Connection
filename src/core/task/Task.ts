@@ -1473,7 +1473,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						content: [
 							{
 								type: "text",
-								text: `[IMPLEMENTATION PLAN for "${currentItem.content}"]\nThe following per-file plans were created during the refine phase. Follow them closely:\n\n${planText}`,
+								text: `[IMPLEMENTATION PLAN for "${currentItem.content}"]\nThe following refine plans were created during the refine phase. They may describe concrete project file changes or non-code planning sections such as project review, project planning, debugging strategy, architecture analysis, or investigation guidance. Follow them closely:\n\n${planText}`,
 							},
 						],
 						ts: Date.now(),
@@ -1484,7 +1484,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						content: [
 							{
 								type: "text",
-								text: `Understood. I will follow the implementation plan for "${currentItem.content}" covering ${planFiles.length} file(s).`,
+								text: `Understood. I will follow the refine plan for "${currentItem.content}" covering ${planFiles.length} plan section(s).`,
 							},
 						],
 						ts: Date.now(),
@@ -3864,6 +3864,70 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					this.currentRequestAbortController = undefined
 				}
 
+				if (this.pendingRefineRequest) {
+					await abortStream("user_cancelled")
+
+					const { todoItemIds } = this.pendingRefineRequest
+					this.pendingRefineRequest = null
+					console.log(
+						`[Task#${this.taskId}.${this.instanceId}] Stream interrupted for refine request, injecting refine prompt`,
+					)
+
+					const itemsToRefine = (this.todoList ?? []).filter((t) => todoItemIds.includes(t.id))
+					if (itemsToRefine.length > 0) {
+						const itemDescriptions = itemsToRefine.map((t) => `- [${t.id}] ${t.content}`).join("\n")
+
+						const refinePrompt = buildRefinePrompt(itemDescriptions)
+
+						this.activeRefineTodoItemIds = itemsToRefine.map((t) => t.id)
+						this.isRefineMode = true
+						stack.push({
+							userContent: [{ type: "text", text: refinePrompt }],
+							includeFileDetails: false,
+						})
+					}
+					continue
+				}
+
+				if (this.pendingTodoEdit) {
+					await abortStream("user_cancelled")
+
+					const { oldTodos, newTodos } = this.pendingTodoEdit
+					this.pendingTodoEdit = null
+					console.log(
+						`[Task#${this.taskId}.${this.instanceId}] Stream interrupted for todo edit, injecting diff`,
+					)
+
+					const formatTodoList = (todos: TodoItem[]) =>
+						todos.length === 0
+							? "(empty)"
+							: todos
+									.map((t) => {
+										const mark =
+											t.status === "completed" ? "x" : t.status === "in_progress" ? "-" : " "
+										return `[${mark}] ${t.content}`
+									})
+									.join("\n")
+
+					const diffText = [
+						"[USER TODO LIST EDIT] The user has manually modified the todo list while you were working.",
+						"",
+						"Previous todo list:",
+						formatTodoList(oldTodos),
+						"",
+						"Updated todo list (user-edited):",
+						formatTodoList(newTodos),
+						"",
+						"Adjust your plan accordingly.",
+					].join("\n")
+
+					stack.push({
+						userContent: [{ type: "text", text: diffText }],
+						includeFileDetails: false,
+					})
+					continue
+				}
+
 				// Need to call here in case the stream was aborted.
 				if (this.abort || this.abandoned) {
 					throw new Error(
@@ -5251,13 +5315,21 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 function buildRefineSystemPrompt(): string {
 	return [
-		"You are a planning assistant. Your current task is to create detailed implementation plans for the todo items provided by the user.",
+		"You are a planning assistant. Your current task is to create detailed refine plans for the todo items provided by the user.",
 		"",
 		"RULES:",
 		"- You have exactly ONE tool available: `write_todo_plan`. Use it to record plans internally.",
 		"- Do NOT create any files in the workspace. The plan is an internal artifact.",
 		"- Do NOT use any other tools. You do not have access to them.",
-		"- Call `write_todo_plan` once per todo item with the appropriate plan_type and plan entries.",
+		"- Call `write_todo_plan` exactly once per requested todo item.",
+		'- You must classify each todo item as either `plan_type="file"` or `plan_type="general"`.',
+		'- `plan_type="file"` means the plan requires modifying or creating real project files of any kind: source files, config files, docs, scripts, tests, workflows, JSON/YAML/MD files, etc.',
+		'- `plan_type="general"` means the plan does NOT require modifying or creating project files. This includes project review plans, project planning plans, debugging plans, investigation plans, architecture evaluation plans, reproduction plans, and research/design guidance.',
+		'- `plan_type="general"` plans are stored in the dedicated non-code planning area separate from file-change plans, so use it whenever no real project files will be edited.',
+		'- Non-code plans MUST be recorded as `plan_type="general"`. Do not force them into file plans.',
+		"- For `general` plans, each plan entry's `filePath` must be a descriptive section title, not a file path.",
+		"- For `file` plans, each plan entry's `filePath` must be a real relative project file path.",
+		"- Do not output extra explanatory prose after writing the plans. Stop after all requested todo items have been recorded.",
 	].join("\n")
 }
 
@@ -5270,19 +5342,30 @@ function buildRefinePrompt(itemDescriptions: string): string {
 		"IMPORTANT — The plan itself is not a workspace file. Do not create markdown files in the project for the plan itself.",
 		"Use the `write_todo_plan` tool to record the plan internally.",
 		"",
-		"IMPORTANT — First, judge whether each todo item will require modifying or creating source code files:",
-		'DEFAULT RULE — treat the plan as non-code-change and use plan_type="general" unless you can clearly identify real project files that must be modified or created.',
+		"IMPORTANT — First, judge whether each todo item will require modifying or creating ANY real project files:",
+		'Use plan_type="general" whenever the task is about planning, review, debugging strategy, investigation, architecture thinking, or other non-code work that does not itself change project files.',
+		'Choosing plan_type="general" ensures the refine plan is stored in the dedicated non-code planning area rather than among file-change plans.',
 		"",
 		'• If the todo item requires changing or creating project files → set plan_type="file".',
-		'  - Each plan entry\'s filePath should be the relative path to a real project file (e.g. "src/core/Player.ts").',
+		"  - This includes source code, tests, docs, config, scripts, CI/workflow files, JSON/YAML/MD, and any other real project files.",
+		'  - Each plan entry\'s filePath should be the relative path to a real project file (e.g. "src/core/Player.ts", "docs/architecture.md", ".github/workflows/release.yml").',
 		"  - Describe WHAT changes are needed in that file, WHY, and HOW.",
 		"",
 		'• If the todo item does NOT involve code changes (e.g. research, design decisions, architecture analysis, documentation planning) → set plan_type="general".',
-		'  - Each plan entry\'s filePath should be a descriptive section title (e.g. "Architecture Overview").',
+		"  - This includes project review plans, project planning plans, debug plans, root-cause investigation plans, repro plans, architecture comparison plans, migration strategy plans, and test-strategy planning when no files are being edited.",
+		'  - Each plan entry\'s filePath should be a descriptive section title (e.g. "Architecture Overview", "Debug Hypotheses", "Project Review Checklist").',
 		"  - Describe the conceptual plan, design rationale, or analysis.",
 		"",
+		"Examples:",
+		'- Example A: "Review the project architecture and propose next steps" → general',
+		'- Example B: "Create a debugging plan for the flaky startup issue without editing code yet" → general',
+		'- Example C: "Investigate the bug, list hypotheses, and design a repro strategy" → general',
+		'- Example D: "Update src/core/task/Task.ts and webview-ui/src/components/chat/ChatRow.tsx" → file',
+		'- Example E: "Add a migration guide in docs/migration.md and adjust package.json" → file',
+		'- Example F: "Plan a project roadmap and module ownership split" → general',
+		"",
 		"Think carefully about:",
-		"1. Whether the todo item requires actual file changes or is purely conceptual",
+		"1. Whether the todo item requires actual project file changes or is purely conceptual/planning/investigation work",
 		"2. Which existing files need modification (for file plans)",
 		"3. Which new files need to be created (for file plans)",
 		"4. The specific changes or design decisions required",
@@ -5290,6 +5373,6 @@ function buildRefinePrompt(itemDescriptions: string): string {
 		"",
 		"Call `write_todo_plan` once per todo item with the appropriate plan_type and all its plan entries.",
 		"",
-		"After you finish writing plans for all requested todo items, stop. Execution will continue in a separate non-refine request with the normal task tools and system prompt.",
+		"After you finish writing plans for all requested todo items, stop immediately. Do not add extra narrative text. Execution will continue in a separate non-refine request with the normal task tools and system prompt.",
 	].join("\n")
 }

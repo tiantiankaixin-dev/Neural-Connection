@@ -571,6 +571,7 @@ export class NativeToolCallParser {
 				if (partialArgs.todo_item_id !== undefined || partialArgs.plans !== undefined) {
 					nativeArgs = {
 						todo_item_id: partialArgs.todo_item_id,
+						plan_type: partialArgs.plan_type,
 						plans: partialArgs.plans,
 					}
 				}
@@ -918,6 +919,7 @@ export class NativeToolCallParser {
 					if (args.todo_item_id !== undefined && args.plans !== undefined) {
 						nativeArgs = {
 							todo_item_id: args.todo_item_id,
+							plan_type: args.plan_type,
 							plans: typeof args.plans === "string" ? args.plans : JSON.stringify(args.plans),
 						} as NativeArgsFor<TName>
 					}

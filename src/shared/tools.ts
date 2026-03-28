@@ -96,6 +96,7 @@ export const toolParamNames = [
 	"full_path",
 	// write_todo_plan parameters
 	"todo_item_id",
+	"plan_type",
 	"plans",
 ] as const
 
@@ -131,7 +132,7 @@ export type NativeToolArgs = {
 	search_files: { path: string; regex: string; file_pattern?: string | null }
 	switch_mode: { mode_slug: string; reason: string }
 	update_todo_list: { todos: string }
-	write_todo_plan: { todo_item_id: string; plans: string }
+	write_todo_plan: { todo_item_id: string; plan_type?: "file" | "general"; plans: string }
 	use_mcp_tool: { server_name: string; tool_name: string; arguments?: Record<string, unknown> }
 	write_to_file: { path: string; content: string }
 	find_by_name: {

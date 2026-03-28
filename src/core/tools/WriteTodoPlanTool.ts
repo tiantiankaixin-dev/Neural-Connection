@@ -15,6 +15,35 @@ interface PlanEntry {
 	content: string
 }
 
+function looksLikeProjectFilePath(value: string): boolean {
+	const trimmed = value.trim()
+	if (!trimmed) {
+		return false
+	}
+
+	if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
+		return true
+	}
+
+	if (/^\.{1,2}[\\/]/.test(trimmed)) {
+		return true
+	}
+
+	if (trimmed.includes("/") || trimmed.includes("\\")) {
+		return true
+	}
+
+	return /^[^\s]+\.[A-Za-z0-9_-]{1,12}$/.test(trimmed)
+}
+
+function resolvePlanType(planTypeRaw: string | undefined, planEntries: PlanEntry[]): PlanType {
+	if (planTypeRaw === "general" || planTypeRaw === "file") {
+		return planTypeRaw
+	}
+
+	return planEntries.some((entry) => looksLikeProjectFilePath(entry.filePath)) ? "file" : "general"
+}
+
 export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 	readonly name = "write_todo_plan" as const
 
@@ -23,7 +52,6 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 
 		try {
 			const { todo_item_id, plan_type: planTypeRaw, plans: plansRaw } = params
-			const planType: PlanType = planTypeRaw === "general" ? "general" : "file"
 
 			if (!todo_item_id || typeof todo_item_id !== "string") {
 				task.consecutiveMistakeCount++
@@ -85,6 +113,12 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				}
 			}
 
+			const normalizedPlanEntries = planEntries.map((entry) => ({
+				filePath: entry.filePath.trim(),
+				content: entry.content.trim(),
+			}))
+			const planType = resolvePlanType(planTypeRaw, normalizedPlanEntries)
+
 			// Auto-approved: this tool only writes internal plan files (.md),
 			// it does not modify actual project source code.
 
@@ -95,7 +129,7 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				task.taskTimestamp,
 				todo_item_id,
 				todoItem.content,
-				planEntries,
+				normalizedPlanEntries,
 				planType,
 			)
 
@@ -118,7 +152,7 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 					todoContent: todoItem.content,
 					savedPath,
 					planType,
-					plans: planEntries.map((e) => ({ filePath: e.filePath, content: e.content })),
+					plans: normalizedPlanEntries.map((e) => ({ filePath: e.filePath, content: e.content })),
 				}),
 				undefined,
 				undefined,
@@ -128,7 +162,7 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 			)
 
 			const label = planType === "general" ? "general plan section(s)" : "plan file(s)"
-			const fileList = planEntries.map((e) => `  - ${e.filePath}`).join("\n")
+			const fileList = normalizedPlanEntries.map((e) => `  - ${e.filePath}`).join("\n")
 			pushToolResult(
 				formatResponse.toolResult(
 					`Successfully wrote ${planEntries.length} ${label} for todo item "${todoItem.content}":\n${fileList}\n\nThese plans will be automatically injected into context when working on this todo item.`,

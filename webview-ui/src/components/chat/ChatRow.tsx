@@ -863,15 +863,20 @@ export const ChatRowContent = ({
 			case "updateTodoList" as any: {
 				const todos = (tool as any).todos || []
 				return (
-					<UpdateTodoListToolBlock
-						todos={todos}
-						todoPlansById={todoPlansById}
-						editable={true}
-						onChange={(newTodos) =>
-							vscode.postMessage({ type: "editTodoList", payload: { todos: newTodos } })
-						}
-						onRefine={onRefineTodoItems}
-					/>
+					<>
+						<UpdateTodoListToolBlock
+							todos={todos}
+							todoPlansById={todoPlansById}
+							editable={true}
+							onChange={(newTodos) =>
+								vscode.postMessage({ type: "editTodoList", payload: { todos: newTodos } })
+							}
+							onRefine={onRefineTodoItems}
+						/>
+						{showRefiningIndicator && isLast && (
+							<div className="mt-1 ml-1 text-xs text-vscode-descriptionForeground">refining...</div>
+						)}
+					</>
 				)
 			}
 			case "readFile":

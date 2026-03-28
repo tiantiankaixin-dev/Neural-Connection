@@ -1894,7 +1894,7 @@ export const webviewMessageHandler = async (
 					// Task is not streaming but may have a pending ask (e.g. tool approval)
 					// or an auto-approved tool executing. Respond to unblock any pending ask.
 					// For executing tools, didRejectTool ensures subsequent blocks are skipped.
-					task.handleWebviewAskResponse("messageResponse")
+					task.handleWebviewAskResponse("noButtonClicked")
 				}
 			}
 			break
