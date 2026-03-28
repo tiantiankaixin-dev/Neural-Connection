@@ -232,6 +232,23 @@ Just some text
 			expect(result[0].id).not.toBe(result[1].id)
 		})
 
+		it("should preserve the same ID for the same logical task across status transitions", () => {
+			const pending = parseMarkdownChecklist(`[ ] Task 1`)
+			const inProgress = parseMarkdownChecklist(`[-] Task 1`)
+			const completed = parseMarkdownChecklist(`[x] Task 1`)
+
+			expect(pending[0].id).toBe(inProgress[0].id)
+			expect(inProgress[0].id).toBe(completed[0].id)
+		})
+
+		it("should generate distinct IDs for duplicate todo content based on occurrence order", () => {
+			const md = `[ ] Task 1
+[ ] Task 1`
+			const result = parseMarkdownChecklist(md)
+
+			expect(result[0].id).not.toBe(result[1].id)
+		})
+
 		it("should generate same IDs regardless of dash prefix", () => {
 			const md1 = `[ ] Task 1`
 			const md2 = `- [ ] Task 1`

@@ -1,7 +1,7 @@
 import * as path from "path"
 import * as fs from "fs/promises"
 
-import { getTaskOptimizePath, getTaskOptimizeTimestampPath } from "../../utils/storage"
+import { getTaskOptimizePath, getTaskOptimizeTimestampPath, getTaskOptimizePlanPath } from "../../utils/storage"
 
 export interface PlanFile {
 	filePath: string
@@ -31,6 +31,8 @@ function sanitizeFileName(name: string): string {
  * during reading without relying on folder names or file paths.
  * If the same todo item is refined again the file is overwritten.
  */
+export type PlanType = "file" | "general"
+
 export async function savePlanFiles(
 	globalStoragePath: string,
 	taskId: string,
@@ -38,15 +40,26 @@ export async function savePlanFiles(
 	todoItemId: string,
 	todoContent: string,
 	plans: PlanFile[],
+	planType: PlanType = "file",
 ): Promise<string> {
-	const optimizeDir = taskTimestamp
-		? await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp)
-		: await getTaskOptimizePath(globalStoragePath, taskId)
+	let optimizeDir: string
+	if (planType === "general" && taskTimestamp) {
+		optimizeDir = await getTaskOptimizePlanPath(globalStoragePath, taskId, taskTimestamp)
+	} else if (taskTimestamp) {
+		optimizeDir = await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp)
+	} else {
+		optimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
+	}
 
 	const safeName = sanitizeFileName(todoContent)
 	const planFilePath = path.join(optimizeDir, `${safeName}.md`)
 
-	const lines: string[] = [`<!-- todoItemId: ${todoItemId} -->`, `# ${todoContent}`, ""]
+	const lines: string[] = [
+		`<!-- todoItemId: ${todoItemId} -->`,
+		`<!-- planType: ${planType} -->`,
+		`# ${todoContent}`,
+		"",
+	]
 
 	for (const plan of plans) {
 		lines.push(`## ${plan.filePath}`, "", plan.content, "", "---", "")
@@ -66,13 +79,16 @@ export async function readPlanFiles(
 	taskId: string,
 	taskTimestamp: string | undefined,
 	todoItemId: string,
+	todoContent?: string,
 ): Promise<PlanFile[]> {
-	const results: PlanFile[] = []
-	const directoriesToScan = [
-		taskTimestamp
-			? await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp)
-			: await getTaskOptimizePath(globalStoragePath, taskId),
-	]
+	const resultsById: PlanFile[] = []
+	const fallbackResultsByContent: PlanFile[] = []
+	const directoriesToScan: string[] = []
+
+	if (taskTimestamp) {
+		directoriesToScan.push(await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp))
+		directoriesToScan.push(await getTaskOptimizePlanPath(globalStoragePath, taskId, taskTimestamp))
+	}
 
 	const legacyOptimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
 	if (!directoriesToScan.includes(legacyOptimizeDir)) {
@@ -93,7 +109,10 @@ export async function readPlanFiles(
 			const raw = await fs.readFile(filePath, "utf8")
 
 			const idMatch = raw.match(/<!-- todoItemId: (.+?) -->/)
-			if (!idMatch || idMatch[1] !== todoItemId) continue
+			const headingMatch = raw.match(/^# (.+)$/m)
+			const matchesId = !!idMatch && idMatch[1] === todoItemId
+			const matchesContent = !!todoContent && headingMatch?.[1]?.trim() === todoContent
+			if (!matchesId && !matchesContent) continue
 
 			const sections = raw.split(/^## /m).slice(1)
 			for (const section of sections) {
@@ -102,12 +121,13 @@ export async function readPlanFiles(
 				const sectionPath = section.substring(0, newlineIdx).trim()
 				let sectionContent = section.substring(newlineIdx + 1).trim()
 				sectionContent = sectionContent.replace(/\n---\s*$/, "").trim()
-				results.push({ filePath: sectionPath, content: sectionContent })
+				const target = matchesId ? resultsById : fallbackResultsByContent
+				target.push({ filePath: sectionPath, content: sectionContent })
 			}
 		}
 	}
 
-	return results
+	return resultsById.length > 0 ? resultsById : fallbackResultsByContent
 }
 
 /**

@@ -78,6 +78,18 @@ import { PathTooltip } from "../ui/PathTooltip"
 import { OpenMarkdownPreviewButton } from "./OpenMarkdownPreviewButton"
 
 // Parse todo_item_divider text: plain string or JSON { content, summary, turns }
+interface TodoPlanEntry {
+	filePath: string
+	content: string
+}
+
+interface TodoPlanData {
+	savedPath?: string
+	planType?: "file" | "general"
+	todoContent?: string
+	plans: TodoPlanEntry[]
+}
+
 interface DividerTurn {
 	turnNumber: number
 	todoItemContent?: string
@@ -88,6 +100,7 @@ interface DividerTurn {
 
 function parseDividerText(text?: string): {
 	content: string
+	todoItemId?: string
 	summary?: string
 	turns?: DividerTurn[]
 	contextSummaryText?: string
@@ -98,6 +111,7 @@ function parseDividerText(text?: string): {
 		if (parsed && typeof parsed.content === "string") {
 			return {
 				content: parsed.content,
+				todoItemId: parsed.todoItemId,
 				summary: parsed.summary,
 				turns: parsed.turns,
 				contextSummaryText: parsed.contextSummaryText,
@@ -167,15 +181,23 @@ function TodoItemDividerRow({
 	dividerTs,
 	isGroupCollapsed,
 	onToggleTodoGroup,
+	todoPlansById,
 }: {
 	message: ClineMessage
 	dividerTs?: number
 	isGroupCollapsed?: boolean
 	onToggleTodoGroup?: (ts: number) => void
+	todoPlansById?: Record<string, TodoPlanData>
 }) {
 	const [refsExpanded, setRefsExpanded] = useState(false)
 	const [summaryExpanded, setSummaryExpanded] = useState(false)
-	const { content, turns, contextSummaryText } = parseDividerText(message.text)
+	const [planExpanded, setPlanExpanded] = useState(false)
+	const { content, todoItemId, turns, contextSummaryText } = parseDividerText(message.text)
+	const todoPlanById = todoItemId ? todoPlansById?.[todoItemId] : undefined
+	const todoPlanMatchesByContent = todoPlanById
+		? []
+		: Object.values(todoPlansById ?? {}).filter((plan) => plan.todoContent === content)
+	const todoPlan = todoPlanById ?? (todoPlanMatchesByContent.length === 1 ? todoPlanMatchesByContent[0] : undefined)
 	const hasTurns = turns && turns.length > 0
 	const hasSummary = !!contextSummaryText?.trim()
 
@@ -202,6 +224,79 @@ function TodoItemDividerRow({
 				)}
 				{content}
 			</div>
+			{todoPlan && todoPlan.savedPath && (
+				<div style={{ marginLeft: 14, marginTop: 2 }}>
+					<div
+						style={{
+							fontSize: "10px",
+							color: "var(--vscode-textLink-foreground)",
+							cursor: "pointer",
+							display: "flex",
+							alignItems: "center",
+							gap: "3px",
+							userSelect: "none",
+						}}
+						onClick={(e) => {
+							e.stopPropagation()
+							setPlanExpanded(!planExpanded)
+						}}>
+						<span
+							className={`codicon codicon-chevron-${planExpanded ? "down" : "right"}`}
+							style={{ fontSize: 9 }}
+						/>
+						<span className="codicon codicon-file-text" style={{ fontSize: 10 }} />
+						{todoPlan.savedPath.replace(/\\/g, "/").split("/").slice(-2).join("/")}
+					</div>
+					{planExpanded && todoPlan.plans.length > 0 && (
+						<div
+							style={{
+								marginLeft: 4,
+								marginTop: 3,
+								padding: "6px 8px",
+								borderRadius: 4,
+								border: "1px solid var(--vscode-editorWidget-border)",
+								background: "var(--vscode-editorWidget-background)",
+								maxHeight: "40vh",
+								overflowY: "auto",
+							}}>
+							<div
+								style={{
+									fontSize: 10,
+									color: "var(--vscode-descriptionForeground)",
+									marginBottom: 6,
+									wordBreak: "break-all",
+								}}>
+								{todoPlan.savedPath}
+							</div>
+							{todoPlan.plans.map((plan, i) => (
+								<div key={i} style={{ marginTop: i === 0 ? 0 : 8 }}>
+									<div
+										style={{
+											fontSize: 10,
+											fontWeight: 600,
+											color: "var(--vscode-foreground)",
+											marginBottom: 3,
+										}}>
+										{plan.filePath}
+									</div>
+									<pre
+										style={{
+											margin: 0,
+											fontSize: 11,
+											lineHeight: "1.4",
+											whiteSpace: "pre-wrap",
+											wordBreak: "break-word",
+											color: "var(--vscode-foreground)",
+											opacity: 0.85,
+										}}>
+										{plan.content}
+									</pre>
+								</div>
+							))}
+						</div>
+					)}
+				</div>
+			)}
 			{hasTurns && (
 				<div style={{ marginLeft: 14, marginTop: 2 }}>
 					<div
@@ -285,6 +380,7 @@ function TodoItemDividerRow({
 interface ChatRowProps {
 	message: ClineMessage
 	lastModifiedMessage?: ClineMessage
+	todoPlansById?: Record<string, TodoPlanData>
 	isExpanded: boolean
 	isLast: boolean
 	isStreaming: boolean
@@ -366,6 +462,7 @@ export default ChatRow
 export const ChatRowContent = ({
 	message,
 	lastModifiedMessage,
+	todoPlansById,
 	isExpanded,
 	isLast,
 	isStreaming,
@@ -768,6 +865,7 @@ export const ChatRowContent = ({
 				return (
 					<UpdateTodoListToolBlock
 						todos={todos}
+						todoPlansById={todoPlansById}
 						editable={true}
 						onChange={(newTodos) =>
 							vscode.postMessage({ type: "editTodoList", payload: { todos: newTodos } })
@@ -1595,7 +1693,8 @@ export const ChatRowContent = ({
 							message={message}
 							dividerTs={undefined}
 							isGroupCollapsed={undefined}
-							onToggleTodoGroup={undefined}
+							onToggleTodoGroup={onToggleTodoGroup}
+							todoPlansById={todoPlansById}
 						/>
 					)
 				}
@@ -1650,6 +1749,7 @@ export const ChatRowContent = ({
 							dividerTs={dividerTs}
 							isGroupCollapsed={isGroupCollapsed}
 							onToggleTodoGroup={onToggleTodoGroup}
+							todoPlansById={todoPlansById}
 						/>
 					)
 				}
@@ -1667,6 +1767,7 @@ export const ChatRowContent = ({
 						<UpdateTodoListToolBlock
 							todos={editedTodos}
 							previousTodos={prevTodos}
+							todoPlansById={todoPlansById}
 							userEdited
 							editable={true}
 							onChange={(newTodos) =>

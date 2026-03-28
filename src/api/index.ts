@@ -86,6 +86,12 @@ export interface ApiHandlerCreateMessageMetadata {
 	 * Only applies to providers that support function calling restrictions (e.g., Gemini).
 	 */
 	allowedFunctionNames?: string[]
+	/**
+	 * Optional explicit behavior role label for debugging/captured-context display.
+	 * This allows transient internal behaviors such as refine-only planning to be
+	 * distinguished from the base task mode.
+	 */
+	behaviorRole?: string
 }
 
 export interface ApiHandler {

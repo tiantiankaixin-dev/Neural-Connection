@@ -123,6 +123,22 @@ export async function getTaskOptimizeTimestampPath(
 }
 
 /**
+ * Gets the +plan subfolder under the task timestamp directory.
+ * General (non-file-modification) plans are stored here:
+ *   task_optimize/{taskTimestamp}/{taskTimestamp}+plan/{subtask}.md
+ */
+export async function getTaskOptimizePlanPath(
+	globalStoragePath: string,
+	taskId: string,
+	taskTimestamp: string,
+): Promise<string> {
+	const timestampDir = await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp)
+	const planDir = path.join(timestampDir, `${taskTimestamp}+plan`)
+	await fs.mkdir(planDir, { recursive: true })
+	return planDir
+}
+
+/**
  * Gets the summaries subdirectory path within memory/ for a task
  */
 export async function getTaskSummariesPath(globalStoragePath: string, taskId: string): Promise<string> {

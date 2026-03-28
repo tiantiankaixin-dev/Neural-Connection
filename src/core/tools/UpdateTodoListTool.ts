@@ -146,11 +146,15 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				const dividerText = contextSelectionResult
 					? JSON.stringify({
 							content: currentActiveItem.content,
+							todoItemId: currentActiveItem.id,
 							summary: contextSelectionResult.summary,
 							turns: contextSelectionResult.turns,
 							contextSummaryText: contextSelectionResult.contextSummaryText,
 						})
-					: currentActiveItem.content
+					: JSON.stringify({
+							content: currentActiveItem.content,
+							todoItemId: currentActiveItem.id,
+						})
 
 				await task.say("todo_item_divider", dividerText, undefined, undefined, undefined, undefined, {
 					isNonInteractive: true,
@@ -275,19 +279,20 @@ export function parseMarkdownChecklist(md: string): TodoItem[] {
 		.map((l) => l.trim())
 		.filter(Boolean)
 	const todos: TodoItem[] = []
+	const contentOccurrences = new Map<string, number>()
 	for (const line of lines) {
 		const match = line.match(/^(?:-\s*)?\[\s*([ xX\-~])\s*\]\s+(.+)$/)
 		if (!match) continue
 		let status: TodoStatus = "pending"
 		if (match[1] === "x" || match[1] === "X") status = "completed"
 		else if (match[1] === "-" || match[1] === "~") status = "in_progress"
-		const id = crypto
-			.createHash("md5")
-			.update(match[2] + status)
-			.digest("hex")
+		const content = match[2]
+		const occurrence = (contentOccurrences.get(content) ?? 0) + 1
+		contentOccurrences.set(content, occurrence)
+		const id = crypto.createHash("md5").update(`${content}#${occurrence}`).digest("hex")
 		todos.push({
 			id,
-			content: match[2],
+			content,
 			status,
 		})
 	}

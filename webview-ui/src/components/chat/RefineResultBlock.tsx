@@ -1,5 +1,5 @@
 import React, { useState } from "react"
-import { ChevronRight, ChevronDown, FileCode2, Wand2 } from "lucide-react"
+import { ChevronRight, ChevronDown, FileCode2, BookOpen, Wand2 } from "lucide-react"
 import MarkdownBlock from "../common/MarkdownBlock"
 
 interface PlanEntry {
@@ -10,6 +10,7 @@ interface PlanEntry {
 interface RefineResultData {
 	todoItemId: string
 	todoContent: string
+	planType?: "file" | "general"
 	plans: PlanEntry[]
 }
 
@@ -62,7 +63,7 @@ const RefineResultBlock: React.FC<RefineResultBlockProps> = ({ data }) => {
 				<Wand2 className="size-3.5" style={{ flexShrink: 0, color: "var(--vscode-charts-blue)" }} />
 				<span style={{ fontWeight: 500 }}>task_optimize</span>
 				<span style={{ color: "var(--vscode-descriptionForeground)", fontSize: 12 }}>
-					{data.todoContent} · {data.plans.length} file(s)
+					{data.todoContent} · {data.plans.length} {data.planType === "general" ? "section(s)" : "file(s)"}
 				</span>
 			</div>
 
@@ -96,10 +97,17 @@ const RefineResultBlock: React.FC<RefineResultBlockProps> = ({ data }) => {
 								) : (
 									<ChevronRight className="size-3" style={{ flexShrink: 0 }} />
 								)}
-								<FileCode2
-									className="size-3"
-									style={{ flexShrink: 0, color: "var(--vscode-descriptionForeground)" }}
-								/>
+								{data.planType === "general" ? (
+									<BookOpen
+										className="size-3"
+										style={{ flexShrink: 0, color: "var(--vscode-descriptionForeground)" }}
+									/>
+								) : (
+									<FileCode2
+										className="size-3"
+										style={{ flexShrink: 0, color: "var(--vscode-descriptionForeground)" }}
+									/>
+								)}
 								<span style={{ fontFamily: "var(--vscode-editor-font-family)", opacity: 0.9 }}>
 									{plan.filePath}
 								</span>

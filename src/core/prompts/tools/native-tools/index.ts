@@ -96,5 +96,12 @@ export function getNativeTools(options: NativeToolsOptions = {}): OpenAI.Chat.Ch
 	] satisfies OpenAI.Chat.ChatCompletionTool[]
 }
 
+/**
+ * Get the minimal tool set for refine mode: only write_todo_plan.
+ */
+export function getRefineOnlyTools(): OpenAI.Chat.ChatCompletionTool[] {
+	return [writeTodoPlan] satisfies OpenAI.Chat.ChatCompletionTool[]
+}
+
 // Backward compatibility: export default tools with line ranges enabled
 export const nativeTools = getNativeTools()

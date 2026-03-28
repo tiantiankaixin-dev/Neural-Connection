@@ -93,7 +93,7 @@ import { OutputInterceptor } from "../../integrations/terminal/OutputInterceptor
 import { calculateApiCostAnthropic, calculateApiCostOpenAI } from "../../shared/cost"
 import { getWorkspacePath } from "../../utils/path"
 import { sanitizeToolUseId } from "../../utils/tool-id"
-import { getTaskDirectoryPath } from "../../utils/storage"
+import { getTaskDirectoryPath, getTaskOptimizePlanPath } from "../../utils/storage"
 
 // prompts
 import { formatResponse } from "../prompts/responses"
@@ -586,6 +586,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	didCompleteReadingStream = false
 	pendingTodoEdit: { oldTodos: TodoItem[]; newTodos: TodoItem[] } | null = null
 	pendingRefineRequest: { todoItemIds: string[] } | null = null
+	activeRefineTodoItemIds: string[] | null = null
+	isRefineMode = false
 	private _started = false
 	// No streaming parser is required.
 	assistantMessageParser?: undefined
@@ -1427,7 +1429,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// 2. Insert completed-item status markers (project name + completed status only)
 		const completedItems = this.todoList.filter((t) => t.status === "completed")
-		if (completedItems.length > 0 && currentItemStart > firstBoundary) {
+		if (!this.isRefineMode && completedItems.length > 0 && currentItemStart > firstBoundary) {
 			const statusLines = completedItems.map((item) => `[x] ${item.content}`).join("\n")
 
 			result.push({
@@ -1454,40 +1456,43 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		// 3. Inject plan files for current item (if any exist)
-		try {
-			const planFiles = await readPlanFiles(
-				this.globalStoragePath,
-				this.taskId,
-				this.taskTimestamp,
-				currentItem.id,
-			)
-			if (planFiles.length > 0) {
-				const planText = planFiles.map((pf) => `### ${pf.filePath}\n${pf.content}`).join("\n\n")
+		if (!this.isRefineMode) {
+			try {
+				const planFiles = await readPlanFiles(
+					this.globalStoragePath,
+					this.taskId,
+					this.taskTimestamp,
+					currentItem.id,
+					currentItem.content,
+				)
+				if (planFiles.length > 0) {
+					const planText = planFiles.map((pf) => `### ${pf.filePath}\n${pf.content}`).join("\n\n")
 
-				result.push({
-					role: "user",
-					content: [
-						{
-							type: "text",
-							text: `[IMPLEMENTATION PLAN for "${currentItem.content}"]\nThe following per-file plans were created during the refine phase. Follow them closely:\n\n${planText}`,
-						},
-					],
-					ts: Date.now(),
-				} as ApiMessage)
+					result.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `[IMPLEMENTATION PLAN for "${currentItem.content}"]\nThe following per-file plans were created during the refine phase. Follow them closely:\n\n${planText}`,
+							},
+						],
+						ts: Date.now(),
+					} as ApiMessage)
 
-				result.push({
-					role: "assistant",
-					content: [
-						{
-							type: "text",
-							text: `Understood. I will follow the implementation plan for "${currentItem.content}" covering ${planFiles.length} file(s).`,
-						},
-					],
-					ts: Date.now(),
-				} as ApiMessage)
+					result.push({
+						role: "assistant",
+						content: [
+							{
+								type: "text",
+								text: `Understood. I will follow the implementation plan for "${currentItem.content}" covering ${planFiles.length} file(s).`,
+							},
+						],
+						ts: Date.now(),
+					} as ApiMessage)
+				}
+			} catch (err) {
+				console.warn("[buildEffectiveHistory] Failed to read plan files (non-critical):", err)
 			}
-		} catch (err) {
-			console.warn("[buildEffectiveHistory] Failed to read plan files (non-critical):", err)
 		}
 
 		// 4. Keep all messages from the current item's boundary onwards
@@ -2436,6 +2441,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				const taskDir = await getTaskDirectoryPath(this.globalStoragePath, this.taskId)
 				const summaryDir = path.join(taskDir, "summary", "task", this.taskTimestamp)
 				await fs.mkdir(summaryDir, { recursive: true })
+				await getTaskOptimizePlanPath(this.globalStoragePath, this.taskId, this.taskTimestamp)
 			} catch (err) {
 				console.warn("[Task] Failed to create summary directory (non-critical):", err)
 			}
@@ -2555,6 +2561,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const taskDir = await getTaskDirectoryPath(this.globalStoragePath, this.taskId)
 			const summaryDir = path.join(taskDir, "summary", "task", this.taskTimestamp)
 			await fs.mkdir(summaryDir, { recursive: true })
+			await getTaskOptimizePlanPath(this.globalStoragePath, this.taskId, this.taskTimestamp)
 
 			// Restore contextRefsPath from disk (check paths in priority order)
 			if (!this.contextRefsPath) {
@@ -3004,7 +3011,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// Add environment details to the existing last user message (which contains the tool_result)
 		// This avoids creating a new user message which would cause consecutive user messages
-		const environmentDetails = await getEnvironmentDetails(this, true)
+		const environmentDetails = this.isRefineMode ? undefined : await getEnvironmentDetails(this, true)
 		let lastUserMsgIndex = -1
 		for (let i = this.apiConversationHistory.length - 1; i >= 0; i--) {
 			if (this.apiConversationHistory[i].role === "user") {
@@ -3012,7 +3019,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				break
 			}
 		}
-		if (lastUserMsgIndex >= 0) {
+		if (lastUserMsgIndex >= 0 && environmentDetails) {
 			const lastUserMsg = this.apiConversationHistory[lastUserMsgIndex]
 			if (Array.isArray(lastUserMsg.content)) {
 				// Remove any existing environment_details blocks before adding fresh ones
@@ -3194,7 +3201,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				}
 			}
 
-			const environmentDetails = await getEnvironmentDetails(this, currentIncludeFileDetails)
+			const environmentDetails = this.isRefineMode
+				? undefined
+				: await getEnvironmentDetails(this, currentIncludeFileDetails)
 
 			// Remove any existing environment_details blocks before adding fresh ones.
 			// This prevents duplicate environment details when resuming tasks,
@@ -3215,7 +3224,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			// Add environment details as its own text block, separate from tool
 			// results.
-			let finalUserContent = [...contentWithoutEnvDetails, { type: "text" as const, text: environmentDetails }]
+			let finalUserContent = environmentDetails
+				? [...contentWithoutEnvDetails, { type: "text" as const, text: environmentDetails }]
+				: contentWithoutEnvDetails
 			// Only add user message to conversation history if:
 			// 1. This is the first attempt (retryAttempt === 0), AND
 			// 2. The original userContent was not empty (empty signals delegation resume where
@@ -3743,26 +3754,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							if (itemsToRefine.length > 0) {
 								const itemDescriptions = itemsToRefine.map((t) => `- [${t.id}] ${t.content}`).join("\n")
 
-								const refinePrompt = [
-									"[REFINE REQUEST] The user wants you to create detailed per-file implementation plans for the following todo item(s):",
-									"",
-									itemDescriptions,
-									"",
-									"For each todo item, analyze what files in the project need to be modified or created. Then use the `write_todo_plan` tool to write detailed .md plan files.",
-									"",
-									"Each plan entry should include:",
-									"- filePath: the relative path to the project file that needs changes",
-									"- content: detailed markdown describing WHAT changes are needed, WHY, and HOW",
-									"",
-									"Think carefully about:",
-									"1. Which existing files need modification",
-									"2. Which new files need to be created",
-									"3. The specific changes required in each file (functions to add/modify, imports, etc.)",
-									"4. Dependencies between files",
-									"",
-									"Call `write_todo_plan` once per todo item with all its plan files.",
-								].join("\n")
+								const refinePrompt = buildRefinePrompt(itemDescriptions)
 
+								this.activeRefineTodoItemIds = itemsToRefine.map((t) => t.id)
+								this.isRefineMode = true
 								stack.push({
 									userContent: [{ type: "text", text: refinePrompt }],
 									includeFileDetails: false,
@@ -4223,26 +4218,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						if (itemsToRefine.length > 0) {
 							const itemDescriptions = itemsToRefine.map((t) => `- [${t.id}] ${t.content}`).join("\n")
 
-							const refinePrompt = [
-								"[REFINE REQUEST] The user wants you to create detailed per-file implementation plans for the following todo item(s):",
-								"",
-								itemDescriptions,
-								"",
-								"For each todo item, analyze what files in the project need to be modified or created. Then use the `write_todo_plan` tool to write detailed .md plan files.",
-								"",
-								"Each plan entry should include:",
-								"- filePath: the relative path to the project file that needs changes",
-								"- content: detailed markdown describing WHAT changes are needed, WHY, and HOW",
-								"",
-								"Think carefully about:",
-								"1. Which existing files need modification",
-								"2. Which new files need to be created",
-								"3. The specific changes required in each file (functions to add/modify, imports, etc.)",
-								"4. Dependencies between files",
-								"",
-								"Call `write_todo_plan` once per todo item with all its plan files.",
-							].join("\n")
+							const refinePrompt = buildRefinePrompt(itemDescriptions)
 
+							this.activeRefineTodoItemIds = itemsToRefine.map((t) => t.id)
+							this.isRefineMode = true
 							this.userMessageContent.push({
 								type: "text",
 								text: refinePrompt,
@@ -4519,7 +4498,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// in the caller.
 		Task.lastGlobalApiRequestTime = performance.now()
 
-		const systemPrompt = await this.getSystemPrompt()
+		let systemPrompt: string
+		if (this.isRefineMode) {
+			systemPrompt = buildRefineSystemPrompt()
+		} else {
+			systemPrompt = await this.getSystemPrompt()
+		}
 
 		// Phase 1: Cross-task transition selection (one-time, when needsContextCompression is set)
 		// Skipped when autoCondenseContext is enabled (mutually exclusive with Phase 3)
@@ -4586,7 +4570,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// Full history pipeline: apply context stripping, merge consecutive same-role messages, then clean for API submission.
 		const effectiveHistory = await this.buildEffectiveHistory()
-		const mergedMessages = mergeConsecutiveApiMessages(effectiveHistory)
+		const requestHistory = this.isRefineMode ? this.buildRefineSafeHistory(effectiveHistory) : effectiveHistory
+		const mergedMessages = mergeConsecutiveApiMessages(requestHistory)
 		const messagesWithoutImages = maybeRemoveImageBlocks(mergedMessages, this.api)
 		const cleanConversationHistory = this.buildCleanConversationHistory(messagesWithoutImages as ApiMessage[])
 
@@ -4613,40 +4598,47 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		let allTools: OpenAI.Chat.ChatCompletionTool[] = []
 		let allowedFunctionNames: string[] | undefined
 
-		// Gemini requires all tool definitions to be present for history compatibility,
-		// but uses allowedFunctionNames to restrict which tools can be called.
-		// Other providers (Anthropic, OpenAI, etc.) don't support this feature yet,
-		// so they continue to receive only the filtered tools for the current mode.
-		const supportsAllowedFunctionNames = apiConfiguration?.apiProvider === "gemini"
+		if (this.isRefineMode) {
+			// Refine mode: only expose write_todo_plan tool
+			const { getRefineOnlyTools } = await import("../prompts/tools/native-tools")
+			allTools = getRefineOnlyTools()
+		} else {
+			// Gemini requires all tool definitions to be present for history compatibility,
+			// but uses allowedFunctionNames to restrict which tools can be called.
+			// Other providers (Anthropic, OpenAI, etc.) don't support this feature yet,
+			// so they continue to receive only the filtered tools for the current mode.
+			const supportsAllowedFunctionNames = apiConfiguration?.apiProvider === "gemini"
 
-		{
-			const provider = this.providerRef.deref()
-			if (!provider) {
-				throw new Error("Provider reference lost during tool building")
+			{
+				const provider = this.providerRef.deref()
+				if (!provider) {
+					throw new Error("Provider reference lost during tool building")
+				}
+
+				const toolsResult = await buildNativeToolsArrayWithRestrictions({
+					provider,
+					cwd: this.cwd,
+					mode,
+					customModes: state?.customModes,
+					experiments: state?.experiments,
+					apiConfiguration,
+					browserToolEnabled: state?.browserToolEnabled ?? true,
+					disabledTools: state?.disabledTools,
+					modelInfo,
+					includeAllToolsWithRestrictions: supportsAllowedFunctionNames,
+					discoveredTools: this.discoveredTools,
+					taskEstablished: this.taskEstablished,
+				})
+				allTools = toolsResult.tools
+				allowedFunctionNames = toolsResult.allowedFunctionNames
 			}
-
-			const toolsResult = await buildNativeToolsArrayWithRestrictions({
-				provider,
-				cwd: this.cwd,
-				mode,
-				customModes: state?.customModes,
-				experiments: state?.experiments,
-				apiConfiguration,
-				browserToolEnabled: state?.browserToolEnabled ?? true,
-				disabledTools: state?.disabledTools,
-				modelInfo,
-				includeAllToolsWithRestrictions: supportsAllowedFunctionNames,
-				discoveredTools: this.discoveredTools,
-				taskEstablished: this.taskEstablished,
-			})
-			allTools = toolsResult.tools
-			allowedFunctionNames = toolsResult.allowedFunctionNames
 		}
 
 		const shouldIncludeTools = allTools.length > 0
 
 		const metadata: ApiHandlerCreateMessageMetadata = {
 			mode: mode,
+			behaviorRole: this.isRefineMode ? "refining" : mode,
 			taskId: this.taskId,
 			suppressPreviousResponseId: this.skipPrevResponseIdOnce,
 			// Include tools whenever they are present.
@@ -4998,6 +4990,97 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		return cleanConversationHistory
 	}
+
+	private buildRefineSafeHistory(messages: ApiMessage[]): ApiMessage[] {
+		const filteredToolUseIds = new Set<string>()
+		const sanitizedMessages: ApiMessage[] = []
+
+		for (const msg of messages) {
+			if ((msg as any).type === "reasoning") {
+				continue
+			}
+
+			if (!msg.role) {
+				continue
+			}
+
+			if (typeof msg.content === "string") {
+				const sanitizedText = this.sanitizeRefineTextBlock(msg.content)
+				if (!sanitizedText) {
+					continue
+				}
+				sanitizedMessages.push({
+					...msg,
+					content: sanitizedText,
+				} as ApiMessage)
+				continue
+			}
+
+			if (!Array.isArray(msg.content)) {
+				sanitizedMessages.push(msg)
+				continue
+			}
+
+			const sanitizedContent = msg.content.flatMap((block: any) => {
+				if (block?.type === "text" && typeof block.text === "string") {
+					const sanitizedText = this.sanitizeRefineTextBlock(block.text)
+					return sanitizedText ? [{ ...block, text: sanitizedText }] : []
+				}
+
+				if (block?.type === "tool_use" || block?.type === "mcp_tool_use") {
+					if (block.name !== "write_todo_plan") {
+						if (typeof block.id === "string") {
+							filteredToolUseIds.add(block.id)
+						}
+						return []
+					}
+				}
+
+				if (block?.type === "tool_result" && typeof block.tool_use_id === "string") {
+					if (filteredToolUseIds.has(block.tool_use_id)) {
+						return []
+					}
+				}
+
+				return [block]
+			})
+
+			if (sanitizedContent.length === 0) {
+				continue
+			}
+
+			sanitizedMessages.push({
+				...msg,
+				content: sanitizedContent,
+			} as ApiMessage)
+		}
+
+		return sanitizedMessages
+	}
+
+	private sanitizeRefineTextBlock(text: string): string | undefined {
+		const trimmed = text.trim()
+		if (!trimmed) {
+			return undefined
+		}
+
+		if (trimmed.startsWith("<environment_details>") && trimmed.endsWith("</environment_details>")) {
+			return undefined
+		}
+
+		if (trimmed.startsWith("[IMPLEMENTATION PLAN for")) {
+			return undefined
+		}
+
+		if (trimmed.startsWith("[USER TODO LIST EDIT]")) {
+			return undefined
+		}
+
+		const postRefineExecutionIndex = text.indexOf("=== POST-REFINE EXECUTION ===")
+		const sanitized = postRefineExecutionIndex >= 0 ? text.slice(0, postRefineExecutionIndex).trimEnd() : text
+
+		return sanitized.trim() ? sanitized : undefined
+	}
 	public async checkpointRestore(options: CheckpointRestoreOptions) {
 		return checkpointRestore(this, options)
 	}
@@ -5164,4 +5247,49 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.error(`[Task] Queue processing error:`, e)
 		}
 	}
+}
+
+function buildRefineSystemPrompt(): string {
+	return [
+		"You are a planning assistant. Your current task is to create detailed implementation plans for the todo items provided by the user.",
+		"",
+		"RULES:",
+		"- You have exactly ONE tool available: `write_todo_plan`. Use it to record plans internally.",
+		"- Do NOT create any files in the workspace. The plan is an internal artifact.",
+		"- Do NOT use any other tools. You do not have access to them.",
+		"- Call `write_todo_plan` once per todo item with the appropriate plan_type and plan entries.",
+	].join("\n")
+}
+
+function buildRefinePrompt(itemDescriptions: string): string {
+	return [
+		"[REFINE REQUEST] The user wants you to create detailed implementation plans for the following todo item(s):",
+		"",
+		itemDescriptions,
+		"",
+		"IMPORTANT — The plan itself is not a workspace file. Do not create markdown files in the project for the plan itself.",
+		"Use the `write_todo_plan` tool to record the plan internally.",
+		"",
+		"IMPORTANT — First, judge whether each todo item will require modifying or creating source code files:",
+		'DEFAULT RULE — treat the plan as non-code-change and use plan_type="general" unless you can clearly identify real project files that must be modified or created.',
+		"",
+		'• If the todo item requires changing or creating project files → set plan_type="file".',
+		'  - Each plan entry\'s filePath should be the relative path to a real project file (e.g. "src/core/Player.ts").',
+		"  - Describe WHAT changes are needed in that file, WHY, and HOW.",
+		"",
+		'• If the todo item does NOT involve code changes (e.g. research, design decisions, architecture analysis, documentation planning) → set plan_type="general".',
+		'  - Each plan entry\'s filePath should be a descriptive section title (e.g. "Architecture Overview").',
+		"  - Describe the conceptual plan, design rationale, or analysis.",
+		"",
+		"Think carefully about:",
+		"1. Whether the todo item requires actual file changes or is purely conceptual",
+		"2. Which existing files need modification (for file plans)",
+		"3. Which new files need to be created (for file plans)",
+		"4. The specific changes or design decisions required",
+		"5. Dependencies between files or plan sections",
+		"",
+		"Call `write_todo_plan` once per todo item with the appropriate plan_type and all its plan entries.",
+		"",
+		"After you finish writing plans for all requested todo items, stop. Execution will continue in a separate non-refine request with the normal task tools and system prompt.",
+	].join("\n")
 }

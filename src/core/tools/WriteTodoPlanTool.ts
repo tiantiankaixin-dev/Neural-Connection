@@ -2,10 +2,11 @@ import { Task } from "../task/Task"
 import { formatResponse } from "../prompts/responses"
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import type { ToolUse } from "../../shared/tools"
-import { savePlanFiles } from "../task-persistence/plan-persistence"
+import { savePlanFiles, type PlanType } from "../task-persistence/plan-persistence"
 
 interface WriteTodoPlanParams {
 	todo_item_id: string
+	plan_type?: string
 	plans: string
 }
 
@@ -21,7 +22,8 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 		const { pushToolResult, handleError, askApproval } = callbacks
 
 		try {
-			const { todo_item_id, plans: plansRaw } = params
+			const { todo_item_id, plan_type: planTypeRaw, plans: plansRaw } = params
+			const planType: PlanType = planTypeRaw === "general" ? "general" : "file"
 
 			if (!todo_item_id || typeof todo_item_id !== "string") {
 				task.consecutiveMistakeCount++
@@ -94,9 +96,19 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				todo_item_id,
 				todoItem.content,
 				planEntries,
+				planType,
 			)
 
 			task.consecutiveMistakeCount = 0
+
+			if (task.activeRefineTodoItemIds) {
+				const remainingTodoItemIds = task.activeRefineTodoItemIds.filter((id) => id !== todo_item_id)
+				task.activeRefineTodoItemIds = remainingTodoItemIds.length > 0 ? remainingTodoItemIds : null
+				task.isRefineMode = remainingTodoItemIds.length > 0
+			} else {
+				// Fallback for unexpected single-item refine flows
+				task.isRefineMode = false
+			}
 
 			// Emit refine_result say message so the UI can show a collapsible plan block
 			await task.say(
@@ -104,6 +116,8 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				JSON.stringify({
 					todoItemId: todo_item_id,
 					todoContent: todoItem.content,
+					savedPath,
+					planType,
 					plans: planEntries.map((e) => ({ filePath: e.filePath, content: e.content })),
 				}),
 				undefined,
@@ -113,10 +127,11 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				{ isNonInteractive: true },
 			)
 
-			const fileList = planEntries.map((e) => `  - ${e.filePath}.md`).join("\n")
+			const label = planType === "general" ? "general plan section(s)" : "plan file(s)"
+			const fileList = planEntries.map((e) => `  - ${e.filePath}`).join("\n")
 			pushToolResult(
 				formatResponse.toolResult(
-					`Successfully wrote ${planEntries.length} plan file(s) for todo item "${todoItem.content}":\n${fileList}\n\nThese plans will be automatically injected into context when working on this todo item.`,
+					`Successfully wrote ${planEntries.length} ${label} for todo item "${todoItem.content}":\n${fileList}\n\nThese plans will be automatically injected into context when working on this todo item.`,
 				),
 			)
 		} catch (error) {

@@ -58,6 +58,18 @@ export interface ChatViewProps {
 	hideAnnouncement: () => void
 }
 
+interface TodoPlanEntry {
+	filePath: string
+	content: string
+}
+
+interface TodoPlanData {
+	savedPath?: string
+	planType?: "file" | "general"
+	todoContent?: string
+	plans: TodoPlanEntry[]
+}
+
 export interface ChatViewRef {
 	acceptInput: () => void
 }
@@ -134,6 +146,34 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		// Fall back to extracting from messages
 		return getLatestTodo(messages)
 	}, [messages, currentTaskTodos])
+
+	const todoPlansById = useMemo<Record<string, TodoPlanData>>(() => {
+		const result: Record<string, TodoPlanData> = {}
+
+		for (const message of messages) {
+			if (message.type !== "say" || message.say !== "refine_result" || !message.text) {
+				continue
+			}
+
+			try {
+				const parsed = JSON.parse(message.text)
+				if (!parsed?.todoItemId || !Array.isArray(parsed?.plans)) {
+					continue
+				}
+
+				result[parsed.todoItemId] = {
+					savedPath: parsed.savedPath,
+					planType: parsed.planType,
+					todoContent: parsed.todoContent,
+					plans: parsed.plans,
+				}
+			} catch {
+				// ignore invalid refine_result payloads
+			}
+		}
+
+		return result
+	}, [messages])
 
 	const modifiedMessages = useMemo(() => combineApiRequests(combineCommandSequences(messages.slice(1))), [messages])
 
@@ -1674,6 +1714,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				<ChatRow
 					key={messageOrGroup.ts}
 					message={messageOrGroup}
+					todoPlansById={todoPlansById}
 					showRefiningIndicator={isRefining}
 					onRefineTodoItems={handleRefineTodoItems}
 					isExpanded={expandedRows[messageOrGroup.ts] || false}
@@ -1710,6 +1751,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			expandedRows,
 			toggleRowExpansion,
 			modifiedMessages,
+			todoPlansById,
 			groupedMessages.length,
 			isRefining,
 			handleRowHeightChange,

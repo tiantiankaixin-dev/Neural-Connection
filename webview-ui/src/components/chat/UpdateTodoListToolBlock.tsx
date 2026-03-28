@@ -8,6 +8,17 @@ interface TodoItem {
 	status?: "completed" | "in_progress" | string
 }
 
+interface TodoPlanEntry {
+	filePath: string
+	content: string
+}
+
+interface TodoPlanData {
+	savedPath?: string
+	planType?: "file" | "general"
+	plans: TodoPlanEntry[]
+}
+
 /**
  * @description
  * Editable Todo List component. Each time the todo list changes (edit, add, delete, status switch), the parent component will be notified via the onChange callback.
@@ -16,6 +27,7 @@ interface TodoItem {
 interface UpdateTodoListToolBlockProps {
 	todos?: TodoItem[]
 	previousTodos?: TodoItem[]
+	todoPlansById?: Record<string, TodoPlanData>
 	content?: string
 	/**
 	 * Callback when todos change, be sure to implement and notify the model with the latest todos
@@ -81,9 +93,128 @@ const CHANGE_COLORS: Record<TodoChangeType, string> = {
 	unchanged: "transparent",
 }
 
+function TodoPlanTree({ plan }: { plan: TodoPlanData }) {
+	const [rootExpanded, setRootExpanded] = React.useState(false)
+	const [expandedSections, setExpandedSections] = React.useState<Set<number>>(new Set())
+
+	const shortPath = plan.savedPath ? plan.savedPath.replace(/\\/g, "/").split("/").slice(-2).join("/") : "Plan"
+
+	const toggleSection = (idx: number) => {
+		setExpandedSections((prev) => {
+			const next = new Set(prev)
+			if (next.has(idx)) {
+				next.delete(idx)
+			} else {
+				next.add(idx)
+			}
+			return next
+		})
+	}
+
+	return (
+		<div style={{ marginTop: 4, marginLeft: 3 }}>
+			<div
+				style={{
+					fontSize: 11,
+					color: "var(--vscode-textLink-foreground)",
+					cursor: "pointer",
+					display: "flex",
+					alignItems: "center",
+					gap: 3,
+					userSelect: "none",
+					lineHeight: "1.4",
+				}}
+				onClick={() => setRootExpanded(!rootExpanded)}>
+				<span
+					className={`codicon codicon-chevron-${rootExpanded ? "down" : "right"}`}
+					style={{ fontSize: 9, flexShrink: 0 }}
+				/>
+				<span className="codicon codicon-folder" style={{ fontSize: 11, flexShrink: 0 }} />
+				<span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{shortPath}</span>
+			</div>
+			{rootExpanded && (
+				<div
+					style={{
+						marginLeft: 12,
+						marginTop: 2,
+						borderLeft: "1px solid var(--vscode-editorWidget-border)",
+						paddingLeft: 8,
+					}}>
+					{plan.savedPath && (
+						<div
+							style={{
+								fontSize: 10,
+								color: "var(--vscode-descriptionForeground)",
+								marginBottom: 4,
+								wordBreak: "break-all",
+								lineHeight: "1.3",
+							}}>
+							{plan.savedPath}
+						</div>
+					)}
+					{plan.plans.map((entry, idx) => (
+						<div key={idx} style={{ marginTop: idx === 0 ? 0 : 2 }}>
+							<div
+								style={{
+									fontSize: 11,
+									color: "var(--vscode-foreground)",
+									cursor: "pointer",
+									display: "flex",
+									alignItems: "center",
+									gap: 3,
+									userSelect: "none",
+									lineHeight: "1.4",
+								}}
+								onClick={() => toggleSection(idx)}>
+								<span
+									className={`codicon codicon-chevron-${expandedSections.has(idx) ? "down" : "right"}`}
+									style={{ fontSize: 9, flexShrink: 0 }}
+								/>
+								<span
+									className="codicon codicon-file-text"
+									style={{ fontSize: 10, flexShrink: 0, opacity: 0.8 }}
+								/>
+								<span
+									style={{
+										overflow: "hidden",
+										textOverflow: "ellipsis",
+										whiteSpace: "nowrap",
+										opacity: 0.9,
+									}}>
+									{entry.filePath}
+								</span>
+							</div>
+							{expandedSections.has(idx) && (
+								<pre
+									style={{
+										margin: "2px 0 4px 20px",
+										fontSize: 11,
+										lineHeight: "1.4",
+										whiteSpace: "pre-wrap",
+										wordBreak: "break-word",
+										color: "var(--vscode-foreground)",
+										opacity: 0.85,
+										padding: "4px 6px",
+										borderRadius: 3,
+										background: "var(--vscode-textBlockQuote-background)",
+										maxHeight: "30vh",
+										overflowY: "auto",
+									}}>
+									{entry.content}
+								</pre>
+							)}
+						</div>
+					))}
+				</div>
+			)}
+		</div>
+	)
+}
+
 const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	todos = [],
 	previousTodos,
+	todoPlansById,
 	content,
 	onChange,
 	onRefine,
@@ -340,6 +471,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 								}
 								const changeType = changeMap.get(todo.id || todo.content) as TodoChangeType | undefined
 								const changeColor = changeType ? CHANGE_COLORS[changeType] : "transparent"
+								const todoPlan = todo.id ? todoPlansById?.[todo.id] : undefined
 								return (
 									<li
 										key={todo.id || idx}
@@ -403,24 +535,32 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 												}}
 											/>
 										) : (
-											<span
+											<div
 												style={{
 													flex: 1,
 													minWidth: 0,
-													fontWeight: 500,
-													color:
-														todo.status === "completed"
-															? "var(--vscode-charts-green)"
-															: todo.status === "in_progress"
-																? "var(--vscode-charts-yellow)"
-																: "var(--vscode-foreground)",
-													fontSize: 13,
 													marginRight: 6,
-													padding: "1px 3px",
-													lineHeight: "1.4",
 												}}>
-												{todo.content}
-											</span>
+												<span
+													style={{
+														display: "block",
+														fontWeight: 500,
+														color:
+															todo.status === "completed"
+																? "var(--vscode-charts-green)"
+																: todo.status === "in_progress"
+																	? "var(--vscode-charts-yellow)"
+																	: "var(--vscode-foreground)",
+														fontSize: 13,
+														padding: "1px 3px",
+														lineHeight: "1.4",
+													}}>
+													{todo.content}
+												</span>
+												{todoPlan && todoPlan.plans.length > 0 && (
+													<TodoPlanTree plan={todoPlan} />
+												)}
+											</div>
 										)}
 										{isEditing && (
 											<select

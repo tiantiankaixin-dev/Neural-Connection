@@ -124,12 +124,13 @@ export class ContextInspectorPanel {
 		modelId?: string
 		provider?: string
 	}): void {
+		const behaviorRole = data.metadata?.behaviorRole ? ` role=${data.metadata.behaviorRole}` : ""
 		this.addEntry({
 			id: ++this.entryCounter,
 			timestamp: new Date().toISOString(),
 			direction: "ext\u2192api",
 			type: "CAPTURED CONTEXT",
-			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
+			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"}${behaviorRole} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
 			data,
 		})
 		if (this.panel) {
@@ -267,12 +268,13 @@ export class ContextInspectorPanel {
 		provider?: string
 	}): void {
 		if (!this.enabled) return
+		const behaviorRole = data.metadata?.behaviorRole ? ` role=${data.metadata.behaviorRole}` : ""
 		this.addEntry({
 			id: ++this.entryCounter,
 			timestamp: new Date().toISOString(),
 			direction: "ext→api",
 			type: "createMessage",
-			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
+			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"}${behaviorRole} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
 			data,
 		})
 	}
