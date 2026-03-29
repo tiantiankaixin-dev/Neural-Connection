@@ -2,6 +2,7 @@ import * as fs from "fs/promises"
 import * as path from "path"
 import { getTaskDirectoryPath } from "../../utils/storage"
 import { safeWriteJson } from "../../utils/safeWriteJson"
+import { getConversationDirectorySegmentsForPlan, readPlanFiles } from "./plan-persistence"
 
 // ────────────────────────────────────────────────────────────────────────────
 // Turn Persistence
@@ -127,6 +128,36 @@ async function getTurnFolderPath(
 	return turnFolder
 }
 
+async function ensurePlannedConversationPaths(
+	globalStoragePath: string,
+	taskId: string,
+	taskTimestamp: string,
+	itemContent: string | undefined,
+	todoItemId: string | undefined,
+): Promise<void> {
+	if (!itemContent || !todoItemId) {
+		return
+	}
+
+	const planFiles = await readPlanFiles(globalStoragePath, taskId, taskTimestamp, todoItemId, itemContent)
+	if (planFiles.length === 0) {
+		return
+	}
+
+	const baseDir = await getTaskTurnsBaseDir(globalStoragePath, taskId, taskTimestamp)
+	const itemFolder = sanitizeFolderName(itemContent)
+	const itemDir = path.join(baseDir, itemFolder)
+
+	for (const planFile of planFiles) {
+		const segments = getConversationDirectorySegmentsForPlan(planFile)
+		if (segments.length === 0) {
+			continue
+		}
+
+		await fs.mkdir(path.join(itemDir, ...segments), { recursive: true })
+	}
+}
+
 /**
  * Save turn output data (input context + LLM output) to disk.
  * Creates: <项目名>/消息N/output.json
@@ -138,6 +169,8 @@ export async function saveTurnOutput(
 	itemContent: string | undefined,
 	turnOutput: TurnOutput,
 ): Promise<void> {
+	await ensurePlannedConversationPaths(globalStoragePath, taskId, taskTimestamp, itemContent, turnOutput.todoItemId)
+
 	const turnDir = await getTurnFolderPath(
 		globalStoragePath,
 		taskId,

@@ -8,7 +8,7 @@ const MODE_PARAMETER_DESCRIPTION = `Slug of the mode to begin the new task in (e
 
 const MESSAGE_PARAMETER_DESCRIPTION = `Initial user instructions or context for the new task`
 
-const TODOS_PARAMETER_DESCRIPTION = `Optional initial todo list written as a markdown checklist; required when the workspace mandates todos`
+const TODOS_PARAMETER_DESCRIPTION = `Optional initial todo list written as a markdown checklist; required when the workspace mandates todos. If any todo involves creating files, explicitly include every new relative file path in that todo item rather than using vague phrases like "create needed files". Each todo that names file paths fully owns those files, and the same unfinished file path must not be assigned to another todo in the same task.`
 
 export default {
 	type: "function",

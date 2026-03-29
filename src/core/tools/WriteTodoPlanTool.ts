@@ -2,56 +2,29 @@ import { Task } from "../task/Task"
 import { formatResponse } from "../prompts/responses"
 import { BaseTool, ToolCallbacks } from "./BaseTool"
 import type { ToolUse } from "../../shared/tools"
-import { savePlanFiles, type PlanType } from "../task-persistence/plan-persistence"
+import {
+	buildPlanEntryContent,
+	normalizeStructuredPlanEntry,
+	savePlanFiles,
+	type PlanType,
+	type StructuredPlanEntry,
+	validateStructuredPlanEntry,
+} from "../task-persistence/plan-persistence"
 
 interface WriteTodoPlanParams {
 	todo_item_id: string
-	plan_type?: string
-	plans: string
-}
-
-interface PlanEntry {
-	filePath: string
-	content: string
-}
-
-function looksLikeProjectFilePath(value: string): boolean {
-	const trimmed = value.trim()
-	if (!trimmed) {
-		return false
-	}
-
-	if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
-		return true
-	}
-
-	if (/^\.{1,2}[\\/]/.test(trimmed)) {
-		return true
-	}
-
-	if (trimmed.includes("/") || trimmed.includes("\\")) {
-		return true
-	}
-
-	return /^[^\s]+\.[A-Za-z0-9_-]{1,12}$/.test(trimmed)
-}
-
-function resolvePlanType(planTypeRaw: string | undefined, planEntries: PlanEntry[]): PlanType {
-	if (planTypeRaw === "general" || planTypeRaw === "file") {
-		return planTypeRaw
-	}
-
-	return planEntries.some((entry) => looksLikeProjectFilePath(entry.filePath)) ? "file" : "general"
+	plan_type: PlanType
+	plans: StructuredPlanEntry[]
 }
 
 export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 	readonly name = "write_todo_plan" as const
 
 	async execute(params: WriteTodoPlanParams, task: Task, callbacks: ToolCallbacks): Promise<void> {
-		const { pushToolResult, handleError, askApproval } = callbacks
+		const { pushToolResult, handleError } = callbacks
 
 		try {
-			const { todo_item_id, plan_type: planTypeRaw, plans: plansRaw } = params
+			const { todo_item_id, plan_type: planType, plans } = params
 
 			if (!todo_item_id || typeof todo_item_id !== "string") {
 				task.consecutiveMistakeCount++
@@ -75,55 +48,59 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				return
 			}
 
-			// Parse plans JSON
-			let planEntries: PlanEntry[]
-			try {
-				planEntries = JSON.parse(plansRaw || "[]")
-			} catch {
+			if (planType !== "file" && planType !== "general") {
 				task.consecutiveMistakeCount++
 				task.recordToolError("write_todo_plan")
 				task.didToolFailInCurrentTurn = true
-				pushToolResult(formatResponse.toolError("The plans parameter is not valid JSON"))
+				pushToolResult(formatResponse.toolError('plan_type must be exactly "file" or "general"'))
 				return
 			}
 
-			if (!Array.isArray(planEntries) || planEntries.length === 0) {
+			if (!Array.isArray(plans) || plans.length === 0) {
 				task.consecutiveMistakeCount++
 				task.recordToolError("write_todo_plan")
 				task.didToolFailInCurrentTurn = true
-				pushToolResult(formatResponse.toolError("plans must be a non-empty JSON array"))
+				pushToolResult(formatResponse.toolError("plans must be a non-empty array"))
 				return
 			}
 
-			// Validate each plan entry
-			for (const [i, entry] of planEntries.entries()) {
-				if (!entry.filePath || typeof entry.filePath !== "string") {
+			const normalizedStructuredEntries = plans.map((entry) => normalizeStructuredPlanEntry(planType, entry))
+
+			for (const [i, entry] of normalizedStructuredEntries.entries()) {
+				if (!entry.target || typeof entry.target !== "string") {
 					task.consecutiveMistakeCount++
 					task.recordToolError("write_todo_plan")
 					task.didToolFailInCurrentTurn = true
-					pushToolResult(formatResponse.toolError(`Plan entry ${i + 1} is missing a valid filePath`))
+					pushToolResult(formatResponse.toolError(`Plan entry ${i + 1} is missing a valid target`))
 					return
 				}
-				if (!entry.content || typeof entry.content !== "string") {
+				if (!entry.body || typeof entry.body !== "string") {
 					task.consecutiveMistakeCount++
 					task.recordToolError("write_todo_plan")
 					task.didToolFailInCurrentTurn = true
-					pushToolResult(formatResponse.toolError(`Plan entry ${i + 1} is missing content`))
+					pushToolResult(formatResponse.toolError(`Plan entry ${i + 1} is missing body`))
+					return
+				}
+
+				const validationError = validateStructuredPlanEntry(entry, planType)
+				if (validationError) {
+					task.consecutiveMistakeCount++
+					task.recordToolError("write_todo_plan")
+					task.didToolFailInCurrentTurn = true
+					pushToolResult(formatResponse.toolError(validationError))
 					return
 				}
 			}
 
-			const normalizedPlanEntries = planEntries.map((entry) => ({
-				filePath: entry.filePath.trim(),
-				content: entry.content.trim(),
+			const normalizedPlanEntries = normalizedStructuredEntries.map((entry) => ({
+				filePath: entry.target,
+				content: buildPlanEntryContent(entry),
 			}))
-			const planType = resolvePlanType(planTypeRaw, normalizedPlanEntries)
 
 			// Auto-approved: this tool only writes internal plan files (.md),
 			// it does not modify actual project source code.
 
-			// Save all plan entries into a single .md file
-			const savedPath = await savePlanFiles(
+			const { savedPaths } = await savePlanFiles(
 				task.globalStoragePath,
 				task.taskId,
 				task.taskTimestamp,
@@ -139,9 +116,13 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				const remainingTodoItemIds = task.activeRefineTodoItemIds.filter((id) => id !== todo_item_id)
 				task.activeRefineTodoItemIds = remainingTodoItemIds.length > 0 ? remainingTodoItemIds : null
 				task.isRefineMode = remainingTodoItemIds.length > 0
+				if (remainingTodoItemIds.length === 0) {
+					task.postRefineDividerPending = true
+				}
 			} else {
 				// Fallback for unexpected single-item refine flows
 				task.isRefineMode = false
+				task.postRefineDividerPending = true
 			}
 
 			// Emit refine_result say message so the UI can show a collapsible plan block
@@ -150,9 +131,16 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				JSON.stringify({
 					todoItemId: todo_item_id,
 					todoContent: todoItem.content,
-					savedPath,
+					savedPath: savedPaths[0],
+					savedPaths,
 					planType,
-					plans: normalizedPlanEntries.map((e) => ({ filePath: e.filePath, content: e.content })),
+					plans: normalizedPlanEntries.map((e, index) => ({
+						filePath: e.filePath,
+						content: e.content,
+						target: normalizedStructuredEntries[index]?.target,
+						action: normalizedStructuredEntries[index]?.action,
+						body: normalizedStructuredEntries[index]?.body,
+					})),
 				}),
 				undefined,
 				undefined,
@@ -163,9 +151,10 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 
 			const label = planType === "general" ? "general plan section(s)" : "plan file(s)"
 			const fileList = normalizedPlanEntries.map((e) => `  - ${e.filePath}`).join("\n")
+			const savedPathList = savedPaths.map((p) => `  - ${p}`).join("\n")
 			pushToolResult(
 				formatResponse.toolResult(
-					`Successfully wrote ${planEntries.length} ${label} for todo item "${todoItem.content}":\n${fileList}\n\nThese plans will be automatically injected into context when working on this todo item.`,
+					`Successfully wrote ${normalizedPlanEntries.length} ${label} for todo item "${todoItem.content}":\n${fileList}\n\nSaved plan files:\n${savedPathList}\n\nThese plans will be automatically injected into context when working on this todo item.`,
 				),
 			)
 		} catch (error) {
@@ -175,17 +164,12 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 
 	override async handlePartial(task: Task, block: ToolUse<"write_todo_plan">): Promise<void> {
 		const todoItemId = block.params.todo_item_id
-		let plansPreview: PlanEntry[] = []
-		try {
-			plansPreview = JSON.parse(block.params.plans || "[]")
-		} catch {
-			plansPreview = []
-		}
+		const plansPreview = Array.isArray(block.params.plans) ? block.params.plans : []
 
 		const previewMsg = JSON.stringify({
 			tool: "writeTodoPlan",
 			todoItemId,
-			files: plansPreview.map((e: PlanEntry) => e.filePath).filter(Boolean),
+			files: plansPreview.map((e: StructuredPlanEntry) => e.target).filter(Boolean),
 		})
 		await task.say("tool", previewMsg, undefined, block.partial).catch(() => {})
 	}

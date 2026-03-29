@@ -15,6 +15,7 @@ interface TodoPlanEntry {
 
 interface TodoPlanData {
 	savedPath?: string
+	savedPaths?: string[]
 	planType?: "file" | "general"
 	plans: TodoPlanEntry[]
 }
@@ -28,6 +29,11 @@ interface UpdateTodoListToolBlockProps {
 	todos?: TodoItem[]
 	previousTodos?: TodoItem[]
 	todoPlansById?: Record<string, TodoPlanData>
+	refiningTodoItemIds?: string[]
+	activeRefiningTodoItemId?: string
+	refineStatusLabel?: string
+	refineReasoningContent?: string
+	showRefiningIndicator?: boolean
 	content?: string
 	/**
 	 * Callback when todos change, be sure to implement and notify the model with the latest todos
@@ -93,11 +99,25 @@ const CHANGE_COLORS: Record<TodoChangeType, string> = {
 	unchanged: "transparent",
 }
 
-function TodoPlanTree({ plan }: { plan: TodoPlanData }) {
-	const [rootExpanded, setRootExpanded] = React.useState(false)
-	const [expandedSections, setExpandedSections] = React.useState<Set<number>>(new Set())
+function getDisplayedPlanContent(content: string) {
+	const stripped = content.replace(
+		/^<<<PLAN_TARGET>>>\r?\nACTION: .*\r?\nPATH: .*\r?\n<<<END_PLAN_TARGET>>>(?:\r?\n)*/,
+		"",
+	)
 
-	const shortPath = plan.savedPath ? plan.savedPath.replace(/\\/g, "/").split("/").slice(-2).join("/") : "Plan"
+	return stripped.trim() || content
+}
+
+function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }) {
+	const [isExpanded, setIsExpanded] = React.useState(false)
+	const [expandedSections, setExpandedSections] = React.useState<Set<number>>(new Set())
+	const hasPlan = !!plan && plan.plans.length > 0
+	const statusColor =
+		todo.status === "completed"
+			? "var(--vscode-charts-green)"
+			: todo.status === "in_progress"
+				? "var(--vscode-charts-yellow)"
+				: "var(--vscode-descriptionForeground)"
 
 	const toggleSection = (idx: number) => {
 		setExpandedSections((prev) => {
@@ -112,96 +132,122 @@ function TodoPlanTree({ plan }: { plan: TodoPlanData }) {
 	}
 
 	return (
-		<div style={{ marginTop: 4, marginLeft: 3 }}>
+		<div
+			style={{
+				borderRadius: 6,
+				border: hasPlan ? "1px solid rgba(55, 148, 255, 0.32)" : "1px solid rgba(55, 148, 255, 0.12)",
+				background: hasPlan ? "var(--vscode-editor-background)" : "rgba(55, 148, 255, 0.03)",
+				overflow: "hidden",
+			}}>
 			<div
+				onClick={() => {
+					if (hasPlan) {
+						setIsExpanded(!isExpanded)
+					}
+				}}
 				style={{
-					fontSize: 11,
-					color: "var(--vscode-textLink-foreground)",
-					cursor: "pointer",
 					display: "flex",
 					alignItems: "center",
-					gap: 3,
+					gap: 6,
+					padding: "8px 10px",
+					cursor: hasPlan ? "pointer" : "default",
 					userSelect: "none",
-					lineHeight: "1.4",
-				}}
-				onClick={() => setRootExpanded(!rootExpanded)}>
+					fontSize: 13,
+					color: "var(--vscode-foreground)",
+				}}>
 				<span
-					className={`codicon codicon-chevron-${rootExpanded ? "down" : "right"}`}
-					style={{ fontSize: 9, flexShrink: 0 }}
-				/>
-				<span className="codicon codicon-folder" style={{ fontSize: 11, flexShrink: 0 }} />
-				<span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{shortPath}</span>
-			</div>
-			{rootExpanded && (
-				<div
+					className={`codicon codicon-chevron-${isExpanded ? "down" : "right"}`}
 					style={{
-						marginLeft: 12,
-						marginTop: 2,
-						borderLeft: "1px solid var(--vscode-editorWidget-border)",
-						paddingLeft: 8,
-					}}>
-					{plan.savedPath && (
+						fontSize: 13,
+						flexShrink: 0,
+						opacity: hasPlan ? 1 : 0.35,
+					}}
+				/>
+				<span className="codicon codicon-wand" style={{ color: "var(--vscode-charts-blue)", flexShrink: 0 }} />
+				<div style={{ minWidth: 0, flex: 1, lineHeight: "1.35" }}>
+					<div
+						style={{
+							color: "var(--vscode-foreground)",
+							fontWeight: 600,
+						}}>
+						{todo.content}
+					</div>
+					<div style={{ color: "var(--vscode-descriptionForeground)", fontSize: 12 }}>
+						{hasPlan
+							? `${plan.plans.length} ${plan.planType === "general" ? "section(s)" : "file(s)"}`
+							: "No refine details"}
+					</div>
+				</div>
+				<span
+					style={{
+						display: "inline-block",
+						width: 8,
+						height: 8,
+						borderRadius: "50%",
+						marginLeft: 4,
+						flexShrink: 0,
+						background:
+							todo.status === "completed" || todo.status === "in_progress" ? statusColor : "transparent",
+						border:
+							todo.status === "completed" || todo.status === "in_progress"
+								? "none"
+								: "1px solid var(--vscode-descriptionForeground)",
+					}}
+				/>
+			</div>
+			{isExpanded && hasPlan && plan && (
+				<div style={{ borderTop: "1px solid var(--vscode-editorGroup-border)" }}>
+					{plan.plans.map((entry, index) => (
 						<div
+							key={index}
 							style={{
-								fontSize: 10,
-								color: "var(--vscode-descriptionForeground)",
-								marginBottom: 4,
-								wordBreak: "break-all",
-								lineHeight: "1.3",
+								borderBottom:
+									index < plan.plans.length - 1
+										? "1px solid var(--vscode-editorGroup-border)"
+										: undefined,
 							}}>
-							{plan.savedPath}
-						</div>
-					)}
-					{plan.plans.map((entry, idx) => (
-						<div key={idx} style={{ marginTop: idx === 0 ? 0 : 2 }}>
 							<div
+								onClick={() => toggleSection(index)}
 								style={{
-									fontSize: 11,
-									color: "var(--vscode-foreground)",
-									cursor: "pointer",
 									display: "flex",
 									alignItems: "center",
-									gap: 3,
+									gap: 6,
+									padding: "6px 10px 6px 20px",
+									cursor: "pointer",
 									userSelect: "none",
-									lineHeight: "1.4",
-								}}
-								onClick={() => toggleSection(idx)}>
+									fontSize: 12,
+									color: "var(--vscode-foreground)",
+								}}>
 								<span
-									className={`codicon codicon-chevron-${expandedSections.has(idx) ? "down" : "right"}`}
-									style={{ fontSize: 9, flexShrink: 0 }}
+									className={`codicon codicon-chevron-${expandedSections.has(index) ? "down" : "right"}`}
+									style={{ fontSize: 12, flexShrink: 0 }}
 								/>
 								<span
-									className="codicon codicon-file-text"
-									style={{ fontSize: 10, flexShrink: 0, opacity: 0.8 }}
-								/>
-								<span
+									className={`codicon codicon-${plan.planType === "general" ? "book" : "file-code"}`}
 									style={{
-										overflow: "hidden",
-										textOverflow: "ellipsis",
-										whiteSpace: "nowrap",
-										opacity: 0.9,
-									}}>
+										fontSize: 12,
+										flexShrink: 0,
+										color: "var(--vscode-descriptionForeground)",
+									}}
+								/>
+								<span style={{ fontFamily: "var(--vscode-editor-font-family)", opacity: 0.9 }}>
 									{entry.filePath}
 								</span>
 							</div>
-							{expandedSections.has(idx) && (
-								<pre
+							{expandedSections.has(index) && (
+								<div
 									style={{
-										margin: "2px 0 4px 20px",
-										fontSize: 11,
-										lineHeight: "1.4",
-										whiteSpace: "pre-wrap",
-										wordBreak: "break-word",
+										padding: "4px 14px 8px 36px",
 										color: "var(--vscode-foreground)",
-										opacity: 0.85,
-										padding: "4px 6px",
-										borderRadius: 3,
-										background: "var(--vscode-textBlockQuote-background)",
 										maxHeight: "30vh",
 										overflowY: "auto",
+										overflowX: "hidden",
+										background: "#000000",
+										borderRadius: 4,
+										margin: "4px 12px 8px 28px",
 									}}>
-									{entry.content}
-								</pre>
+									<MarkdownBlock markdown={getDisplayedPlanContent(entry.content)} />
+								</div>
 							)}
 						</div>
 					))}
@@ -215,6 +261,11 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	todos = [],
 	previousTodos,
 	todoPlansById,
+	refiningTodoItemIds,
+	activeRefiningTodoItemId,
+	refineStatusLabel = "refining...",
+	refineReasoningContent = "",
+	showRefiningIndicator = false,
 	content,
 	onChange,
 	onRefine,
@@ -233,8 +284,13 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	const newInputRef = useRef<HTMLInputElement>(null)
 	const [deleteId, setDeleteId] = useState<string | null>(null)
 	const [isEditing, setIsEditing] = useState(false)
+	const [expandedInlineThinkingIds, setExpandedInlineThinkingIds] = useState<Set<string>>(new Set())
 	const [selectedForRefine, setSelectedForRefine] = useState<Set<string>>(new Set())
 	const [isRefineMode, setIsRefineMode] = useState(false)
+	const refiningTodoIdSet = React.useMemo(
+		() => new Set((showRefiningIndicator ? refiningTodoItemIds : []) ?? []),
+		[refiningTodoItemIds, showRefiningIndicator],
+	)
 
 	// Automatically exit edit mode when external editable becomes false
 	useEffect(() => {
@@ -316,6 +372,18 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 			setAdding(false)
 			setNewContent("")
 		}
+	}
+
+	const toggleInlineThinking = (id: string) => {
+		setExpandedInlineThinkingIds((prev) => {
+			const next = new Set(prev)
+			if (next.has(id)) {
+				next.delete(id)
+			} else {
+				next.add(id)
+			}
+			return next
+		})
 	}
 
 	return (
@@ -472,13 +540,26 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 								const changeType = changeMap.get(todo.id || todo.content) as TodoChangeType | undefined
 								const changeColor = changeType ? CHANGE_COLORS[changeType] : "transparent"
 								const todoPlan = todo.id ? todoPlansById?.[todo.id] : undefined
+								const hasInlineRefinedCard = !isEditing && !!todoPlan?.plans?.length
+								const isActiveInlineRefining =
+									showRefiningIndicator &&
+									!!todo.id &&
+									activeRefiningTodoItemId === todo.id &&
+									!todoPlan?.plans?.length
+								const shouldShowInlineRefining =
+									isActiveInlineRefining && !!todo.id && refiningTodoIdSet.has(todo.id)
+								const shouldShowInlineThinking =
+									shouldShowInlineRefining &&
+									refineStatusLabel === "thinking..." &&
+									refineReasoningContent.trim().length > 0
+								const isInlineThinkingExpanded = !!todo.id && expandedInlineThinkingIds.has(todo.id)
 								return (
 									<li
 										key={todo.id || idx}
 										style={{
-											marginBottom: 2,
+											marginBottom: hasInlineRefinedCard ? 8 : 2,
 											display: "flex",
-											alignItems: "flex-start",
+											alignItems: hasInlineRefinedCard ? "stretch" : "flex-start",
 											minHeight: 20,
 											borderLeft:
 												changeColor !== "transparent" ? `3px solid ${changeColor}` : undefined,
@@ -502,66 +583,13 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 												}}
 												style={{
 													marginRight: 6,
-													marginTop: 5,
-													cursor: "pointer",
+													marginTop: hasInlineRefinedCard ? 8 : 7,
+													flexShrink: 0,
 													accentColor: "var(--vscode-charts-blue)",
 												}}
 											/>
 										)}
-										{!isRefineMode && icon}
-										{isEditing ? (
-											<input
-												type="text"
-												value={todo.content}
-												placeholder="Enter todo item"
-												onChange={(e) => handleContentChange(todo.id!, e.target.value)}
-												style={{
-													flex: 1,
-													minWidth: 0,
-													fontWeight: 500,
-													color: "var(--vscode-input-foreground)",
-													background: "var(--vscode-input-background)",
-													border: "none",
-													outline: "none",
-													fontSize: 13,
-													marginRight: 6,
-													padding: "1px 3px",
-													borderBottom: "1px solid var(--vscode-input-border)",
-												}}
-												onBlur={(e) => {
-													if (!e.target.value.trim()) {
-														handleDelete(todo.id!)
-													}
-												}}
-											/>
-										) : (
-											<div
-												style={{
-													flex: 1,
-													minWidth: 0,
-													marginRight: 6,
-												}}>
-												<span
-													style={{
-														display: "block",
-														fontWeight: 500,
-														color:
-															todo.status === "completed"
-																? "var(--vscode-charts-green)"
-																: todo.status === "in_progress"
-																	? "var(--vscode-charts-yellow)"
-																	: "var(--vscode-foreground)",
-														fontSize: 13,
-														padding: "1px 3px",
-														lineHeight: "1.4",
-													}}>
-													{todo.content}
-												</span>
-												{todoPlan && todoPlan.plans.length > 0 && (
-													<TodoPlanTree plan={todoPlan} />
-												)}
-											</div>
-										)}
+										{!isRefineMode && !hasInlineRefinedCard && icon}
 										{isEditing && (
 											<select
 												value={todo.status || ""}
@@ -581,6 +609,119 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 													</option>
 												))}
 											</select>
+										)}
+										{isEditing ? (
+											<input
+												type="text"
+												value={todo.content}
+												onChange={(e) => handleContentChange(todo.id!, e.target.value)}
+												style={{
+													flex: 1,
+													minWidth: 0,
+													fontWeight: 500,
+													color:
+														todo.status === "completed"
+															? "var(--vscode-charts-green)"
+															: todo.status === "in_progress"
+																? "var(--vscode-charts-yellow)"
+																: "var(--vscode-foreground)",
+													background: "transparent",
+													border: "none",
+													outline: "none",
+													fontSize: 13,
+													padding: "1px 3px",
+													lineHeight: "1.4",
+												}}
+												onBlur={(e) => {
+													if (!e.target.value.trim()) {
+														handleDelete(todo.id!)
+													}
+												}}
+											/>
+										) : hasInlineRefinedCard ? (
+											<div
+												style={{
+													flex: 1,
+													minWidth: 0,
+													marginRight: 6,
+												}}>
+												<RefinedTodoCard todo={todo} plan={todoPlan} />
+											</div>
+										) : (
+											<div
+												style={{
+													flex: 1,
+													minWidth: 0,
+												}}>
+												<span
+													style={{
+														display: "block",
+														fontWeight: 500,
+														color:
+															todo.status === "completed"
+																? "var(--vscode-charts-green)"
+																: todo.status === "in_progress"
+																	? "var(--vscode-charts-yellow)"
+																	: "var(--vscode-foreground)",
+														fontSize: 13,
+														padding: "1px 3px",
+														lineHeight: "1.4",
+													}}>
+													{todo.content}
+												</span>
+												{shouldShowInlineRefining &&
+													(shouldShowInlineThinking && todo.id ? (
+														<button
+															type="button"
+															onClick={() => toggleInlineThinking(todo.id!)}
+															style={{
+																marginTop: 4,
+																marginLeft: 3,
+																padding: 0,
+																border: "none",
+																background: "transparent",
+																color: "var(--vscode-descriptionForeground)",
+																fontSize: 11,
+																lineHeight: "1.35",
+																cursor: "pointer",
+																display: "flex",
+																alignItems: "center",
+																gap: 4,
+															}}>
+															<span
+																className={`codicon codicon-chevron-${isInlineThinkingExpanded ? "down" : "right"}`}
+																style={{ fontSize: 11 }}
+															/>
+															<span>{refineStatusLabel}</span>
+														</button>
+													) : (
+														<div
+															style={{
+																marginTop: 4,
+																marginLeft: 3,
+																fontSize: 11,
+																lineHeight: "1.35",
+																color: "var(--vscode-descriptionForeground)",
+															}}>
+															{refineStatusLabel}
+														</div>
+													))}
+												{shouldShowInlineThinking && isInlineThinkingExpanded && (
+													<div
+														style={{
+															marginTop: 4,
+															marginLeft: 3,
+															padding: "6px 10px",
+															borderLeft: "2px solid var(--vscode-widget-border)",
+															background: "var(--vscode-editor-background)",
+															borderRadius: 4,
+															maxHeight: "24vh",
+															overflowY: "auto",
+														}}>
+														<MarkdownBlock markdown={refineReasoningContent} />
+													</div>
+												)}
+											</div>
 										)}
 										{isEditing && (
 											<button

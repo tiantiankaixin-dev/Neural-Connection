@@ -48,7 +48,6 @@ import { CommandExecutionError } from "./CommandExecutionError"
 import { AutoApprovedRequestLimitWarning } from "./AutoApprovedRequestLimitWarning"
 import { InProgressRow, CondensationErrorRow, TruncationResultRow } from "./context-management"
 import CodebaseSearchResultsDisplay from "./CodebaseSearchResultsDisplay"
-import RefineResultBlock from "./RefineResultBlock"
 import { appendImages } from "@src/utils/imageUtils"
 import { McpExecution } from "./McpExecution"
 import { ChatTextArea } from "./ChatTextArea"
@@ -85,6 +84,7 @@ interface TodoPlanEntry {
 
 interface TodoPlanData {
 	savedPath?: string
+	savedPaths?: string[]
 	planType?: "file" | "general"
 	todoContent?: string
 	plans: TodoPlanEntry[]
@@ -121,6 +121,30 @@ function parseDividerText(text?: string): {
 		// not JSON, plain string
 	}
 	return { content: text }
+}
+
+function isLeakedWriteTodoPlanPayload(text?: string) {
+	if (!text) {
+		return false
+	}
+
+	try {
+		const parsed = JSON.parse(text)
+		if (!parsed || typeof parsed !== "object") {
+			return false
+		}
+
+		const parsedRecord = parsed as Record<string, unknown>
+		return (
+			parsedRecord.tool === "writeTodoPlan" ||
+			parsedRecord.tool === "write_todo_plan" ||
+			(typeof parsedRecord.todo_item_id === "string" &&
+				(parsedRecord.plan_type === "file" || parsedRecord.plan_type === "general") &&
+				Array.isArray(parsedRecord.plans))
+		)
+	} catch {
+		return false
+	}
 }
 
 function ExpandableTurnItem({ turn }: { turn: DividerTurn }) {
@@ -198,6 +222,7 @@ function TodoItemDividerRow({
 		? []
 		: Object.values(todoPlansById ?? {}).filter((plan) => plan.todoContent === content)
 	const todoPlan = todoPlanById ?? (todoPlanMatchesByContent.length === 1 ? todoPlanMatchesByContent[0] : undefined)
+	const primarySavedPath = todoPlan?.savedPath ?? todoPlan?.savedPaths?.[0]
 	const hasTurns = turns && turns.length > 0
 	const hasSummary = !!contextSummaryText?.trim()
 
@@ -224,7 +249,7 @@ function TodoItemDividerRow({
 				)}
 				{content}
 			</div>
-			{todoPlan && todoPlan.savedPath && (
+			{todoPlan && primarySavedPath && (
 				<div style={{ marginLeft: 14, marginTop: 2 }}>
 					<div
 						style={{
@@ -245,7 +270,7 @@ function TodoItemDividerRow({
 							style={{ fontSize: 9 }}
 						/>
 						<span className="codicon codicon-file-text" style={{ fontSize: 10 }} />
-						{todoPlan.savedPath.replace(/\\/g, "/").split("/").slice(-2).join("/")}
+						{primarySavedPath.replace(/\\/g, "/").split("/").slice(-2).join("/")}
 					</div>
 					{planExpanded && todoPlan.plans.length > 0 && (
 						<div
@@ -266,7 +291,10 @@ function TodoItemDividerRow({
 									marginBottom: 6,
 									wordBreak: "break-all",
 								}}>
-								{todoPlan.savedPath}
+								{(todoPlan.savedPaths && todoPlan.savedPaths.length > 0
+									? todoPlan.savedPaths
+									: [primarySavedPath]
+								).join("\n")}
 							</div>
 							{todoPlan.plans.map((plan, i) => (
 								<div key={i} style={{ marginTop: i === 0 ? 0 : 8 }}>
@@ -381,6 +409,11 @@ interface ChatRowProps {
 	message: ClineMessage
 	lastModifiedMessage?: ClineMessage
 	todoPlansById?: Record<string, TodoPlanData>
+	refiningTodoItemIds?: string[]
+	activeRefiningTodoItemId?: string
+	refineStatusLabel?: string
+	refineReasoningContent?: string
+	hiddenRefineApiRequestMessageTs?: number[]
 	isExpanded: boolean
 	isLast: boolean
 	isStreaming: boolean
@@ -463,6 +496,11 @@ export const ChatRowContent = ({
 	message,
 	lastModifiedMessage,
 	todoPlansById,
+	refiningTodoItemIds,
+	activeRefiningTodoItemId,
+	refineStatusLabel,
+	refineReasoningContent,
+	hiddenRefineApiRequestMessageTs,
 	isExpanded,
 	isLast,
 	isStreaming,
@@ -481,6 +519,9 @@ export const ChatRowContent = ({
 	const { mcpServers, alwaysAllowMcp, currentCheckpoint, mode, apiConfiguration, clineMessages, currentTaskItem } =
 		useExtensionState()
 	const { info: model } = useSelectedModel(apiConfiguration)
+	const shouldShowGlobalRefiningIndicator = showRefiningIndicator && (refiningTodoItemIds?.length ?? 0) === 0
+	const shouldInlineRefineStatus = showRefiningIndicator && (refiningTodoItemIds?.length ?? 0) > 0
+	const todoGroupTodoItemId = (message as any)._todoGroupTodoItemId as string | undefined
 	const [isEditing, setIsEditing] = useState(false)
 	const [editedContent, setEditedContent] = useState("")
 	const [editMode, setEditMode] = useState<Mode>(mode || "code")
@@ -551,8 +592,11 @@ export const ChatRowContent = ({
 	// When resuming task, last wont be api_req_failed but a resume_task
 	// message, so api_req_started will show loading spinner. That's why we just
 	// remove the last api_req_started that failed without streaming anything.
+	const shouldHideRefineApiFailure =
+		lastModifiedMessage?.ask === "api_req_failed" &&
+		(shouldInlineRefineStatus || hiddenRefineApiRequestMessageTs?.includes(lastModifiedMessage.ts))
 	const apiRequestFailedMessage =
-		isLast && lastModifiedMessage?.ask === "api_req_failed" // if request is retried then the latest message is a api_req_retried
+		isLast && lastModifiedMessage?.ask === "api_req_failed" && !shouldHideRefineApiFailure // if request is retried then the latest message is a api_req_retried
 			? lastModifiedMessage?.text
 			: undefined
 
@@ -862,20 +906,27 @@ export const ChatRowContent = ({
 			}
 			case "updateTodoList" as any: {
 				const todos = (tool as any).todos || []
+				const groupedTodos = todoGroupTodoItemId
+					? todos.filter((todo: any) => todo?.id === todoGroupTodoItemId)
+					: []
+				const displayedTodos = groupedTodos.length > 0 ? groupedTodos : todos
+				const shouldUseSingleTodoExecutionView = groupedTodos.length > 0
 				return (
 					<>
 						<UpdateTodoListToolBlock
-							todos={todos}
+							todos={displayedTodos}
 							todoPlansById={todoPlansById}
-							editable={true}
+							refiningTodoItemIds={refiningTodoItemIds}
+							activeRefiningTodoItemId={activeRefiningTodoItemId}
+							refineStatusLabel={refineStatusLabel}
+							refineReasoningContent={refineReasoningContent}
+							showRefiningIndicator={showRefiningIndicator}
+							editable={!shouldUseSingleTodoExecutionView}
 							onChange={(newTodos) =>
 								vscode.postMessage({ type: "editTodoList", payload: { todos: newTodos } })
 							}
-							onRefine={onRefineTodoItems}
+							onRefine={shouldUseSingleTodoExecutionView ? undefined : onRefineTodoItems}
 						/>
-						{showRefiningIndicator && isLast && (
-							<div className="mt-1 ml-1 text-xs text-vscode-descriptionForeground">refining...</div>
-						)}
 					</>
 				)
 			}
@@ -1377,6 +1428,10 @@ export const ChatRowContent = ({
 						</div>
 					)
 				case "reasoning":
+					if (shouldInlineRefineStatus && !(message.text || "").trim()) {
+						return null
+					}
+
 					return (
 						<>
 							<ReasoningBlock
@@ -1385,7 +1440,7 @@ export const ChatRowContent = ({
 								isStreaming={isStreaming}
 								isLast={isLast}
 							/>
-							{showRefiningIndicator && isLast && isStreaming && (
+							{shouldShowGlobalRefiningIndicator && isLast && isStreaming && (
 								<div className="mt-1 ml-1 text-xs text-vscode-descriptionForeground">refining...</div>
 							)}
 						</>
@@ -1394,6 +1449,14 @@ export const ChatRowContent = ({
 					// Determine if the API request is in progress
 					const isApiRequestInProgress =
 						apiReqCancelReason === undefined && apiRequestFailedMessage === undefined && cost === undefined
+					const shouldHideStandaloneRefineApiRequest =
+						(shouldInlineRefineStatus || hiddenRefineApiRequestMessageTs?.includes(message.ts)) &&
+						!apiRequestFailedMessage &&
+						!apiReqStreamingFailedMessage
+
+					if (shouldHideStandaloneRefineApiRequest) {
+						return null
+					}
 
 					return (
 						<>
@@ -1420,7 +1483,7 @@ export const ChatRowContent = ({
 									${Number(cost || 0)?.toFixed(4)}
 								</div>
 							</div>
-							{showRefiningIndicator && isLast && isApiRequestInProgress && (
+							{shouldShowGlobalRefiningIndicator && isLast && isApiRequestInProgress && (
 								<div className="mt-1 ml-7 text-xs text-vscode-descriptionForeground">refining...</div>
 							)}
 							{(((cost === null || cost === undefined) && apiRequestFailedMessage) ||
@@ -1523,6 +1586,10 @@ export const ChatRowContent = ({
 				case "api_req_finished":
 					return null // we should never see this message type
 				case "text":
+					if (isLeakedWriteTodoPlanPayload(message.text)) {
+						return null
+					}
+
 					return (
 						<div className="group">
 							<div style={headerStyle}>
@@ -1770,27 +1837,43 @@ export const ChatRowContent = ({
 					}
 					return (
 						<UpdateTodoListToolBlock
-							todos={editedTodos}
-							previousTodos={prevTodos}
+							todos={
+								todoGroupTodoItemId
+									? (() => {
+											const groupedTodos = editedTodos.filter(
+												(todo) => todo?.id === todoGroupTodoItemId,
+											)
+											return groupedTodos.length > 0 ? groupedTodos : editedTodos
+										})()
+									: editedTodos
+							}
+							previousTodos={
+								todoGroupTodoItemId
+									? (() => {
+											const groupedPrevTodos = (prevTodos || []).filter(
+												(todo) => todo?.id === todoGroupTodoItemId,
+											)
+											return groupedPrevTodos.length > 0 ? groupedPrevTodos : prevTodos
+										})()
+									: prevTodos
+							}
 							todoPlansById={todoPlansById}
+							refiningTodoItemIds={refiningTodoItemIds}
+							activeRefiningTodoItemId={activeRefiningTodoItemId}
+							refineStatusLabel={refineStatusLabel}
+							refineReasoningContent={refineReasoningContent}
+							showRefiningIndicator={showRefiningIndicator}
 							userEdited
-							editable={true}
+							editable={false}
 							onChange={(newTodos) =>
 								vscode.postMessage({ type: "editTodoList", payload: { todos: newTodos } })
 							}
-							onRefine={onRefineTodoItems}
+							onRefine={undefined}
 						/>
 					)
 				}
 				case "refine_result": {
-					let refineData: any = null
-					try {
-						refineData = JSON.parse(message.text || "{}")
-					} catch {
-						// ignore parse errors
-					}
-					if (!refineData || !Array.isArray(refineData.plans)) return null
-					return <RefineResultBlock data={refineData} />
+					return null
 				}
 				case "tool" as any:
 					// Handle say tool messages

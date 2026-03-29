@@ -81,9 +81,8 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 			//   1. First item gets a border immediately when todo list is created
 			//   2. Each item gets its own separate bordered box
 			//   3. Works regardless of whether AI uses [-] or skips to [x]
-			const getActiveContent = (todos: { content: string; status: string }[]): string | undefined => {
-				const item = todos.find((t) => t.status === "in_progress") || todos.find((t) => t.status === "pending")
-				return item?.content
+			const getActiveItem = (todos: TodoItem[]): TodoItem | undefined => {
+				return todos.find((t) => t.status === "in_progress") || todos.find((t) => t.status === "pending")
 			}
 
 			// Context selection: if this is the first todo list creation and no context selection
@@ -136,12 +135,15 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				}
 			}
 
-			const previousActiveContent = task.todoList ? getActiveContent(task.todoList) : undefined
-			const currentActiveContent = getActiveContent(normalizedTodos)
-			const currentActiveItem = normalizedTodos.find((t) => t.content === currentActiveContent)
+			const previousActiveItem = task.todoList ? getActiveItem(task.todoList) : undefined
+			const currentActiveItem = getActiveItem(normalizedTodos)
+			const shouldEmitDivider =
+				!!currentActiveItem &&
+				(task.postRefineDividerPending || currentActiveItem.id !== previousActiveItem?.id)
 
-			if (currentActiveItem && currentActiveContent !== previousActiveContent) {
+			if (currentActiveItem && shouldEmitDivider) {
 				task.todoItemBoundaries.set(currentActiveItem.id, task.apiConversationHistory.length)
+				task.postRefineDividerPending = false
 
 				const dividerText = contextSelectionResult
 					? JSON.stringify({

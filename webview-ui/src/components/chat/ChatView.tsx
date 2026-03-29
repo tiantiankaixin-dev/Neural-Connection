@@ -65,9 +65,58 @@ interface TodoPlanEntry {
 
 interface TodoPlanData {
 	savedPath?: string
+	savedPaths?: string[]
 	planType?: "file" | "general"
 	todoContent?: string
 	plans: TodoPlanEntry[]
+}
+
+function parseTodoGroupDividerText(text?: string): { todoItemId?: string } {
+	if (!text) {
+		return {}
+	}
+
+	try {
+		const parsed = JSON.parse(text)
+		if (parsed && typeof parsed === "object" && typeof parsed.todoItemId === "string") {
+			return { todoItemId: parsed.todoItemId }
+		}
+	} catch {
+		// ignore non-JSON divider payloads
+	}
+
+	return {}
+}
+
+function isLeakedWriteTodoPlanMessage(message: ClineMessage) {
+	if (!message.text) {
+		return false
+	}
+
+	if (message.type === "say" && message.say === "refine_result") {
+		return true
+	}
+
+	try {
+		const parsed = JSON.parse(message.text)
+		if (!parsed || typeof parsed !== "object") {
+			return false
+		}
+
+		const parsedRecord = parsed as Record<string, unknown>
+		const toolName = parsedRecord.tool
+		if (toolName === "writeTodoPlan" || toolName === "write_todo_plan") {
+			return true
+		}
+
+		return (
+			typeof parsedRecord.todo_item_id === "string" &&
+			(parsedRecord.plan_type === "file" || parsedRecord.plan_type === "general") &&
+			Array.isArray(parsedRecord.plans)
+		)
+	} catch {
+		return false
+	}
 }
 
 export interface ChatViewRef {
@@ -135,7 +184,9 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		// First check if we have initial todos from the state (for new subtasks)
 		if (currentTaskTodos && currentTaskTodos.length > 0) {
 			// Check if there are any todo updates in messages
-			const messageBasedTodos = getLatestTodo(messages)
+			const messageBasedTodos = getLatestTodo(
+				messages.filter((message) => !isLeakedWriteTodoPlanMessage(message)),
+			)
 			// If there are message-based todos, they take precedence (user has updated them)
 			if (messageBasedTodos && messageBasedTodos.length > 0) {
 				return messageBasedTodos
@@ -144,7 +195,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			return currentTaskTodos
 		}
 		// Fall back to extracting from messages
-		return getLatestTodo(messages)
+		return getLatestTodo(messages.filter((message) => !isLeakedWriteTodoPlanMessage(message)))
 	}, [messages, currentTaskTodos])
 
 	const todoPlansById = useMemo<Record<string, TodoPlanData>>(() => {
@@ -163,6 +214,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 				result[parsed.todoItemId] = {
 					savedPath: parsed.savedPath,
+					savedPaths: Array.isArray(parsed.savedPaths)
+						? parsed.savedPaths
+						: parsed.savedPath
+							? [parsed.savedPath]
+							: [],
 					planType: parsed.planType,
 					todoContent: parsed.todoContent,
 					plans: parsed.plans,
@@ -209,9 +265,13 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	>(undefined)
 	const [isCondensing, setIsCondensing] = useState<boolean>(false)
 	const [isRefining, setIsRefining] = useState<boolean>(false)
+	const [refiningTodoItemIds, setRefiningTodoItemIds] = useState<string[]>([])
+	const [refineStatusLabel, setRefineStatusLabel] = useState<string>("refining...")
+	const [refineReasoningContent, setRefineReasoningContent] = useState<string>("")
 	const hasSeenStreamingSinceRefine = useRef(false)
-	const [collapsedTodoGroups, setCollapsedTodoGroups] = useState<Set<number>>(new Set())
 	const autoCollapsedRef = useRef(false)
+	const [collapsedTodoGroups, setCollapsedTodoGroups] = useState<Set<number>>(new Set())
+	const [hiddenRefineApiRequestMessageTs, setHiddenRefineApiRequestMessageTs] = useState<number[]>([])
 	const [showAnnouncementModal, setShowAnnouncementModal] = useState(false)
 	const everVisibleMessagesTsRef = useRef<LRUCache<number, boolean>>(
 		new LRUCache({
@@ -294,8 +354,49 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	const handleRefineTodoItems = useCallback((todoItemIds: string[]) => {
 		setIsRefining(true)
+		setRefiningTodoItemIds(todoItemIds)
+		setRefineStatusLabel("thinking...")
+		setRefineReasoningContent("")
 		vscode.postMessage({ type: "refineTodoItems", payload: { todoItemIds } })
 	}, [])
+	const activeRefiningTodoItemId = refiningTodoItemIds[0]
+
+	useEffect(() => {
+		if (
+			isRefining &&
+			((lastMessage?.type === "say" &&
+				(lastMessage.say === "api_req_started" || lastMessage.say === "reasoning")) ||
+				(lastMessage?.type === "ask" && lastMessage.ask === "api_req_failed"))
+		) {
+			setRefineStatusLabel(
+				lastMessage.type === "say" && lastMessage.say === "reasoning" ? "thinking..." : "api request...",
+			)
+			if (lastMessage.type === "say" && lastMessage.say === "reasoning") {
+				setRefineReasoningContent(lastMessage.text || "")
+			}
+			setHiddenRefineApiRequestMessageTs((prev) =>
+				prev.includes(lastMessage.ts) ? prev : [...prev, lastMessage.ts],
+			)
+		}
+	}, [isRefining, lastMessage])
+
+	useEffect(() => {
+		setRefineReasoningContent("")
+	}, [activeRefiningTodoItemId])
+
+	useEffect(() => {
+		if (!isRefining || refiningTodoItemIds.length === 0) {
+			return
+		}
+
+		const remainingTodoItemIds = refiningTodoItemIds.filter(
+			(todoItemId) => !todoPlansById[todoItemId]?.plans?.length,
+		)
+
+		if (remainingTodoItemIds.length !== refiningTodoItemIds.length) {
+			setRefiningTodoItemIds(remainingTodoItemIds)
+		}
+	}, [isRefining, refiningTodoItemIds, todoPlansById])
 
 	const playSound = useCallback(
 		(audioType: AudioType) => {
@@ -560,6 +661,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		setIsCondensing(false) // Reset condensing state when switching tasks
 		setCollapsedTodoGroups(new Set()) // Reset todo group collapse state
 		autoCollapsedRef.current = false
+		setIsRefining(false)
+		setRefiningTodoItemIds([])
+		setRefineStatusLabel("refining...")
+		setRefineReasoningContent("")
+		setHiddenRefineApiRequestMessageTs([])
 		// Note: sendingDisabled is not reset here as it's managed by message effects
 
 		// Clear any pending auto-approval timeout from previous task
@@ -696,6 +802,9 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	useEffect(() => {
 		if (!isRefining) {
+			setRefiningTodoItemIds([])
+			setRefineStatusLabel("refining...")
+			setRefineReasoningContent("")
 			hasSeenStreamingSinceRefine.current = false
 			return
 		}
@@ -712,20 +821,10 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			return
 		}
 
-		if (!isStreaming) {
-			setIsRefining(false)
-			return
-		}
-
-		if (lastMessage?.type === "ask") {
-			setIsRefining(false)
-			return
-		}
-
-		if (lastMessage?.type === "say" && lastMessage.say !== "api_req_started" && lastMessage.say !== "reasoning") {
+		if (!isStreaming && refiningTodoItemIds.length === 0) {
 			setIsRefining(false)
 		}
-	}, [isRefining, isStreaming, lastMessage])
+	}, [isRefining, isStreaming, refiningTodoItemIds.length])
 
 	const markFollowUpAsAnswered = useCallback(() => {
 		const lastFollowUpMessage = messagesRef.current.findLast((msg: ClineMessage) => msg.ask === "followup")
@@ -1140,6 +1239,20 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		// Remove the 500-message limit to prevent array index shifting
 		// Virtuoso is designed to efficiently handle large lists through virtualization
 		const newVisibleMessages = modifiedMessages.filter((message) => {
+			if (isLeakedWriteTodoPlanMessage(message)) {
+				return false
+			}
+
+			if (
+				hiddenRefineApiRequestMessageTs.includes(message.ts) ||
+				(isRefining &&
+					(message.ask === "api_req_failed" ||
+						message.say === "api_req_retry_delayed" ||
+						message.say === "api_req_rate_limit_wait"))
+			) {
+				return false
+			}
+
 			// Filter out checkpoint_saved messages that should be suppressed
 			if (message.say === "checkpoint_saved") {
 				// Check if this checkpoint has the suppressMessage flag set
@@ -1216,7 +1329,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			.forEach((msg: ClineMessage) => everVisibleMessagesTsRef.current.set(msg.ts, true))
 
 		return newVisibleMessages
-	}, [modifiedMessages])
+	}, [modifiedMessages, hiddenRefineApiRequestMessageTs, isRefining])
 
 	useEffect(() => {
 		const cleanupInterval = setInterval(() => {
@@ -1481,26 +1594,27 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			}
 			const dividerTs = result[startIdx].ts
 			const isCollapsed = collapsedTodoGroups.has(dividerTs)
+			const { todoItemId } = parseTodoGroupDividerText(result[startIdx].text)
 
 			if (isCollapsed) {
-				// Collapsed: header becomes "only", body/last are hidden
 				result[startIdx] = {
 					...result[startIdx],
 					_todoGroupPos: "only",
 					_todoGroupCollapsed: true,
 					_todoGroupDividerTs: dividerTs,
+					_todoGroupTodoItemId: todoItemId,
 				} as any
 				for (let i = startIdx + 1; i < endIdx; i++) {
 					hiddenIndices.add(i)
 				}
 			} else {
-				// Expanded: normal annotation
 				if (endIdx <= startIdx + 1) {
 					result[startIdx] = {
 						...result[startIdx],
 						_todoGroupPos: "only",
 						_todoGroupCollapsed: false,
 						_todoGroupDividerTs: dividerTs,
+						_todoGroupTodoItemId: todoItemId,
 					} as any
 				} else {
 					result[startIdx] = {
@@ -1508,11 +1622,13 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						_todoGroupPos: "header",
 						_todoGroupCollapsed: false,
 						_todoGroupDividerTs: dividerTs,
+						_todoGroupTodoItemId: todoItemId,
 					} as any
 					for (let i = startIdx + 1; i < endIdx; i++) {
 						result[i] = {
 							...result[i],
 							_todoGroupPos: i === endIdx - 1 ? "last" : "body",
+							_todoGroupTodoItemId: todoItemId,
 						} as any
 					}
 				}
@@ -1716,6 +1832,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 					message={messageOrGroup}
 					todoPlansById={todoPlansById}
 					showRefiningIndicator={isRefining}
+					refiningTodoItemIds={refiningTodoItemIds}
+					activeRefiningTodoItemId={activeRefiningTodoItemId}
+					refineStatusLabel={refineStatusLabel}
+					refineReasoningContent={refineReasoningContent}
+					hiddenRefineApiRequestMessageTs={hiddenRefineApiRequestMessageTs}
 					onRefineTodoItems={handleRefineTodoItems}
 					isExpanded={expandedRows[messageOrGroup.ts] || false}
 					onToggleExpand={toggleRowExpansion} // This was already stabilized
@@ -1754,6 +1875,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			todoPlansById,
 			groupedMessages.length,
 			isRefining,
+			refiningTodoItemIds,
+			activeRefiningTodoItemId,
+			refineStatusLabel,
+			refineReasoningContent,
+			hiddenRefineApiRequestMessageTs,
 			handleRowHeightChange,
 			handleRefineTodoItems,
 			isStreaming,

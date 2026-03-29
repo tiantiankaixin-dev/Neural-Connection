@@ -916,12 +916,25 @@ export class NativeToolCallParser {
 					break
 
 				case "write_todo_plan":
-					if (args.todo_item_id !== undefined && args.plans !== undefined) {
-						nativeArgs = {
-							todo_item_id: args.todo_item_id,
-							plan_type: args.plan_type,
-							plans: typeof args.plans === "string" ? args.plans : JSON.stringify(args.plans),
-						} as NativeArgsFor<TName>
+					if (args.todo_item_id !== undefined && args.plan_type !== undefined && args.plans !== undefined) {
+						const parsedPlans =
+							typeof args.plans === "string"
+								? (() => {
+										try {
+											return parseJSON(args.plans)
+										} catch {
+											return undefined
+										}
+									})()
+								: args.plans
+
+						if (Array.isArray(parsedPlans)) {
+							nativeArgs = {
+								todo_item_id: args.todo_item_id,
+								plan_type: args.plan_type,
+								plans: parsedPlans,
+							} as NativeArgsFor<TName>
+						}
 					}
 					break
 

@@ -91,7 +91,6 @@ export function getNativeTools(options: NativeToolsOptions = {}): OpenAI.Chat.Ch
 		searchFiles,
 		switchMode,
 		updateTodoList,
-		writeTodoPlan,
 		writeToFile,
 	] satisfies OpenAI.Chat.ChatCompletionTool[]
 }

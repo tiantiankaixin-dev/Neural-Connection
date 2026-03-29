@@ -1,11 +1,33 @@
 import * as path from "path"
 import * as fs from "fs/promises"
 
-import { getTaskOptimizePath, getTaskOptimizeTimestampPath, getTaskOptimizePlanPath } from "../../utils/storage"
+import {
+	getTaskDirectoryPath,
+	getTaskOptimizePath,
+	getTaskOptimizeTimestampPath,
+	getTaskOptimizePlanPath,
+} from "../../utils/storage"
 
 export interface PlanFile {
 	filePath: string
 	content: string
+}
+
+export type PlanTargetAction = "CREATE" | "MODIFY" | "DELETE" | "GENERAL"
+
+export interface StructuredPlanEntry {
+	target: string
+	action: PlanTargetAction
+	body: string
+}
+
+export interface PlanSaveResult {
+	savedPaths: string[]
+}
+
+interface ParsedPlanTargetHeader {
+	action: PlanTargetAction
+	path: string
 }
 
 /**
@@ -22,38 +44,197 @@ function sanitizeFileName(name: string): string {
 	)
 }
 
-/**
- * Save all plan entries for a todo item into a single .md file.
- * Stored at: task_optimize/{sanitized_todo_content}.md
- *
- * All plan files live directly inside task_optimize/ (no subfolders).
- * The todoItemId is embedded in the file header so it can be recovered
- * during reading without relying on folder names or file paths.
- * If the same todo item is refined again the file is overwritten.
- */
-export type PlanType = "file" | "general"
+function sanitizeConversationFolderName(name: string): string {
+	return (
+		name
+			// eslint-disable-next-line no-control-regex
+			.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+			.replace(/\s+/g, "_")
+			.substring(0, 80)
+			.replace(/_+$/, "") || "unnamed"
+	)
+}
 
-export async function savePlanFiles(
+function sanitizeConversationPathSegment(segment: string): string {
+	const trimmed = segment.trim()
+	if (!trimmed || trimmed === "." || trimmed === "..") {
+		return ""
+	}
+
+	return (
+		trimmed
+			// eslint-disable-next-line no-control-regex
+			.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+			.replace(/\s+/g, "_")
+			.substring(0, 120)
+			.replace(/_+$/, "") || "unnamed"
+	)
+}
+
+function looksLikeProjectFilePath(value: string): boolean {
+	const trimmed = value.trim()
+	if (!trimmed) {
+		return false
+	}
+
+	if (/^[A-Za-z]:[\\/]/.test(trimmed)) {
+		return true
+	}
+
+	if (/^\.{1,2}[\\/]/.test(trimmed)) {
+		return true
+	}
+
+	if (trimmed.includes("/") || trimmed.includes("\\")) {
+		return true
+	}
+
+	return /^[^\s]+\.[A-Za-z0-9_-]{1,12}$/.test(trimmed)
+}
+
+export function normalizeStructuredPlanEntry(planType: PlanType, entry: StructuredPlanEntry): StructuredPlanEntry {
+	const normalizedTarget =
+		planType === "file" ? entry.target.trim().replace(/\\/g, "/").replace(/\/+/g, "/") : entry.target.trim()
+
+	return {
+		target: normalizedTarget,
+		action: entry.action,
+		body: entry.body.trim(),
+	}
+}
+
+export function validateStructuredPlanEntry(entry: StructuredPlanEntry, planType: PlanType): string | null {
+	if (!entry.target) {
+		return "Each plan entry must include a non-empty target"
+	}
+
+	if (!entry.body) {
+		return `Plan entry for \"${entry.target}\" must include a non-empty body`
+	}
+
+	if (planType === "general") {
+		if (entry.action !== "GENERAL") {
+			return `General plan entry for \"${entry.target}\" must use ACTION: GENERAL`
+		}
+
+		if (looksLikeProjectFilePath(entry.target)) {
+			return `General plan entry for \"${entry.target}\" must use a descriptive section title, not a file path`
+		}
+
+		return null
+	}
+
+	if (!["CREATE", "MODIFY", "DELETE"].includes(entry.action)) {
+		return `File plan entry for \"${entry.target}\" must use ACTION: CREATE, MODIFY, or DELETE`
+	}
+
+	if (/^[A-Za-z]:\//.test(entry.target) || entry.target.startsWith("/") || entry.target.startsWith("../")) {
+		return `File plan entry for \"${entry.target}\" must use a relative project file path`
+	}
+
+	if (!looksLikeProjectFilePath(entry.target)) {
+		return `File plan entry for \"${entry.target}\" must use a real relative project file path`
+	}
+
+	return null
+}
+
+export function buildPlanEntryContent(entry: StructuredPlanEntry): string {
+	return [
+		"<<<PLAN_TARGET>>>",
+		`ACTION: ${entry.action}`,
+		`PATH: ${entry.target}`,
+		"<<<END_PLAN_TARGET>>>",
+		entry.body,
+	]
+		.join("\n")
+		.trim()
+}
+
+export function parsePlanTargetHeader(content: string): ParsedPlanTargetHeader | null {
+	const match = content.match(
+		/^<<<PLAN_TARGET>>>\r?\nACTION: (CREATE|MODIFY|DELETE|GENERAL)\r?\nPATH: ([^\r\n]+)\r?\n<<<END_PLAN_TARGET>>>(?:\r?\n|$)/,
+	)
+
+	if (!match) {
+		return null
+	}
+
+	return {
+		action: match[1] as PlanTargetAction,
+		path: match[2].trim(),
+	}
+}
+
+function isLikelyFileLeafSegment(segment: string): boolean {
+	return /\.[A-Za-z0-9_-]{1,12}$/.test(segment)
+}
+
+export function getConversationDirectorySegmentsForPlan(plan: PlanFile): string[] {
+	const parsedHeader = parsePlanTargetHeader(plan.content)
+	const rawTargetPath = parsedHeader?.path ?? plan.filePath
+	const rawSegments = rawTargetPath
+		.split(/[\\/]+/)
+		.map((segment) => segment.trim())
+		.filter(Boolean)
+
+	if (rawSegments.length === 0) {
+		return []
+	}
+
+	const treatLastSegmentAsFile = parsedHeader
+		? parsedHeader.action !== "GENERAL"
+		: rawSegments.length > 1 && isLikelyFileLeafSegment(rawSegments[rawSegments.length - 1])
+
+	const directorySegments = treatLastSegmentAsFile ? rawSegments.slice(0, -1) : rawSegments
+	return directorySegments.map(sanitizeConversationPathSegment).filter(Boolean)
+}
+
+async function ensureConversationPlanDirectories(
 	globalStoragePath: string,
 	taskId: string,
 	taskTimestamp: string | undefined,
-	todoItemId: string,
 	todoContent: string,
 	plans: PlanFile[],
-	planType: PlanType = "file",
-): Promise<string> {
-	let optimizeDir: string
-	if (planType === "general" && taskTimestamp) {
-		optimizeDir = await getTaskOptimizePlanPath(globalStoragePath, taskId, taskTimestamp)
-	} else if (taskTimestamp) {
-		optimizeDir = await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp)
-	} else {
-		optimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
+): Promise<void> {
+	if (!taskTimestamp || plans.length === 0) {
+		return
 	}
 
-	const safeName = sanitizeFileName(todoContent)
-	const planFilePath = path.join(optimizeDir, `${safeName}.md`)
+	const taskDir = await getTaskDirectoryPath(globalStoragePath, taskId)
+	const itemDir = path.join(taskDir, "task", taskTimestamp, sanitizeConversationFolderName(todoContent))
+	await fs.mkdir(itemDir, { recursive: true })
 
+	for (const plan of plans) {
+		const segments = getConversationDirectorySegmentsForPlan(plan)
+		if (segments.length === 0) {
+			continue
+		}
+
+		await fs.mkdir(path.join(itemDir, ...segments), { recursive: true })
+	}
+}
+
+function getPlanStorageDirectorySegmentsForPlan(plan: PlanFile): string[] {
+	const parsedHeader = parsePlanTargetHeader(plan.content)
+	const rawTargetPath = parsedHeader?.path ?? plan.filePath
+	const rawSegments = rawTargetPath
+		.split(/[\\/]+/)
+		.map(sanitizeConversationPathSegment)
+		.filter(Boolean)
+
+	if (rawSegments.length === 0) {
+		return []
+	}
+
+	if (parsedHeader?.action === "GENERAL") {
+		return rawSegments
+	}
+
+	return rawSegments.slice(0, -1)
+}
+
+function buildPlanMarkdown(todoItemId: string, todoContent: string, planType: PlanType, plans: PlanFile[]): string {
 	const lines: string[] = [
 		`<!-- todoItemId: ${todoItemId} -->`,
 		`<!-- planType: ${planType} -->`,
@@ -65,8 +246,123 @@ export async function savePlanFiles(
 		lines.push(`## ${plan.filePath}`, "", plan.content, "", "---", "")
 	}
 
-	await fs.writeFile(planFilePath, lines.join("\n"), "utf8")
-	return planFilePath
+	return lines.join("\n")
+}
+
+async function deleteExistingPlanFilesForTodo(
+	globalStoragePath: string,
+	taskId: string,
+	taskTimestamp: string | undefined,
+	todoItemId: string,
+): Promise<void> {
+	const directoriesToScan = new Set<string>()
+
+	if (taskTimestamp) {
+		directoriesToScan.add(await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp))
+	}
+
+	directoriesToScan.add(await getTaskOptimizePath(globalStoragePath, taskId))
+
+	const visitedFiles = new Set<string>()
+	for (const optimizeDir of directoriesToScan) {
+		for (const filePath of await collectMarkdownPlanFiles(optimizeDir)) {
+			if (visitedFiles.has(filePath)) {
+				continue
+			}
+			visitedFiles.add(filePath)
+
+			const raw = await fs.readFile(filePath, "utf8")
+			const idMatch = raw.match(/<!-- todoItemId: (.+?) -->/)
+			if (idMatch?.[1] === todoItemId) {
+				await fs.unlink(filePath).catch(() => {})
+			}
+		}
+	}
+}
+
+async function collectMarkdownPlanFiles(directory: string): Promise<string[]> {
+	let entries: import("fs").Dirent[]
+	try {
+		entries = await fs.readdir(directory, { withFileTypes: true })
+	} catch {
+		return []
+	}
+
+	const files: string[] = []
+	for (const entry of entries) {
+		const entryPath = path.join(directory, entry.name)
+		if (entry.isDirectory()) {
+			files.push(...(await collectMarkdownPlanFiles(entryPath)))
+		} else if (entry.isFile() && entry.name.endsWith(".md")) {
+			files.push(entryPath)
+		}
+	}
+
+	return files
+}
+
+/**
+ * Save refine plans for a todo item.
+ *
+ * - file plans: stored under task_optimize/{taskTimestamp}/{PATH...}/{sanitized_todo_content}.md
+ * - general plans: stored under task_optimize/{taskTimestamp}/{taskTimestamp}+plan/{sanitized_todo_content}.md
+ *
+ * The todoItemId is embedded in the file header so it can be recovered during reading.
+ */
+export type PlanType = "file" | "general"
+
+export async function savePlanFiles(
+	globalStoragePath: string,
+	taskId: string,
+	taskTimestamp: string | undefined,
+	todoItemId: string,
+	todoContent: string,
+	plans: PlanFile[],
+	planType: PlanType = "file",
+): Promise<PlanSaveResult> {
+	const safeName = sanitizeFileName(`${todoContent}__${todoItemId}`)
+
+	await ensureConversationPlanDirectories(globalStoragePath, taskId, taskTimestamp, todoContent, plans)
+	await deleteExistingPlanFilesForTodo(globalStoragePath, taskId, taskTimestamp, todoItemId)
+
+	if (planType === "general" && taskTimestamp) {
+		const optimizeDir = await getTaskOptimizePlanPath(globalStoragePath, taskId, taskTimestamp)
+		const planFilePath = path.join(optimizeDir, `${safeName}.md`)
+		await fs.writeFile(planFilePath, buildPlanMarkdown(todoItemId, todoContent, planType, plans), "utf8")
+		return { savedPaths: [planFilePath] }
+	}
+
+	if (planType === "file" && taskTimestamp) {
+		const optimizeDir = await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp)
+		const plansByTargetDir = new Map<string, { dirSegments: string[]; plans: PlanFile[] }>()
+
+		for (const plan of plans) {
+			const dirSegments = getPlanStorageDirectorySegmentsForPlan(plan)
+			const dirKey = dirSegments.join("/")
+			const existing = plansByTargetDir.get(dirKey)
+			if (existing) {
+				existing.plans.push(plan)
+			} else {
+				plansByTargetDir.set(dirKey, { dirSegments, plans: [plan] })
+			}
+		}
+
+		const savedPaths: string[] = []
+		for (const { dirSegments, plans: groupedPlans } of plansByTargetDir.values()) {
+			const targetDir = dirSegments.length > 0 ? path.join(optimizeDir, ...dirSegments) : optimizeDir
+			await fs.mkdir(targetDir, { recursive: true })
+			const planFilePath = path.join(targetDir, `${safeName}.md`)
+			await fs.writeFile(planFilePath, buildPlanMarkdown(todoItemId, todoContent, planType, groupedPlans), "utf8")
+			savedPaths.push(planFilePath)
+		}
+
+		return { savedPaths }
+	}
+
+	const optimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
+	const planFilePath = path.join(optimizeDir, `${safeName}.md`)
+	await fs.writeFile(planFilePath, buildPlanMarkdown(todoItemId, todoContent, planType, plans), "utf8")
+	return { savedPaths: [planFilePath] }
 }
 
 /**
@@ -87,7 +383,6 @@ export async function readPlanFiles(
 
 	if (taskTimestamp) {
 		directoriesToScan.push(await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp))
-		directoriesToScan.push(await getTaskOptimizePlanPath(globalStoragePath, taskId, taskTimestamp))
 	}
 
 	const legacyOptimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
@@ -95,17 +390,14 @@ export async function readPlanFiles(
 		directoriesToScan.push(legacyOptimizeDir)
 	}
 
+	const visitedFiles = new Set<string>()
 	for (const optimizeDir of directoriesToScan) {
-		let entries: import("fs").Dirent[]
-		try {
-			entries = await fs.readdir(optimizeDir, { withFileTypes: true })
-		} catch {
-			continue
-		}
+		for (const filePath of await collectMarkdownPlanFiles(optimizeDir)) {
+			if (visitedFiles.has(filePath)) {
+				continue
+			}
+			visitedFiles.add(filePath)
 
-		for (const entry of entries) {
-			if (!entry.isFile() || !entry.name.endsWith(".md")) continue
-			const filePath = path.join(optimizeDir, entry.name)
 			const raw = await fs.readFile(filePath, "utf8")
 
 			const idMatch = raw.match(/<!-- todoItemId: (.+?) -->/)
@@ -137,27 +429,11 @@ export async function getRefinedTodoItemIds(globalStoragePath: string, taskId: s
 	const refined = new Set<string>()
 	const optimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
 
-	let entries: import("fs").Dirent[]
-	try {
-		entries = await fs.readdir(optimizeDir, { withFileTypes: true })
-	} catch {
-		return refined
-	}
-
-	for (const entry of entries) {
-		const targetDir = entry.isDirectory() ? path.join(optimizeDir, entry.name) : optimizeDir
-		const targetEntries = entry.isDirectory()
-			? await fs.readdir(targetDir, { withFileTypes: true }).catch(() => [])
-			: [entry]
-
-		for (const targetEntry of targetEntries) {
-			if (!targetEntry.isFile() || !targetEntry.name.endsWith(".md")) continue
-			const filePath = path.join(targetDir, targetEntry.name)
-			const raw = await fs.readFile(filePath, "utf8")
-			const idMatch = raw.match(/<!-- todoItemId: (.+?) -->/)
-			if (idMatch) {
-				refined.add(idMatch[1])
-			}
+	for (const filePath of await collectMarkdownPlanFiles(optimizeDir)) {
+		const raw = await fs.readFile(filePath, "utf8")
+		const idMatch = raw.match(/<!-- todoItemId: (.+?) -->/)
+		if (idMatch) {
+			refined.add(idMatch[1])
 		}
 	}
 
