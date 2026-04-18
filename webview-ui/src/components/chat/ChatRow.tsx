@@ -87,6 +87,7 @@ interface TodoPlanData {
 	savedPaths?: string[]
 	planType?: "file" | "general"
 	todoContent?: string
+	contexts: string[]
 	plans: TodoPlanEntry[]
 }
 
@@ -738,8 +739,8 @@ export const ChatRowContent = ({
 	}
 
 	const tool = useMemo(
-		() => (message.ask === "tool" ? safeJsonParse<ClineSayTool>(message.text) : null),
-		[message.ask, message.text],
+		() => (message.ask === "tool" || message.say === "tool" ? safeJsonParse<ClineSayTool>(message.text) : null),
+		[message.ask, message.say, message.text],
 	)
 
 	// Unified diff content (provided by backend when relevant)
@@ -1065,6 +1066,46 @@ export const ChatRowContent = ({
 							)}
 						</div>
 					</>
+				)
+			}
+			case "readCommandOutput": {
+				const formatBytes = (bytes: number) => {
+					if (bytes < 1024) return `${bytes} B`
+					if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+					return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+				}
+
+				const isSearch = tool.searchPattern !== undefined
+
+				let infoText = ""
+				if (isSearch) {
+					const matchText =
+						tool.matchCount !== undefined
+							? tool.matchCount === 1
+								? "1 match"
+								: `${tool.matchCount} matches`
+							: ""
+					infoText = `search: "${tool.searchPattern}"${matchText ? ` • ${matchText}` : ""}`
+				} else if (
+					tool.readStart !== undefined &&
+					tool.readEnd !== undefined &&
+					tool.totalBytes !== undefined
+				) {
+					infoText = `${formatBytes(tool.readStart)} - ${formatBytes(tool.readEnd)} of ${formatBytes(tool.totalBytes)}`
+				} else if (tool.totalBytes !== undefined) {
+					infoText = formatBytes(tool.totalBytes)
+				}
+
+				return (
+					<div style={headerStyle}>
+						<FileCode2 className="w-4 shrink-0" aria-label="Read command output icon" />
+						<span style={{ fontWeight: "bold" }}>{t("chat:readCommandOutput.title")}</span>
+						{infoText && (
+							<span className="text-xs ml-1" style={{ color: "var(--vscode-descriptionForeground)" }}>
+								({infoText})
+							</span>
+						)}
+					</div>
 				)
 			}
 			case "listFilesTopLevel":
@@ -1441,7 +1482,7 @@ export const ChatRowContent = ({
 								isLast={isLast}
 							/>
 							{shouldShowGlobalRefiningIndicator && isLast && isStreaming && (
-								<div className="mt-1 ml-1 text-xs text-vscode-descriptionForeground">refining...</div>
+								<div className="mt-1 ml-1 text-xs text-vscode-descriptionForeground">subagent...</div>
 							)}
 						</>
 					)
@@ -1484,7 +1525,7 @@ export const ChatRowContent = ({
 								</div>
 							</div>
 							{shouldShowGlobalRefiningIndicator && isLast && isApiRequestInProgress && (
-								<div className="mt-1 ml-7 text-xs text-vscode-descriptionForeground">refining...</div>
+								<div className="mt-1 ml-7 text-xs text-vscode-descriptionForeground">subagent...</div>
 							)}
 							{(((cost === null || cost === undefined) && apiRequestFailedMessage) ||
 								apiReqStreamingFailedMessage) && (

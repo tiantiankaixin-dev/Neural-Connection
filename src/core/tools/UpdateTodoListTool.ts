@@ -10,6 +10,8 @@ import { applyContextSelection, refreshContextSelection } from "../condense/cont
 
 interface UpdateTodoListParams {
 	todos: string
+	/** Refine mode only: one markdown string per checklist line (same order). */
+	item_contexts?: string[]
 }
 
 let approvedTodoList: TodoItem[] | undefined = undefined
@@ -34,6 +36,33 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				return
 			}
 
+			const itemContexts = params.item_contexts
+			if (itemContexts !== undefined) {
+				if (!Array.isArray(itemContexts)) {
+					task.consecutiveMistakeCount++
+					task.recordToolError("update_todo_list")
+					task.didToolFailInCurrentTurn = true
+					pushToolResult(formatResponse.toolError("item_contexts must be an array of strings"))
+					return
+				}
+				if (itemContexts.length !== todos.length) {
+					task.consecutiveMistakeCount++
+					task.recordToolError("update_todo_list")
+					task.didToolFailInCurrentTurn = true
+					pushToolResult(
+						formatResponse.toolError(
+							`item_contexts must have the same length as the checklist (${todos.length} lines), got ${itemContexts.length}`,
+						),
+					)
+					return
+				}
+				todos = todos.map((t, i) => {
+					const raw = itemContexts[i]
+					const ctx = typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : undefined
+					return ctx ? { ...t, context: ctx } : { ...t }
+				})
+			}
+
 			const { valid, error } = validateTodos(todos)
 			if (!valid) {
 				task.consecutiveMistakeCount++
@@ -47,6 +76,7 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				id: t.id,
 				content: t.content,
 				status: normalizeStatus(t.status),
+				...(t.context?.trim() ? { context: t.context.trim() } : {}),
 			}))
 
 			const approvalMsg = JSON.stringify({
@@ -139,6 +169,7 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 			const currentActiveItem = getActiveItem(normalizedTodos)
 			const shouldEmitDivider =
 				!!currentActiveItem &&
+				!task.isRefineMode &&
 				(task.postRefineDividerPending || currentActiveItem.id !== previousActiveItem?.id)
 
 			if (currentActiveItem && shouldEmitDivider) {
@@ -165,6 +196,26 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 
 			await setTodoListForTask(task, normalizedTodos)
 
+			if (task.isRefineMode) {
+				const unfinishedRefineTodoIds = normalizedTodos
+					.filter((todo) => todo.status !== "completed")
+					.map((todo) => todo.id)
+				task.activeRefineTodoItemIds = unfinishedRefineTodoIds.length > 0 ? unfinishedRefineTodoIds : null
+				if (unfinishedRefineTodoIds.length === 0) {
+					task.isRefineMode = false
+					task.postRefineDividerPending = true
+				}
+
+				// Notify webview so it can switch from global to per-item refine indicators
+				const provider = task.providerRef.deref()
+				if (provider) {
+					await provider.postMessageToWebview({
+						type: "refineItemIdsUpdate",
+						refiningTodoItemIds: unfinishedRefineTodoIds,
+					})
+				}
+			}
+
 			// Task lock: establishing a task unlocks all tools for subsequent API calls
 			task.taskEstablished = true
 
@@ -173,12 +224,29 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 			const completionHint = allCompleted
 				? "\n\nAll tasks are now completed. If the user has given you a new request, call update_todo_list to create a new task list. Otherwise, call attempt_completion to present the final result."
 				: ""
+			const todosWithIds = todoListToMarkdown(normalizedTodos, true)
 
 			if (isTodoListChanged) {
 				const md = todoListToMarkdown(normalizedTodos)
-				pushToolResult(formatResponse.toolResult("User edits todo:\n\n" + md + completionHint))
+				pushToolResult(
+					formatResponse.toolResult(
+						"User edits todo:\n\n" +
+							md +
+							"\n\nCurrent todo ids:\n" +
+							todosWithIds +
+							"\n\nUse the ids shown above for any follow-up tool calls that require a todo_item_id." +
+							completionHint,
+					),
+				)
 			} else {
-				pushToolResult(formatResponse.toolResult("Todo list updated successfully." + completionHint))
+				pushToolResult(
+					formatResponse.toolResult(
+						"Todo list updated successfully.\n\nCurrent todo ids:\n" +
+							todosWithIds +
+							"\n\nUse the ids shown above for any follow-up tool calls that require a todo_item_id." +
+							completionHint,
+					),
+				)
 			}
 		} catch (error) {
 			await handleError("update todo list", error as Error)
@@ -257,13 +325,13 @@ export function restoreTodoListForTask(cline: Task, todoList?: TodoItem[]) {
 	cline.todoList = getLatestTodo(cline.clineMessages)
 }
 
-function todoListToMarkdown(todos: TodoItem[]): string {
+function todoListToMarkdown(todos: TodoItem[], includeIds = false): string {
 	return todos
 		.map((t) => {
 			let box = "[ ]"
 			if (t.status === "completed") box = "[x]"
 			else if (t.status === "in_progress") box = "[-]"
-			return `${box} ${t.content}`
+			return includeIds ? `${box} [${t.id}] ${t.content}` : `${box} ${t.content}`
 		})
 		.join("\n")
 }
@@ -314,6 +382,8 @@ function validateTodos(todos: any[]): { valid: boolean; error?: string } {
 			return { valid: false, error: `Item ${i + 1} is missing content` }
 		if (t.status && !todoStatusSchema.options.includes(t.status as TodoStatus))
 			return { valid: false, error: `Item ${i + 1} has invalid status` }
+		if (t.context !== undefined && typeof t.context !== "string")
+			return { valid: false, error: `Item ${i + 1} context must be a string` }
 	}
 	return { valid: true }
 }

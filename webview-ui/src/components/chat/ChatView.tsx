@@ -68,6 +68,7 @@ interface TodoPlanData {
 	savedPaths?: string[]
 	planType?: "file" | "general"
 	todoContent?: string
+	contexts: string[]
 	plans: TodoPlanEntry[]
 }
 
@@ -212,24 +213,62 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 					continue
 				}
 
-				result[parsed.todoItemId] = {
-					savedPath: parsed.savedPath,
-					savedPaths: Array.isArray(parsed.savedPaths)
-						? parsed.savedPaths
-						: parsed.savedPath
-							? [parsed.savedPath]
-							: [],
-					planType: parsed.planType,
-					todoContent: parsed.todoContent,
-					plans: parsed.plans,
+				const existing = result[parsed.todoItemId]
+				const newPaths = Array.isArray(parsed.savedPaths)
+					? parsed.savedPaths
+					: parsed.savedPath
+						? [parsed.savedPath]
+						: []
+				const newContext = parsed.context ? [parsed.context] : []
+
+				if (existing) {
+					// Accumulate: multiple write_todo_plan calls for same todo
+					existing.savedPaths = [...(existing.savedPaths || []), ...newPaths]
+					existing.contexts = [...existing.contexts, ...newContext]
+					existing.plans = [...existing.plans, ...parsed.plans]
+				} else {
+					result[parsed.todoItemId] = {
+						savedPath: parsed.savedPath,
+						savedPaths: newPaths,
+						planType: parsed.planType,
+						todoContent: parsed.todoContent,
+						contexts: newContext,
+						plans: parsed.plans,
+					}
 				}
 			} catch {
 				// ignore invalid refine_result payloads
 			}
 		}
 
+		// Per-todo context from refine STEP 1 (`update_todo_list` + item_contexts) — show refined UI before any write_todo_plan
+		for (const todo of latestTodos) {
+			const id = todo.id
+			if (!id) {
+				continue
+			}
+			const ctx =
+				typeof (todo as { context?: string }).context === "string"
+					? (todo as { context?: string }).context!.trim()
+					: ""
+			if (!ctx) {
+				continue
+			}
+			const existing = result[id]
+			if (existing) {
+				if (!existing.contexts.includes(ctx)) {
+					existing.contexts = [ctx, ...existing.contexts]
+				}
+			} else {
+				result[id] = {
+					contexts: [ctx],
+					plans: [],
+				}
+			}
+		}
+
 		return result
-	}, [messages])
+	}, [messages, latestTodos])
 
 	const modifiedMessages = useMemo(() => combineApiRequests(combineCommandSequences(messages.slice(1))), [messages])
 
@@ -266,7 +305,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	const [isCondensing, setIsCondensing] = useState<boolean>(false)
 	const [isRefining, setIsRefining] = useState<boolean>(false)
 	const [refiningTodoItemIds, setRefiningTodoItemIds] = useState<string[]>([])
-	const [refineStatusLabel, setRefineStatusLabel] = useState<string>("refining...")
+	const [refineStatusLabel, setRefineStatusLabel] = useState<string>("subagent...")
 	const [refineReasoningContent, setRefineReasoningContent] = useState<string>("")
 	const hasSeenStreamingSinceRefine = useRef(false)
 	const autoCollapsedRef = useRef(false)
@@ -354,8 +393,10 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	const handleRefineTodoItems = useCallback((todoItemIds: string[]) => {
 		setIsRefining(true)
-		setRefiningTodoItemIds(todoItemIds)
-		setRefineStatusLabel("thinking...")
+		// Use __global__ sentinel so the indicator shows at bottom of list (global phase).
+		// The backend sends refineItemIdsUpdate with real IDs after update_todo_list rewrites the list.
+		setRefiningTodoItemIds(["__global__"])
+		setRefineStatusLabel("subagent...")
 		setRefineReasoningContent("")
 		vscode.postMessage({ type: "refineTodoItems", payload: { todoItemIds } })
 	}, [])
@@ -389,9 +430,10 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			return
 		}
 
-		const remainingTodoItemIds = refiningTodoItemIds.filter(
-			(todoItemId) => !todoPlansById[todoItemId]?.plans?.length,
-		)
+		const remainingTodoItemIds = refiningTodoItemIds.filter((todoItemId) => {
+			const p = todoPlansById[todoItemId]
+			return !p?.plans?.length && !p?.contexts?.length
+		})
 
 		if (remainingTodoItemIds.length !== refiningTodoItemIds.length) {
 			setRefiningTodoItemIds(remainingTodoItemIds)
@@ -663,7 +705,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		autoCollapsedRef.current = false
 		setIsRefining(false)
 		setRefiningTodoItemIds([])
-		setRefineStatusLabel("refining...")
+		setRefineStatusLabel("subagent...")
 		setRefineReasoningContent("")
 		setHiddenRefineApiRequestMessageTs([])
 		// Note: sendingDisabled is not reset here as it's managed by message effects
@@ -803,7 +845,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	useEffect(() => {
 		if (!isRefining) {
 			setRefiningTodoItemIds([])
-			setRefineStatusLabel("refining...")
+			setRefineStatusLabel("subagent...")
 			setRefineReasoningContent("")
 			hasSeenStreamingSinceRefine.current = false
 			return
@@ -1200,6 +1242,11 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						})
 					}
 					break
+				case "refineItemIdsUpdate":
+					if (message.refiningTodoItemIds) {
+						setRefiningTodoItemIds(message.refiningTodoItemIds)
+					}
+					break
 			}
 			// textAreaRef.current is not explicitly required here since React
 			// guarantees that ref will be stable across re-renders, and we're
@@ -1562,7 +1609,42 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		// Consolidate consecutive ask messages into batches
 		const readFileBatched = batchConsecutive(filtered, isReadFileAsk, synthesizeReadFileBatch)
 		const listFilesBatched = batchConsecutive(readFileBatched, isListFilesAsk, synthesizeListFilesBatch)
-		const result = batchConsecutive(listFilesBatched, isEditFileAsk, synthesizeEditFileBatch)
+		const batchedResult = batchConsecutive(listFilesBatched, isEditFileAsk, synthesizeEditFileBatch)
+
+		// Group interleaved subagent messages so all messages from the same subagentId
+		// appear contiguously. Non-subagent messages keep their original position.
+		// This ensures the divider-based grouping below works correctly for parallel subagents.
+		const result: ClineMessage[] = []
+		const subagentBuckets = new Map<string, ClineMessage[]>()
+		let insertionPoint = -1 // where subagent messages start in the result
+
+		for (const msg of batchedResult) {
+			const sid = (msg as any).subagentId as string | undefined
+			if (sid) {
+				if (!subagentBuckets.has(sid)) {
+					subagentBuckets.set(sid, [])
+				}
+				subagentBuckets.get(sid)!.push(msg)
+				if (insertionPoint < 0) {
+					insertionPoint = result.length // mark where subagent zone starts
+				}
+			} else {
+				result.push(msg)
+			}
+		}
+
+		// Append subagent groups at the insertion point (or end if no insertion point)
+		if (subagentBuckets.size > 0) {
+			const subagentMessages: ClineMessage[] = []
+			for (const bucket of subagentBuckets.values()) {
+				subagentMessages.push(...bucket)
+			}
+			if (insertionPoint >= 0) {
+				result.splice(insertionPoint, 0, ...subagentMessages)
+			} else {
+				result.push(...subagentMessages)
+			}
+		}
 
 		// Annotate messages between todo_item_divider markers with group position
 		// so ChatRow can render bordered boxes around each todo item's messages.

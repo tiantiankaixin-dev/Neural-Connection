@@ -84,7 +84,7 @@ const PATCH_FILE_MARKERS = ["*** Add File: ", "*** Delete File: ", "*** Update F
  * @param patchContent The patch content string
  * @returns Array of file paths found in the patch
  */
-function extractFilePathsFromPatch(patchContent: string): string[] {
+export function extractFilePathsFromPatch(patchContent: string): string[] {
 	const filePaths: string[] = []
 	const lines = patchContent.split("\n")
 

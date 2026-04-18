@@ -1,0 +1,25 @@
+{
+	"mcpServers": {
+		"my-mcp-1": {
+			"command": "node",
+			"args": ["C:/Users/Lenovo/.cursor/my-mcp-server/index.mjs"],
+			"env": {
+				"WUKONG_SESSION": "1"
+			}
+		},
+		"my-mcp-2": {
+			"command": "node",
+			"args": ["C:/Users/Lenovo/.cursor/my-mcp-server/index.mjs"],
+			"env": {
+				"WUKONG_SESSION": "2"
+			}
+		},
+		"my-mcp-3": {
+			"command": "node",
+			"args": ["C:/Users/Lenovo/.cursor/my-mcp-server/index.mjs"],
+			"env": {
+				"WUKONG_SESSION": "3"
+			}
+		}
+	}
+}

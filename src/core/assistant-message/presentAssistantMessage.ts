@@ -47,7 +47,8 @@ import { runSlashCommandTool } from "../tools/RunSlashCommandTool"
 import { skillTool } from "../tools/SkillTool"
 import { generateImageTool } from "../tools/GenerateImageTool"
 import { applyDiffTool as applyDiffToolClass } from "../tools/ApplyDiffTool"
-import { isValidToolName, validateToolUse } from "../tools/validateToolUse"
+import { isValidToolName, validateToolUse, extractFilePathsFromPatch } from "../tools/validateToolUse"
+import { isFileOwnedByTask } from "../tools/file-ownership"
 import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 
 import { formatResponse } from "../prompts/responses"
@@ -665,6 +666,53 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 
 					break
+				}
+
+				// File ownership enforcement for parallel dispatch subagents.
+				// If the task has ownedFiles set, edit operations are restricted to those files only.
+				if (!block.partial && cline.ownedFiles && cline.ownedFiles.length > 0) {
+					const editTools = new Set([
+						"write_to_file",
+						"apply_diff",
+						"edit",
+						"search_and_replace",
+						"search_replace",
+						"edit_file",
+						"apply_patch",
+						"multi_edit",
+					])
+					if (editTools.has(block.name)) {
+						const filePath = block.params?.path || block.params?.file_path
+						if (filePath && !isFileOwnedByTask(filePath, cline.ownedFiles)) {
+							cline.consecutiveMistakeCount++
+							const ownershipError = `File ownership violation: "${filePath}" is not in your allowed files. You may only edit: ${cline.ownedFiles.join(", ")}. This restriction exists because you are a parallel subagent — other subagents own the files you are trying to modify.`
+							cline.pushToolResultToUserContent({
+								type: "tool_result",
+								tool_use_id: sanitizeToolUseId(toolCallId),
+								content: formatResponse.toolError(ownershipError),
+								is_error: true,
+							})
+							break
+						}
+						// Also check apply_patch embedded file paths
+						if (block.name === "apply_patch" && typeof block.params?.patch === "string") {
+							const patchFilePaths = extractFilePathsFromPatch(block.params.patch)
+							const unowned = patchFilePaths.filter(
+								(p: string) => !isFileOwnedByTask(p, cline.ownedFiles),
+							)
+							if (unowned.length > 0) {
+								cline.consecutiveMistakeCount++
+								const patchError = `File ownership violation in patch: ${unowned.map((p: string) => `"${p}"`).join(", ")} not in your allowed files. You may only edit: ${cline.ownedFiles.join(", ")}.`
+								cline.pushToolResultToUserContent({
+									type: "tool_result",
+									tool_use_id: sanitizeToolUseId(toolCallId),
+									content: formatResponse.toolError(patchError),
+									is_error: true,
+								})
+								break
+							}
+						}
+					}
 				}
 			}
 

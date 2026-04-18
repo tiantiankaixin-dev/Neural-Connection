@@ -287,6 +287,12 @@ export const clineMessageSchema = z.object({
 	isProtected: z.boolean().optional(),
 	apiProtocol: z.union([z.literal("openai"), z.literal("anthropic")]).optional(),
 	isAnswered: z.boolean().optional(),
+	/**
+	 * When set, this message belongs to a parallel subagent execution.
+	 * The value is the todo item ID that this subagent is working on.
+	 * Used by the webview to group messages into per-subagent boxes.
+	 */
+	subagentId: z.string().optional(),
 })
 
 export type ClineMessage = z.infer<typeof clineMessageSchema>

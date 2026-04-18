@@ -46,6 +46,54 @@ export interface EncryptedReasoningItem {
 	originalIndex: number
 }
 
+function summarizeAiSdkMessageContent(content: ModelMessage["content"]): Record<string, unknown> {
+	if (typeof content === "string") {
+		return { textPreview: content.slice(0, 240) }
+	}
+
+	if (!Array.isArray(content)) {
+		return { contentType: typeof content }
+	}
+
+	const partTypes = content.map((part) => {
+		const block = part as unknown as Record<string, unknown>
+		return typeof block.type === "string" ? block.type : typeof part
+	})
+	const preview = content
+		.map((part) => {
+			const block = part as unknown as Record<string, unknown>
+			const type = typeof block.type === "string" ? block.type : typeof part
+			if (type === "text") {
+				return `text:${String(block.text ?? "").slice(0, 120)}`
+			}
+			if (type === "tool-call") {
+				return `tool-call:${String(block.toolName ?? "")}`
+			}
+			if (type === "tool-result") {
+				return `tool-result:${String(block.toolName ?? "")}`
+			}
+			if (type === "reasoning") {
+				return `reasoning:${String(block.text ?? "").slice(0, 120)}`
+			}
+			return type
+		})
+		.join(" | ")
+
+	return {
+		partTypes,
+		preview: preview.slice(0, 400),
+	}
+}
+
+function summarizeAiSdkMessages(messages: ModelMessage[]): Array<Record<string, unknown>> {
+	const startIndex = Math.max(0, messages.length - 6)
+	return messages.slice(startIndex).map((message, offset) => ({
+		index: startIndex + offset,
+		role: message.role,
+		...summarizeAiSdkMessageContent(message.content),
+	}))
+}
+
 /**
  * Strip plain-text reasoning blocks from assistant message content arrays.
  *
@@ -437,6 +485,25 @@ export class OpenAiNativeHandler extends BaseProvider implements SingleCompletio
 
 		const openAiTools = this.convertToolsForOpenAI(metadata?.tools)
 		const aiSdkTools = convertToolsForAiSdk(openAiTools) as ToolSet | undefined
+		if (metadata?.taskId?.includes(":")) {
+			console.log("[OpenAiNativeHandler] Subagent request", {
+				taskId: metadata.taskId,
+				mode: metadata.mode,
+				behaviorRole: metadata.behaviorRole,
+				systemPromptHasRefineMarkers:
+					systemPrompt.includes("Plan mode ACTIVE") ||
+					systemPrompt.includes("write_todo_plan") ||
+					systemPrompt.includes("update_todo_list"),
+				systemPromptPreview: systemPrompt.slice(0, 320),
+				anthropicMessageCount: cleanedMessages.length,
+				aiSdkMessageCount: aiSdkMessages.length,
+				aiSdkMessageSummary: summarizeAiSdkMessages(aiSdkMessages),
+				toolNames: (openAiTools ?? []).map((tool) => {
+					const fn = (tool as unknown as { function?: { name?: string } }).function
+					return fn?.name ?? tool.type
+				}),
+			})
+		}
 
 		const taskId = metadata?.taskId
 		const userAgent = `roo-code/${Package.version} (${os.platform()} ${os.release()}; ${os.arch()}) node/${process.version.slice(1)}`

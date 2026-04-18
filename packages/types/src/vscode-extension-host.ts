@@ -111,6 +111,7 @@ export interface ExtensionMessage {
 		// Neural Agent
 		| "neuralAgentStatus"
 		| "neuralAgentModels"
+		| "refineItemIdsUpdate"
 	text?: string
 	payload?: any // eslint-disable-line @typescript-eslint/no-explicit-any
 	checkpointWarning?: {
@@ -189,6 +190,7 @@ export interface ExtensionMessage {
 	stepIndex?: number // For browserSessionNavigate: the target step index to display
 	tools?: SerializedCustomToolDefinition[] // For customToolsResult
 	modes?: { slug: string; name: string }[] // For modes response
+	refiningTodoItemIds?: string[] // For refineItemIdsUpdate
 	skills?: SkillMetadata[] // For skills response
 	aggregatedCosts?: {
 		// For taskWithAggregatedCosts response

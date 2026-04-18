@@ -13,6 +13,11 @@ export interface PlanFile {
 	content: string
 }
 
+export interface PlanReadResult {
+	plans: PlanFile[]
+	contexts: string[]
+}
+
 export type PlanTargetAction = "CREATE" | "MODIFY" | "DELETE" | "GENERAL"
 
 export interface StructuredPlanEntry {
@@ -234,13 +239,23 @@ function getPlanStorageDirectorySegmentsForPlan(plan: PlanFile): string[] {
 	return rawSegments.slice(0, -1)
 }
 
-function buildPlanMarkdown(todoItemId: string, todoContent: string, planType: PlanType, plans: PlanFile[]): string {
+function buildPlanMarkdown(
+	todoItemId: string,
+	todoContent: string,
+	planType: PlanType,
+	plans: PlanFile[],
+	context?: string,
+): string {
 	const lines: string[] = [
 		`<!-- todoItemId: ${todoItemId} -->`,
 		`<!-- planType: ${planType} -->`,
 		`# ${todoContent}`,
 		"",
 	]
+
+	if (context && context.trim()) {
+		lines.push("<!-- BEGIN_TASK_CONTEXT -->", context.trim(), "<!-- END_TASK_CONTEXT -->", "")
+	}
 
 	for (const plan of plans) {
 		lines.push(`## ${plan.filePath}`, "", plan.content, "", "---", "")
@@ -319,16 +334,17 @@ export async function savePlanFiles(
 	todoContent: string,
 	plans: PlanFile[],
 	planType: PlanType = "file",
+	context?: string,
 ): Promise<PlanSaveResult> {
-	const safeName = sanitizeFileName(`${todoContent}__${todoItemId}`)
+	const callSuffix = Date.now()
+	const safeName = sanitizeFileName(`${todoContent}__${todoItemId}__${callSuffix}`)
 
 	await ensureConversationPlanDirectories(globalStoragePath, taskId, taskTimestamp, todoContent, plans)
-	await deleteExistingPlanFilesForTodo(globalStoragePath, taskId, taskTimestamp, todoItemId)
 
 	if (planType === "general" && taskTimestamp) {
 		const optimizeDir = await getTaskOptimizePlanPath(globalStoragePath, taskId, taskTimestamp)
 		const planFilePath = path.join(optimizeDir, `${safeName}.md`)
-		await fs.writeFile(planFilePath, buildPlanMarkdown(todoItemId, todoContent, planType, plans), "utf8")
+		await fs.writeFile(planFilePath, buildPlanMarkdown(todoItemId, todoContent, planType, plans, context), "utf8")
 		return { savedPaths: [planFilePath] }
 	}
 
@@ -348,11 +364,23 @@ export async function savePlanFiles(
 		}
 
 		const savedPaths: string[] = []
+		let contextWritten = false
 		for (const { dirSegments, plans: groupedPlans } of plansByTargetDir.values()) {
 			const targetDir = dirSegments.length > 0 ? path.join(optimizeDir, ...dirSegments) : optimizeDir
 			await fs.mkdir(targetDir, { recursive: true })
 			const planFilePath = path.join(targetDir, `${safeName}.md`)
-			await fs.writeFile(planFilePath, buildPlanMarkdown(todoItemId, todoContent, planType, groupedPlans), "utf8")
+			await fs.writeFile(
+				planFilePath,
+				buildPlanMarkdown(
+					todoItemId,
+					todoContent,
+					planType,
+					groupedPlans,
+					contextWritten ? undefined : context,
+				),
+				"utf8",
+			)
+			contextWritten = true
 			savedPaths.push(planFilePath)
 		}
 
@@ -361,7 +389,7 @@ export async function savePlanFiles(
 
 	const optimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
 	const planFilePath = path.join(optimizeDir, `${safeName}.md`)
-	await fs.writeFile(planFilePath, buildPlanMarkdown(todoItemId, todoContent, planType, plans), "utf8")
+	await fs.writeFile(planFilePath, buildPlanMarkdown(todoItemId, todoContent, planType, plans, context), "utf8")
 	return { savedPaths: [planFilePath] }
 }
 
@@ -376,9 +404,11 @@ export async function readPlanFiles(
 	taskTimestamp: string | undefined,
 	todoItemId: string,
 	todoContent?: string,
-): Promise<PlanFile[]> {
+): Promise<PlanReadResult> {
 	const resultsById: PlanFile[] = []
 	const fallbackResultsByContent: PlanFile[] = []
+	const contextsById: string[] = []
+	const contextsByContent: string[] = []
 	const directoriesToScan: string[] = []
 
 	if (taskTimestamp) {
@@ -406,6 +436,19 @@ export async function readPlanFiles(
 			const matchesContent = !!todoContent && headingMatch?.[1]?.trim() === todoContent
 			if (!matchesId && !matchesContent) continue
 
+			// Extract context block if present (only keep first occurrence)
+			const contextMatch = raw.match(/<!-- BEGIN_TASK_CONTEXT -->\r?\n([\s\S]*?)\r?\n<!-- END_TASK_CONTEXT -->/)
+			if (contextMatch) {
+				const ctxText = contextMatch[1].trim()
+				if (ctxText) {
+					if (matchesId) {
+						contextsById.push(ctxText)
+					} else {
+						contextsByContent.push(ctxText)
+					}
+				}
+			}
+
 			const sections = raw.split(/^## /m).slice(1)
 			for (const section of sections) {
 				const newlineIdx = section.indexOf("\n")
@@ -419,7 +462,10 @@ export async function readPlanFiles(
 		}
 	}
 
-	return resultsById.length > 0 ? resultsById : fallbackResultsByContent
+	if (resultsById.length > 0) {
+		return { plans: resultsById, contexts: contextsById }
+	}
+	return { plans: fallbackResultsByContent, contexts: contextsByContent }
 }
 
 /**

@@ -560,9 +560,12 @@ export class NativeToolCallParser {
 				break
 
 			case "update_todo_list":
-				if (partialArgs.todos !== undefined) {
+				if (partialArgs.todos !== undefined || partialArgs.item_contexts !== undefined) {
 					nativeArgs = {
-						todos: partialArgs.todos,
+						...(partialArgs.todos !== undefined ? { todos: partialArgs.todos } : {}),
+						...(partialArgs.item_contexts !== undefined
+							? { item_contexts: partialArgs.item_contexts }
+							: {}),
 					}
 				}
 				break
@@ -911,6 +914,7 @@ export class NativeToolCallParser {
 					if (args.todos !== undefined) {
 						nativeArgs = {
 							todos: args.todos,
+							...(args.item_contexts !== undefined ? { item_contexts: args.item_contexts } : {}),
 						} as NativeArgsFor<TName>
 					}
 					break

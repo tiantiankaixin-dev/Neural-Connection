@@ -29,7 +29,7 @@ import searchReplace from "./search_replace"
 import edit_file from "./edit_file"
 import searchFiles from "./search_files"
 import switchMode from "./switch_mode"
-import updateTodoList from "./update_todo_list"
+import updateTodoList, { createUpdateTodoListTool } from "./update_todo_list"
 import writeTodoPlan from "./write_todo_plan"
 import writeToFile from "./write_to_file"
 
@@ -43,6 +43,15 @@ export type { ReadFileToolOptions } from "./read_file"
 export interface NativeToolsOptions {
 	/** Whether the model supports image processing (default: false) */
 	supportsImages?: boolean
+}
+
+const subagentAttemptCompletion: OpenAI.Chat.ChatCompletionTool = {
+	...attemptCompletion,
+	function: {
+		...attemptCompletion.function,
+		description:
+			"Use this when your assigned subtask is finished or cannot be completed further. The tool results returned in this conversation are the authoritative execution feedback for the subagent; you do not need extra user confirmation before calling attempt_completion. After you have finished the required reads/writes/searches for your assigned files and the latest tool results indicate success, call attempt_completion immediately with a concise summary. If the subtask is blocked by missing files, ownership limits, or tool limitations, call attempt_completion with a concise explanation of the blocker.",
+	},
 }
 
 /**
@@ -96,10 +105,52 @@ export function getNativeTools(options: NativeToolsOptions = {}): OpenAI.Chat.Ch
 }
 
 /**
- * Get the minimal tool set for refine mode: only write_todo_plan.
+ * Get the planning/exploration tool set for refine mode.
+ *
+ * Refine uses an OpenCode-style planning environment: read-only code exploration,
+ * todo-list restructuring, follow-up questions, and internal plan writing.
  */
-export function getRefineOnlyTools(): OpenAI.Chat.ChatCompletionTool[] {
-	return [writeTodoPlan] satisfies OpenAI.Chat.ChatCompletionTool[]
+export function getRefineOnlyTools(options: NativeToolsOptions = {}): OpenAI.Chat.ChatCompletionTool[] {
+	const { supportsImages = false } = options
+
+	const readFileOptions: ReadFileToolOptions = {
+		supportsImages,
+	}
+
+	return [
+		codebaseSearchBroad,
+		codebaseSearchPrecise,
+		askFollowupQuestion,
+		listFiles,
+		findByName,
+		createReadFileTool(readFileOptions),
+		searchFiles,
+		viewContentChunk,
+		readUrlContent,
+		searchWeb,
+		createUpdateTodoListTool(true),
+		writeTodoPlan,
+	] satisfies OpenAI.Chat.ChatCompletionTool[]
+}
+
+/**
+ * Tools available to parallel subagents during build phase.
+ * A focused subset: read + write + search + completion. No browser, MCP, or command execution.
+ */
+export function getSubagentTools(options: NativeToolsOptions = {}): OpenAI.Chat.ChatCompletionTool[] {
+	const { supportsImages = false } = options
+
+	const readFileOptions: ReadFileToolOptions = {
+		supportsImages,
+	}
+
+	return [
+		createReadFileTool(readFileOptions),
+		listFiles,
+		searchFiles,
+		writeToFile,
+		subagentAttemptCompletion,
+	] satisfies OpenAI.Chat.ChatCompletionTool[]
 }
 
 // Backward compatibility: export default tools with line ranges enabled

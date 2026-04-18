@@ -48,6 +48,8 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				return
 			}
 
+			const taskContext = todoItem.context?.trim() ?? ""
+
 			if (planType !== "file" && planType !== "general") {
 				task.consecutiveMistakeCount++
 				task.recordToolError("write_todo_plan")
@@ -108,6 +110,7 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				todoItem.content,
 				normalizedPlanEntries,
 				planType,
+				taskContext,
 			)
 
 			task.consecutiveMistakeCount = 0
@@ -134,6 +137,7 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 					savedPath: savedPaths[0],
 					savedPaths,
 					planType,
+					context: taskContext || "",
 					plans: normalizedPlanEntries.map((e, index) => ({
 						filePath: e.filePath,
 						content: e.content,
@@ -152,11 +156,20 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 			const label = planType === "general" ? "general plan section(s)" : "plan file(s)"
 			const fileList = normalizedPlanEntries.map((e) => `  - ${e.filePath}`).join("\n")
 			const savedPathList = savedPaths.map((p) => `  - ${p}`).join("\n")
+
+			const allPlansWritten = !task.isRefineMode
+
 			pushToolResult(
 				formatResponse.toolResult(
-					`Successfully wrote ${normalizedPlanEntries.length} ${label} for todo item "${todoItem.content}":\n${fileList}\n\nSaved plan files:\n${savedPathList}\n\nThese plans will be automatically injected into context when working on this todo item.`,
+					`Successfully wrote ${normalizedPlanEntries.length} ${label} for todo item "${todoItem.content}":\n${fileList}\n\nSaved plan files:\n${savedPathList}\n\nThese plans will be automatically injected into context when working on this todo item.${allPlansWritten ? "\n\n[ALL PLANS RECORDED — Launching parallel execution...]" : ""}`,
 				),
 			)
+
+			// When all plans are written (refine mode exited), signal the main loop to exit
+			// so that initiateTaskLoop can launch parallel subagents without interference.
+			if (allPlansWritten) {
+				task.subagentsPending = true
+			}
 		} catch (error) {
 			await handleError("write todo plan", error as Error)
 		}

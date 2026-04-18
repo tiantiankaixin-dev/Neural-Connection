@@ -139,7 +139,7 @@ async function ensurePlannedConversationPaths(
 		return
 	}
 
-	const planFiles = await readPlanFiles(globalStoragePath, taskId, taskTimestamp, todoItemId, itemContent)
+	const { plans: planFiles } = await readPlanFiles(globalStoragePath, taskId, taskTimestamp, todoItemId, itemContent)
 	if (planFiles.length === 0) {
 		return
 	}

@@ -6,6 +6,8 @@ interface TodoItem {
 	id?: string
 	content: string
 	status?: "completed" | "in_progress" | string
+	/** From refine STEP 1 (item_contexts); shown in refined card before plans exist */
+	context?: string
 }
 
 interface TodoPlanEntry {
@@ -17,6 +19,7 @@ interface TodoPlanData {
 	savedPath?: string
 	savedPaths?: string[]
 	planType?: "file" | "general"
+	contexts: string[]
 	plans: TodoPlanEntry[]
 }
 
@@ -111,7 +114,21 @@ function getDisplayedPlanContent(content: string) {
 function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }) {
 	const [isExpanded, setIsExpanded] = React.useState(false)
 	const [expandedSections, setExpandedSections] = React.useState<Set<number>>(new Set())
-	const hasPlan = !!plan && plan.plans.length > 0
+	const [expandedContexts, setExpandedContexts] = React.useState<Set<number>>(new Set())
+	const hasPlan = !!plan && (plan.plans.length > 0 || plan.contexts.length > 0)
+	const hasContexts = !!plan && plan.contexts.length > 0
+
+	const toggleContext = (idx: number) => {
+		setExpandedContexts((prev) => {
+			const next = new Set(prev)
+			if (next.has(idx)) {
+				next.delete(idx)
+			} else {
+				next.add(idx)
+			}
+			return next
+		})
+	}
 	const statusColor =
 		todo.status === "completed"
 			? "var(--vscode-charts-green)"
@@ -174,7 +191,11 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 					</div>
 					<div style={{ color: "var(--vscode-descriptionForeground)", fontSize: 12 }}>
 						{hasPlan
-							? `${plan.plans.length} ${plan.planType === "general" ? "section(s)" : "file(s)"}`
+							? plan.plans.length > 0
+								? `${plan.plans.length} ${plan.planType === "general" ? "section(s)" : "file(s)"}`
+								: plan.contexts.length > 0
+									? `${plan.contexts.length} task context block(s)`
+									: "No refine details"
 							: "No refine details"}
 					</div>
 				</div>
@@ -197,6 +218,62 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 			</div>
 			{isExpanded && hasPlan && plan && (
 				<div style={{ borderTop: "1px solid var(--vscode-editorGroup-border)" }}>
+					{/* Context sections — parent agent's cross-cutting context (interfaces, contracts, dependencies) */}
+					{hasContexts &&
+						plan.contexts.map((ctx, ctxIdx) => (
+							<div
+								key={`ctx-${ctxIdx}`}
+								style={{
+									borderBottom: "1px solid var(--vscode-editorGroup-border)",
+								}}>
+								<div
+									onClick={() => toggleContext(ctxIdx)}
+									style={{
+										display: "flex",
+										alignItems: "center",
+										gap: 6,
+										padding: "6px 10px 6px 20px",
+										cursor: "pointer",
+										userSelect: "none",
+										fontSize: 12,
+										color: "var(--vscode-foreground)",
+									}}>
+									<span
+										className={`codicon codicon-chevron-${expandedContexts.has(ctxIdx) ? "down" : "right"}`}
+										style={{ fontSize: 12, flexShrink: 0 }}
+									/>
+									<span
+										className="codicon codicon-symbol-interface"
+										style={{
+											fontSize: 12,
+											flexShrink: 0,
+											color: "var(--vscode-charts-purple)",
+										}}
+									/>
+									<span style={{ fontWeight: 500, opacity: 0.9 }}>
+										Task Context{plan.contexts.length > 1 ? ` (${ctxIdx + 1})` : ""}
+									</span>
+									<span style={{ color: "var(--vscode-descriptionForeground)", fontSize: 11 }}>
+										interfaces & contracts
+									</span>
+								</div>
+								{expandedContexts.has(ctxIdx) && (
+									<div
+										style={{
+											padding: "4px 14px 8px 36px",
+											color: "var(--vscode-foreground)",
+											maxHeight: "30vh",
+											overflowY: "auto",
+											overflowX: "hidden",
+											background: "#000000",
+											borderRadius: 4,
+											margin: "4px 12px 8px 28px",
+										}}>
+										<MarkdownBlock markdown={ctx} />
+									</div>
+								)}
+							</div>
+						))}
 					{plan.plans.map((entry, index) => (
 						<div
 							key={index}
@@ -263,7 +340,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	todoPlansById,
 	refiningTodoItemIds,
 	activeRefiningTodoItemId,
-	refineStatusLabel = "refining...",
+	refineStatusLabel = "subagent...",
 	refineReasoningContent = "",
 	showRefiningIndicator = false,
 	content,
@@ -540,12 +617,17 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 								const changeType = changeMap.get(todo.id || todo.content) as TodoChangeType | undefined
 								const changeColor = changeType ? CHANGE_COLORS[changeType] : "transparent"
 								const todoPlan = todo.id ? todoPlansById?.[todo.id] : undefined
-								const hasInlineRefinedCard = !isEditing && !!todoPlan?.plans?.length
+								const effectivePlan: TodoPlanData | undefined =
+									todoPlan ??
+									(todo.context?.trim() ? { contexts: [todo.context.trim()], plans: [] } : undefined)
+								const hasInlineRefinedCard =
+									!isEditing && (!!effectivePlan?.plans?.length || !!effectivePlan?.contexts?.length)
 								const isActiveInlineRefining =
 									showRefiningIndicator &&
 									!!todo.id &&
 									activeRefiningTodoItemId === todo.id &&
-									!todoPlan?.plans?.length
+									!effectivePlan?.plans?.length &&
+									!effectivePlan?.contexts?.length
 								const shouldShowInlineRefining =
 									isActiveInlineRefining && !!todo.id && refiningTodoIdSet.has(todo.id)
 								const shouldShowInlineThinking =
@@ -645,7 +727,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 													minWidth: 0,
 													marginRight: 6,
 												}}>
-												<RefinedTodoCard todo={todo} plan={todoPlan} />
+												<RefinedTodoCard todo={todo} plan={effectivePlan} />
 											</div>
 										) : (
 											<div
@@ -825,6 +907,58 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 						</ul>
 					) : (
 						<MarkdownBlock markdown={content} />
+					)}
+					{/* Global refine indicator: shown at the bottom of the list only during
+					    the __global__ exploration phase, before the list is rewritten */}
+					{showRefiningIndicator && activeRefiningTodoItemId === "__global__" && (
+						<div style={{ marginTop: 6, marginLeft: 3 }}>
+							{refineReasoningContent.trim().length > 0 ? (
+								<button
+									type="button"
+									onClick={() => {
+										/* toggle handled via parent state - just show inline */
+									}}
+									style={{
+										padding: 0,
+										border: "none",
+										background: "transparent",
+										color: "var(--vscode-descriptionForeground)",
+										fontSize: 11,
+										lineHeight: "1.35",
+										cursor: "default",
+										display: "flex",
+										alignItems: "center",
+										gap: 4,
+									}}>
+									<span className="codicon codicon-chevron-down" style={{ fontSize: 11 }} />
+									<span>{refineStatusLabel}</span>
+								</button>
+							) : (
+								<div
+									style={{
+										fontSize: 11,
+										lineHeight: "1.35",
+										color: "var(--vscode-descriptionForeground)",
+									}}>
+									{refineStatusLabel}
+								</div>
+							)}
+							{refineReasoningContent.trim().length > 0 && (
+								<div
+									style={{
+										marginTop: 4,
+										marginLeft: 3,
+										padding: "6px 10px",
+										borderLeft: "2px solid var(--vscode-widget-border)",
+										background: "var(--vscode-editor-background)",
+										borderRadius: 4,
+										maxHeight: "24vh",
+										overflowY: "auto",
+									}}>
+									<MarkdownBlock markdown={refineReasoningContent} />
+								</div>
+							)}
+						</div>
 					)}
 				</div>
 				{/* Delete confirmation dialog */}

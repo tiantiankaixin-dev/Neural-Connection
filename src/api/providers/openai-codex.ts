@@ -42,6 +42,54 @@ export type OpenAiCodexModel = ReturnType<OpenAiCodexHandler["getModel"]>
  */
 const CODEX_API_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
+function summarizeAiSdkMessageContent(content: unknown): Record<string, unknown> {
+	if (typeof content === "string") {
+		return { textPreview: content.slice(0, 240) }
+	}
+
+	if (!Array.isArray(content)) {
+		return { contentType: typeof content }
+	}
+
+	const partTypes = content.map((part) => {
+		const block = part as unknown as Record<string, unknown>
+		return typeof block.type === "string" ? block.type : typeof part
+	})
+	const preview = content
+		.map((part) => {
+			const block = part as unknown as Record<string, unknown>
+			const type = typeof block.type === "string" ? block.type : typeof part
+			if (type === "text") {
+				return `text:${String(block.text ?? "").slice(0, 120)}`
+			}
+			if (type === "tool-call") {
+				return `tool-call:${String(block.toolName ?? "")}`
+			}
+			if (type === "tool-result") {
+				return `tool-result:${String(block.toolName ?? "")}`
+			}
+			if (type === "reasoning") {
+				return `reasoning:${String(block.text ?? "").slice(0, 120)}`
+			}
+			return type
+		})
+		.join(" | ")
+
+	return {
+		partTypes,
+		preview: preview.slice(0, 400),
+	}
+}
+
+function summarizeAiSdkMessages(messages: Array<{ role: string; content: unknown }>): Array<Record<string, unknown>> {
+	const startIndex = Math.max(0, messages.length - 6)
+	return messages.slice(startIndex).map((message, offset) => ({
+		index: startIndex + offset,
+		role: message.role,
+		...summarizeAiSdkMessageContent(message.content),
+	}))
+}
+
 /**
  * Check whether an error looks like an authentication / authorization failure
  * so the caller can attempt a token refresh and retry.
@@ -187,6 +235,27 @@ export class OpenAiCodexHandler extends BaseProvider implements SingleCompletion
 				// Convert tools to OpenAI format first, then to AI SDK format
 				const openAiTools = this.convertToolsForOpenAI(metadata?.tools)
 				const aiSdkTools = convertToolsForAiSdk(openAiTools) as ToolSet | undefined
+				if (metadata?.taskId?.includes(":")) {
+					console.log("[OpenAiCodexHandler] Subagent request", {
+						taskId: metadata.taskId,
+						mode: metadata.mode,
+						behaviorRole: metadata.behaviorRole,
+						systemPromptHasRefineMarkers:
+							systemPrompt.includes("Plan mode ACTIVE") ||
+							systemPrompt.includes("write_todo_plan") ||
+							systemPrompt.includes("update_todo_list"),
+						systemPromptPreview: systemPrompt.slice(0, 320),
+						anthropicMessageCount: cleanedMessages.length,
+						aiSdkMessageCount: aiSdkMessages.length,
+						aiSdkMessageSummary: summarizeAiSdkMessages(
+							aiSdkMessages as Array<{ role: string; content: unknown }>,
+						),
+						toolNames: (openAiTools ?? []).map((tool) => {
+							const fn = (tool as unknown as { function?: { name?: string } }).function
+							return fn?.name ?? tool.type
+						}),
+					})
+				}
 
 				const providerOptions = this.buildProviderOptions(model, metadata, systemPrompt)
 

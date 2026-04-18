@@ -131,7 +131,7 @@ export type NativeToolArgs = {
 	skill: { skill: string; args?: string | null }
 	search_files: { path: string; regex: string; file_pattern?: string | null }
 	switch_mode: { mode_slug: string; reason: string }
-	update_todo_list: { todos: string }
+	update_todo_list: { todos: string; item_contexts?: string[] }
 	write_todo_plan: {
 		todo_item_id: string
 		plan_type: "file" | "general"
