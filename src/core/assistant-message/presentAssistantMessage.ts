@@ -43,12 +43,12 @@ import { switchModeTool } from "../tools/SwitchModeTool"
 import { attemptCompletionTool, AttemptCompletionCallbacks } from "../tools/AttemptCompletionTool"
 import { updateTodoListTool } from "../tools/UpdateTodoListTool"
 import { writeTodoPlanTool } from "../tools/WriteTodoPlanTool"
+import { resumeSubagentsTool } from "../tools/ResumeSubagentsTool"
 import { runSlashCommandTool } from "../tools/RunSlashCommandTool"
 import { skillTool } from "../tools/SkillTool"
 import { generateImageTool } from "../tools/GenerateImageTool"
 import { applyDiffTool as applyDiffToolClass } from "../tools/ApplyDiffTool"
-import { isValidToolName, validateToolUse, extractFilePathsFromPatch } from "../tools/validateToolUse"
-import { isFileOwnedByTask } from "../tools/file-ownership"
+import { isValidToolName, validateToolUse } from "../tools/validateToolUse"
 import { codebaseSearchTool } from "../tools/CodebaseSearchTool"
 
 import { formatResponse } from "../prompts/responses"
@@ -626,7 +626,14 @@ export async function presentAssistantMessage(cline: Task) {
 				// e.g., "edit_file" should resolve to "apply_diff"
 				const rawIncludedTools = modelInfo?.info?.includedTools
 				const { resolveToolAlias } = await import("../prompts/tools/filter-tools-for-mode")
-				const includedTools = rawIncludedTools?.map((tool) => resolveToolAlias(tool))
+				const includedTools = rawIncludedTools?.map((tool) => resolveToolAlias(tool)) ?? []
+				if (
+					!cline.isRefineMode &&
+					(await cline.shouldReviewSubagentResumeState()) &&
+					!includedTools.includes("resume_subagents")
+				) {
+					includedTools.push("resume_subagents")
+				}
 
 				try {
 					const toolRequirements =
@@ -666,53 +673,6 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 
 					break
-				}
-
-				// File ownership enforcement for parallel dispatch subagents.
-				// If the task has ownedFiles set, edit operations are restricted to those files only.
-				if (!block.partial && cline.ownedFiles && cline.ownedFiles.length > 0) {
-					const editTools = new Set([
-						"write_to_file",
-						"apply_diff",
-						"edit",
-						"search_and_replace",
-						"search_replace",
-						"edit_file",
-						"apply_patch",
-						"multi_edit",
-					])
-					if (editTools.has(block.name)) {
-						const filePath = block.params?.path || block.params?.file_path
-						if (filePath && !isFileOwnedByTask(filePath, cline.ownedFiles)) {
-							cline.consecutiveMistakeCount++
-							const ownershipError = `File ownership violation: "${filePath}" is not in your allowed files. You may only edit: ${cline.ownedFiles.join(", ")}. This restriction exists because you are a parallel subagent — other subagents own the files you are trying to modify.`
-							cline.pushToolResultToUserContent({
-								type: "tool_result",
-								tool_use_id: sanitizeToolUseId(toolCallId),
-								content: formatResponse.toolError(ownershipError),
-								is_error: true,
-							})
-							break
-						}
-						// Also check apply_patch embedded file paths
-						if (block.name === "apply_patch" && typeof block.params?.patch === "string") {
-							const patchFilePaths = extractFilePathsFromPatch(block.params.patch)
-							const unowned = patchFilePaths.filter(
-								(p: string) => !isFileOwnedByTask(p, cline.ownedFiles),
-							)
-							if (unowned.length > 0) {
-								cline.consecutiveMistakeCount++
-								const patchError = `File ownership violation in patch: ${unowned.map((p: string) => `"${p}"`).join(", ")} not in your allowed files. You may only edit: ${cline.ownedFiles.join(", ")}.`
-								cline.pushToolResultToUserContent({
-									type: "tool_result",
-									tool_use_id: sanitizeToolUseId(toolCallId),
-									content: formatResponse.toolError(patchError),
-									is_error: true,
-								})
-								break
-							}
-						}
-					}
 				}
 			}
 
@@ -782,6 +742,10 @@ export async function presentAssistantMessage(cline: Task) {
 
 			switch (block.name) {
 				case "write_to_file":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await writeToFileTool.handle(cline, block as ToolUse<"write_to_file">, {
 						askApproval,
@@ -803,7 +767,18 @@ export async function presentAssistantMessage(cline: Task) {
 						pushToolResult,
 					})
 					break
+				case "resume_subagents":
+					await resumeSubagentsTool.handle(cline, block as ToolUse<"resume_subagents">, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
 				case "apply_diff":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await applyDiffToolClass.handle(cline, block as ToolUse<"apply_diff">, {
 						askApproval,
@@ -813,6 +788,10 @@ export async function presentAssistantMessage(cline: Task) {
 					break
 				case "edit":
 				case "search_and_replace":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await editTool.handle(cline, block as ToolUse<"edit">, {
 						askApproval,
@@ -821,6 +800,10 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 					break
 				case "search_replace":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await searchReplaceTool.handle(cline, block as ToolUse<"search_replace">, {
 						askApproval,
@@ -829,6 +812,10 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 					break
 				case "multi_edit":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await multiEditTool.handle(cline, block as ToolUse<"multi_edit">, {
 						askApproval,
@@ -837,6 +824,10 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 					break
 				case "edit_file":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await editFileTool.handle(cline, block as ToolUse<"edit_file">, {
 						askApproval,
@@ -845,6 +836,10 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 					break
 				case "apply_patch":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await applyPatchTool.handle(cline, block as ToolUse<"apply_patch">, {
 						askApproval,
@@ -898,6 +893,10 @@ export async function presentAssistantMessage(cline: Task) {
 					)
 					break
 				case "execute_command":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await executeCommandTool.handle(cline, block as ToolUse<"execute_command">, {
 						askApproval,
 						handleError,
@@ -933,6 +932,10 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 					break
 				case "edit_notebook":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await editNotebookTool.handle(cline, block as ToolUse<"edit_notebook">, {
 						askApproval,
@@ -1033,6 +1036,10 @@ export async function presentAssistantMessage(cline: Task) {
 					})
 					break
 				case "generate_image":
+					if (!cline.isRefineMode) {
+						await cline.clearRefineResumeState()
+						await cline.clearSubagentResumeState()
+					}
 					await checkpointSaveAndMark(cline)
 					await generateImageTool.handle(cline, block as ToolUse<"generate_image">, {
 						askApproval,

@@ -78,6 +78,20 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				status: normalizeStatus(t.status),
 				...(t.context?.trim() ? { context: t.context.trim() } : {}),
 			}))
+			const refineCompletionError =
+				"Refine mode cannot be completed by marking every todo item as completed. Rewrite the todo list into pending/in-progress architecture-based implementation groups, then call write_todo_plan for each item. Refine mode exits only after all required write_todo_plan calls are recorded."
+			const isCompletingRefineTodoList = (candidateTodos: TodoItem[]) =>
+				task.isRefineMode &&
+				candidateTodos.length > 0 &&
+				candidateTodos.every((todo) => todo.status === "completed")
+
+			if (isCompletingRefineTodoList(normalizedTodos)) {
+				task.consecutiveMistakeCount++
+				task.recordToolError("update_todo_list")
+				task.didToolFailInCurrentTurn = true
+				pushToolResult(formatResponse.toolError(refineCompletionError))
+				return
+			}
 
 			const approvalMsg = JSON.stringify({
 				tool: "updateTodoList",
@@ -102,6 +116,13 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 						todos: normalizedTodos,
 					}),
 				)
+			}
+			if (isCompletingRefineTodoList(normalizedTodos)) {
+				task.consecutiveMistakeCount++
+				task.recordToolError("update_todo_list")
+				task.didToolFailInCurrentTurn = true
+				pushToolResult(formatResponse.toolError(refineCompletionError))
+				return
 			}
 
 			// Track the "active item" — the item currently being worked on.
@@ -201,10 +222,7 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 					.filter((todo) => todo.status !== "completed")
 					.map((todo) => todo.id)
 				task.activeRefineTodoItemIds = unfinishedRefineTodoIds.length > 0 ? unfinishedRefineTodoIds : null
-				if (unfinishedRefineTodoIds.length === 0) {
-					task.isRefineMode = false
-					task.postRefineDividerPending = true
-				}
+				await task.persistRefineResumeState(unfinishedRefineTodoIds)
 
 				// Notify webview so it can switch from global to per-item refine indicators
 				const provider = task.providerRef.deref()
@@ -214,6 +232,9 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 						refiningTodoItemIds: unfinishedRefineTodoIds,
 					})
 				}
+			} else {
+				await task.clearRefineResumeState()
+				await task.clearSubagentResumeState()
 			}
 
 			// Task lock: establishing a task unlocks all tools for subsequent API calls
@@ -221,9 +242,10 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 
 			// Check if all todos are completed
 			const allCompleted = normalizedTodos.length > 0 && normalizedTodos.every((t) => t.status === "completed")
-			const completionHint = allCompleted
-				? "\n\nAll tasks are now completed. If the user has given you a new request, call update_todo_list to create a new task list. Otherwise, call attempt_completion to present the final result."
-				: ""
+			const completionHint =
+				allCompleted && !task.isRefineMode
+					? "\n\nAll tasks are now completed. If the user has given you a new request, call update_todo_list to create a new task list. Otherwise, call attempt_completion to present the final result."
+					: ""
 			const todosWithIds = todoListToMarkdown(normalizedTodos, true)
 
 			if (isTodoListChanged) {

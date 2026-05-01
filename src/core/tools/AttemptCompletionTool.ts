@@ -30,6 +30,18 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 		const { result } = params
 		const { handleError, pushToolResult } = callbacks
 
+		if (task.isRefineMode || task.subagentsPending) {
+			task.consecutiveMistakeCount++
+			task.recordToolError("attempt_completion")
+			task.didToolFailInCurrentTurn = true
+			pushToolResult(
+				formatResponse.toolError(
+					"Cannot complete the task while refine planning is active or parallel subagent execution is pending. Continue the refine workflow with write_todo_plan; after all plans are recorded, execution starts automatically.",
+				),
+			)
+			return
+		}
+
 		// Prevent attempt_completion if any tool failed in the current turn
 		if (task.didToolFailInCurrentTurn) {
 			const errorMsg = t("common:errors.attempt_completion_tool_failed")
@@ -66,6 +78,8 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 				return
 			}
 
+			await task.clearRefineResumeState()
+			await task.clearSubagentResumeState()
 			task.consecutiveMistakeCount = 0
 
 			await task.say("completion_result", result, undefined, false)
@@ -128,6 +142,10 @@ export class AttemptCompletionTool extends BaseTool<"attempt_completion"> {
 	}
 
 	override async handlePartial(task: Task, block: ToolUse<"attempt_completion">): Promise<void> {
+		if (task.isRefineMode || task.subagentsPending) {
+			return
+		}
+
 		const result: string | undefined = block.params.result
 		const command: string | undefined = block.params.command
 

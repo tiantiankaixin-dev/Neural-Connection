@@ -30,9 +30,25 @@ export interface PlanSaveResult {
 	savedPaths: string[]
 }
 
+export interface PlanFileAgreement {
+	plan_target_path: string
+	content: string
+}
+
+const PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE = "### Cross-Task Agreements Owned By This File"
+
 interface ParsedPlanTargetHeader {
 	action: PlanTargetAction
 	path: string
+}
+
+interface ParsedPlanAgreementItem {
+	text: string
+	sharedWith: string[]
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 /**
@@ -97,14 +113,37 @@ function looksLikeProjectFilePath(value: string): boolean {
 	return /^[^\s]+\.[A-Za-z0-9_-]{1,12}$/.test(trimmed)
 }
 
-export function normalizeStructuredPlanEntry(planType: PlanType, entry: StructuredPlanEntry): StructuredPlanEntry {
-	const normalizedTarget =
-		planType === "file" ? entry.target.trim().replace(/\\/g, "/").replace(/\/+/g, "/") : entry.target.trim()
+function inferGeneralPlanTarget(body: string): string {
+	const heading = body.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/m)?.[1]?.trim()
+	return heading?.replace(/\s+#+$/, "").trim() ?? ""
+}
+
+function normalizePlanTarget(planType: PlanType, target: unknown, body: string): string {
+	const rawTarget = typeof target === "string" ? target.trim() : ""
+	if (planType === "file") {
+		return rawTarget.replace(/\\/g, "/").replace(/\/+/g, "/")
+	}
+	return rawTarget || inferGeneralPlanTarget(body)
+}
+
+function normalizePlanAction(planType: PlanType, action: unknown): PlanTargetAction {
+	const rawAction = typeof action === "string" ? action.trim().toUpperCase() : ""
+	if (rawAction === "CREATE" || rawAction === "MODIFY" || rawAction === "DELETE" || rawAction === "GENERAL") {
+		return rawAction
+	}
+	return planType === "general" ? "GENERAL" : ("" as PlanTargetAction)
+}
+
+export function normalizeStructuredPlanEntry(
+	planType: PlanType,
+	entry: Partial<StructuredPlanEntry>,
+): StructuredPlanEntry {
+	const body = typeof entry?.body === "string" ? entry.body.trim() : ""
 
 	return {
-		target: normalizedTarget,
-		action: entry.action,
-		body: entry.body.trim(),
+		target: normalizePlanTarget(planType, entry?.target, body),
+		action: normalizePlanAction(planType, entry?.action),
+		body,
 	}
 }
 
@@ -316,6 +355,211 @@ async function collectMarkdownPlanFiles(directory: string): Promise<string[]> {
 	return files
 }
 
+async function collectMatchingPlanMarkdownFiles(
+	globalStoragePath: string,
+	taskId: string,
+	taskTimestamp: string | undefined,
+	todoItemId: string,
+	todoContent?: string,
+): Promise<string[]> {
+	const matchesById: string[] = []
+	const matchesByContent: string[] = []
+	const directoriesToScan: string[] = []
+
+	if (taskTimestamp) {
+		directoriesToScan.push(await getTaskOptimizeTimestampPath(globalStoragePath, taskId, taskTimestamp))
+	}
+
+	const legacyOptimizeDir = await getTaskOptimizePath(globalStoragePath, taskId)
+	if (!directoriesToScan.includes(legacyOptimizeDir)) {
+		directoriesToScan.push(legacyOptimizeDir)
+	}
+
+	const visitedFiles = new Set<string>()
+	for (const optimizeDir of directoriesToScan) {
+		for (const filePath of await collectMarkdownPlanFiles(optimizeDir)) {
+			if (visitedFiles.has(filePath)) {
+				continue
+			}
+			visitedFiles.add(filePath)
+
+			const raw = await fs.readFile(filePath, "utf8")
+			const idMatch = raw.match(/<!-- todoItemId: (.+?) -->/)
+			const headingMatch = raw.match(/^# (.+)$/m)
+			const matchesId = !!idMatch && idMatch[1] === todoItemId
+			const matchesContent = !!todoContent && headingMatch?.[1]?.trim() === todoContent
+			if (!matchesId && !matchesContent) {
+				continue
+			}
+
+			if (matchesId) {
+				matchesById.push(filePath)
+			} else {
+				matchesByContent.push(filePath)
+			}
+		}
+	}
+
+	return matchesById.length > 0 ? matchesById : matchesByContent
+}
+
+function parsePlanAgreementTargets(value: string): string[] {
+	const targets: string[] = []
+	const seen = new Set<string>()
+	for (const rawTarget of value.split(",")) {
+		const target = rawTarget
+			.trim()
+			.replace(/^`|`$/g, "")
+			.replace(/^["']|["']$/g, "")
+		if (!target || seen.has(target)) {
+			continue
+		}
+		seen.add(target)
+		targets.push(target)
+	}
+	return targets
+}
+
+function mergePlanAgreementItem(items: ParsedPlanAgreementItem[], item: ParsedPlanAgreementItem): void {
+	const text = item.text.trim()
+	if (!text) {
+		return
+	}
+	const existing = items.find((entry) => entry.text === text)
+	if (!existing) {
+		items.push({
+			text,
+			sharedWith: parsePlanAgreementTargets(item.sharedWith.join(",")),
+		})
+		return
+	}
+
+	const seen = new Set(existing.sharedWith)
+	for (const target of item.sharedWith) {
+		if (!target || seen.has(target)) {
+			continue
+		}
+		seen.add(target)
+		existing.sharedWith.push(target)
+	}
+}
+
+function parsePlanAgreementContent(content: string): ParsedPlanAgreementItem[] {
+	const items: ParsedPlanAgreementItem[] = []
+	let current: ParsedPlanAgreementItem | undefined
+	const body = content
+		.trim()
+		.replace(new RegExp(`^${escapeRegExp(PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE)}\\r?\\n?`), "")
+
+	for (const line of body.split(/\r?\n/)) {
+		const sharedWithMatch = line.match(/^\s+[-*]\s+Shared with:\s*(.+?)\s*$/i)
+		if (sharedWithMatch && current) {
+			current.sharedWith = parsePlanAgreementTargets([...current.sharedWith, sharedWithMatch[1] ?? ""].join(","))
+			continue
+		}
+
+		const agreementMatch = line.match(/^\s*[-*]\s+(.+?)\s*$/)
+		if (!agreementMatch) {
+			continue
+		}
+
+		const text = (agreementMatch[1] ?? "").trim()
+		if (!text || /^Shared with:/i.test(text)) {
+			continue
+		}
+
+		current = { text, sharedWith: [] }
+		mergePlanAgreementItem(items, current)
+		current = items.find((entry) => entry.text === text)
+	}
+
+	return items
+}
+
+function formatPlanAgreementContent(items: ParsedPlanAgreementItem[]): string {
+	const lines: string[] = [PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE]
+	for (const item of items) {
+		lines.push(`- ${item.text}`)
+		if (item.sharedWith.length > 0) {
+			lines.push(`  - Shared with: ${item.sharedWith.map((target) => `\`${target}\``).join(", ")}`)
+		}
+	}
+	return lines.join("\n")
+}
+
+function appendFileAgreementToPlanMarkdown(
+	raw: string,
+	planTargetPath: string,
+	content: string,
+): {
+	matchedSection: boolean
+	appended: boolean
+	updated: string
+} {
+	const trimmedTarget = planTargetPath.trim()
+	const trimmedContent = content.trim()
+	if (!trimmedTarget || !trimmedContent) {
+		return {
+			matchedSection: false,
+			appended: false,
+			updated: raw,
+		}
+	}
+
+	const sectionRegex = new RegExp(
+		`(^## ${escapeRegExp(trimmedTarget)}\\r?\\n)([\\s\\S]*?)(\\r?\\n---(?:\\r?\\n|$))`,
+		"m",
+	)
+	const match = raw.match(sectionRegex)
+	if (!match) {
+		return {
+			matchedSection: false,
+			appended: false,
+			updated: raw,
+		}
+	}
+
+	const [, header, body, suffix] = match
+	const existingAgreementSectionRegex = new RegExp(
+		`\\n*${escapeRegExp(PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE)}\\r?\\n[\\s\\S]*$`,
+	)
+	const existingAgreementContent = body.match(existingAgreementSectionRegex)?.[0]?.trim() ?? ""
+	const mergedAgreementItems: ParsedPlanAgreementItem[] = []
+	for (const item of parsePlanAgreementContent(existingAgreementContent)) {
+		mergePlanAgreementItem(mergedAgreementItems, item)
+	}
+	for (const item of parsePlanAgreementContent(trimmedContent)) {
+		mergePlanAgreementItem(mergedAgreementItems, item)
+	}
+	if (mergedAgreementItems.length === 0) {
+		return {
+			matchedSection: true,
+			appended: false,
+			updated: raw,
+		}
+	}
+	const nextAgreementContent = formatPlanAgreementContent(mergedAgreementItems)
+	const previousAgreementContent = existingAgreementContent
+		? formatPlanAgreementContent(parsePlanAgreementContent(existingAgreementContent))
+		: ""
+	if (nextAgreementContent.trim() === previousAgreementContent.trim()) {
+		return {
+			matchedSection: true,
+			appended: false,
+			updated: raw,
+		}
+	}
+
+	const baseBody = body.replace(existingAgreementSectionRegex, "").trimEnd()
+	const nextBody = baseBody.length > 0 ? `${baseBody}\n\n${nextAgreementContent}\n` : `${nextAgreementContent}\n`
+
+	return {
+		matchedSection: true,
+		appended: true,
+		updated: raw.replace(sectionRegex, () => `${header}${nextBody}${suffix}`),
+	}
+}
+
 /**
  * Save refine plans for a todo item.
  *
@@ -466,6 +710,58 @@ export async function readPlanFiles(
 		return { plans: resultsById, contexts: contextsById }
 	}
 	return { plans: fallbackResultsByContent, contexts: contextsByContent }
+}
+
+export async function appendFileAgreementsToPlanFiles(
+	globalStoragePath: string,
+	taskId: string,
+	taskTimestamp: string | undefined,
+	todoItemId: string,
+	agreements: PlanFileAgreement[],
+	todoContent?: string,
+): Promise<number> {
+	const normalizedAgreements = agreements
+		.map((agreement) => ({
+			plan_target_path: agreement.plan_target_path.trim(),
+			content: agreement.content.trim(),
+		}))
+		.filter((agreement) => agreement.plan_target_path.length > 0 && agreement.content.length > 0)
+
+	if (normalizedAgreements.length === 0) {
+		return 0
+	}
+
+	const planFilePaths = await collectMatchingPlanMarkdownFiles(
+		globalStoragePath,
+		taskId,
+		taskTimestamp,
+		todoItemId,
+		todoContent,
+	)
+	if (planFilePaths.length === 0) {
+		return 0
+	}
+
+	const fileCache = new Map<string, string>()
+	let appendedCount = 0
+
+	for (const agreement of normalizedAgreements) {
+		for (const planFilePath of planFilePaths) {
+			const raw = fileCache.get(planFilePath) ?? (await fs.readFile(planFilePath, "utf8"))
+			const result = appendFileAgreementToPlanMarkdown(raw, agreement.plan_target_path, agreement.content)
+			fileCache.set(planFilePath, result.updated)
+			if (!result.matchedSection) {
+				continue
+			}
+
+			if (result.appended) {
+				await fs.writeFile(planFilePath, result.updated, "utf8")
+				appendedCount++
+			}
+		}
+	}
+
+	return appendedCount
 }
 
 /**

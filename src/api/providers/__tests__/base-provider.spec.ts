@@ -31,6 +31,14 @@ class TestProvider extends BaseProvider {
 	public testConvertToolsForOpenAI(tools: any[] | undefined): any[] | undefined {
 		return this.convertToolsForOpenAI(tools)
 	}
+
+	public testConvertToolSchemaForGoogle(schema: any): any {
+		return this.convertToolSchemaForGoogle(schema)
+	}
+
+	public testConvertToolsForGoogle(tools: any[] | undefined): any[] | undefined {
+		return this.convertToolsForGoogle(tools)
+	}
 }
 
 describe("BaseProvider", () => {
@@ -299,6 +307,99 @@ describe("BaseProvider", () => {
 			const result = provider.testConvertToolsForOpenAI(tools)
 
 			expect(result?.[0]).toEqual(tools[0])
+		})
+	})
+
+	describe("convertToolSchemaForGoogle", () => {
+		it("should convert nullable array properties to optional array schemas", () => {
+			const schema = {
+				type: "object",
+				properties: {
+					path: { type: "string" },
+					extensions: {
+						type: ["array", "null"],
+						items: { type: "string" },
+					},
+				},
+				required: ["path", "extensions"],
+				additionalProperties: false,
+			}
+
+			const result = provider.testConvertToolSchemaForGoogle(schema)
+
+			expect(result.properties.extensions).toEqual({
+				type: "array",
+				items: { type: "string" },
+			})
+			expect(result.required).toEqual(["path"])
+		})
+
+		it("should convert nullable string enum properties to optional string enum schemas", () => {
+			const schema = {
+				type: "object",
+				properties: {
+					type: {
+						type: ["string", "null"],
+						enum: ["file", "directory", "any", null],
+					},
+				},
+				required: ["type"],
+				additionalProperties: false,
+			}
+
+			const result = provider.testConvertToolSchemaForGoogle(schema)
+
+			expect(result.properties.type).toEqual({
+				type: "string",
+				enum: ["file", "directory", "any"],
+			})
+			expect(result.required).toBeUndefined()
+		})
+	})
+
+	describe("convertToolsForGoogle", () => {
+		it("should convert nullable strict tool properties for Google providers", () => {
+			const tools = [
+				{
+					type: "function",
+					function: {
+						name: "find_by_name",
+						description: "Find by name",
+						strict: true,
+						parameters: {
+							type: "object",
+							properties: {
+								path: { type: "string" },
+								pattern: { type: "string" },
+								extensions: {
+									type: ["array", "null"],
+									items: { type: "string" },
+								},
+								type: {
+									type: ["string", "null"],
+									enum: ["file", "directory", "any", null],
+								},
+							},
+							required: ["path", "pattern", "extensions", "type"],
+							additionalProperties: false,
+						},
+					},
+				},
+			]
+
+			const result = provider.testConvertToolsForGoogle(tools)
+			const parameters = result?.[0].function.parameters
+
+			expect(result?.[0].function.strict).toBe(false)
+			expect(parameters.required).toEqual(["path", "pattern"])
+			expect(parameters.properties.extensions).toEqual({
+				type: "array",
+				items: { type: "string" },
+			})
+			expect(parameters.properties.type).toEqual({
+				type: "string",
+				enum: ["file", "directory", "any"],
+			})
 		})
 	})
 })

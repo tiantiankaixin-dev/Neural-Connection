@@ -52,6 +52,7 @@ export const toolNames = [
 	"read_url_content",
 	"search_web",
 	"recall_memory",
+	"resume_subagents",
 ] as const
 
 export const toolNamesSchema = z.enum(toolNames)

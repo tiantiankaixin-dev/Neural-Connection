@@ -73,8 +73,14 @@ async function generatePrompt(
 	const codeIndexManager = CodeIndexManager.getInstance(context, cwd)
 
 	// DEBUG: Verify RAG system state when system prompt is generated
-	const codeIndexEnabled = !!(codeIndexManager?.isFeatureEnabled && codeIndexManager?.isFeatureConfigured && codeIndexManager?.isInitialized)
-	console.log(`[SYSTEM_PROMPT DEBUG] cwd=${cwd}, codeIndexManager exists=${!!codeIndexManager}, enabled=${codeIndexManager?.isFeatureEnabled}, configured=${codeIndexManager?.isFeatureConfigured}, initialized=${codeIndexManager?.isInitialized}, => RAG section included: ${codeIndexEnabled}`)
+	const codeIndexEnabled = !!(
+		codeIndexManager?.isFeatureEnabled &&
+		codeIndexManager?.isFeatureConfigured &&
+		codeIndexManager?.isInitialized
+	)
+	console.log(
+		`[SYSTEM_PROMPT DEBUG] cwd=${cwd}, codeIndexManager exists=${!!codeIndexManager}, enabled=${codeIndexManager?.isFeatureEnabled}, configured=${codeIndexManager?.isFeatureConfigured}, initialized=${codeIndexManager?.isInitialized}, => RAG section included: ${codeIndexEnabled}`,
+	)
 
 	// Tool calling is native-only.
 	const effectiveProtocol = "native"
@@ -103,7 +109,7 @@ ${getRulesSection(cwd, settings)}
 
 ${getSystemInfoSection(cwd)}
 
-${getObjectiveSection()}
+${getObjectiveSection({ suppressCompletionInstructions: settings?.suppressCompletionInstructions })}
 
 ${await addCustomInstructions(baseInstructions, globalCustomInstructions || "", cwd, mode, {
 	language: language ?? formatLanguage(vscode.env.language),

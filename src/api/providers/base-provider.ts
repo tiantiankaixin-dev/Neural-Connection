@@ -114,6 +114,185 @@ export abstract class BaseProvider implements ApiHandler {
 		return result
 	}
 
+	protected convertToolsForGoogle(tools: any[] | undefined): any[] | undefined {
+		if (!tools) {
+			return undefined
+		}
+
+		return tools.map((tool) => {
+			if (tool.type !== "function") {
+				return tool
+			}
+
+			return {
+				...tool,
+				function: {
+					...tool.function,
+					strict: false,
+					parameters: this.convertToolSchemaForGoogle(tool.function.parameters),
+				},
+			}
+		})
+	}
+
+	protected convertToolSchemaForGoogle(schema: any): any {
+		return this.convertNullableToolSchemaForGoogle(schema).schema
+	}
+
+	private convertNullableToolSchemaForGoogle(schema: any): { schema: any; nullable: boolean } {
+		if (!schema || typeof schema !== "object") {
+			return { schema, nullable: false }
+		}
+
+		if (Array.isArray(schema)) {
+			return {
+				schema: schema.map((item) => this.convertNullableToolSchemaForGoogle(item).schema),
+				nullable: false,
+			}
+		}
+
+		const {
+			type,
+			properties,
+			items,
+			required,
+			enum: enumValues,
+			const: constValue,
+			anyOf,
+			oneOf,
+			allOf,
+			...rest
+		} = schema
+		const result: any = { ...rest }
+		let nullable = type === "null" || (Array.isArray(type) && type.includes("null"))
+		let convertedItems: any
+		let convertedProperties: Record<string, any> | undefined
+		const nullableProperties = new Set<string>()
+
+		if (items !== undefined) {
+			convertedItems = this.convertNullableToolSchemaForGoogle(items).schema
+		}
+
+		if (properties && typeof properties === "object" && !Array.isArray(properties)) {
+			convertedProperties = {}
+
+			for (const [key, propertySchema] of Object.entries(properties)) {
+				const convertedProperty = this.convertNullableToolSchemaForGoogle(propertySchema)
+				convertedProperties[key] = convertedProperty.schema
+
+				if (convertedProperty.nullable) {
+					nullableProperties.add(key)
+				}
+			}
+
+			result.properties = convertedProperties
+		}
+
+		const nonNullTypes = Array.isArray(type)
+			? type.filter((schemaType) => schemaType !== "null")
+			: type === undefined || type === "null"
+				? []
+				: [type]
+
+		if (nonNullTypes.length === 1) {
+			result.type = nonNullTypes[0]
+		} else if (nonNullTypes.length > 1) {
+			result.anyOf = nonNullTypes.map((schemaType) => {
+				const branch: any = { type: schemaType }
+
+				if (schemaType === "array" && convertedItems !== undefined) {
+					branch.items = convertedItems
+				}
+
+				if (schemaType === "object" && convertedProperties) {
+					branch.properties = convertedProperties
+				}
+
+				return branch
+			})
+		}
+
+		if (convertedItems !== undefined && result.type === "array") {
+			result.items = convertedItems
+		}
+
+		const applyComposition = (key: "anyOf" | "oneOf" | "allOf", value: unknown) => {
+			if (!Array.isArray(value)) {
+				return
+			}
+
+			const converted = value.map((entry) => this.convertNullableToolSchemaForGoogle(entry))
+			const nonNullSchemas = converted
+				.filter(
+					(entry) =>
+						!(
+							entry.nullable &&
+							entry.schema &&
+							typeof entry.schema === "object" &&
+							!Array.isArray(entry.schema) &&
+							Object.keys(entry.schema).length === 0
+						),
+				)
+				.map((entry) => entry.schema)
+
+			if (converted.some((entry) => entry.nullable)) {
+				nullable = true
+			}
+
+			if (nonNullSchemas.length === 1 && !result.type && !result.anyOf && !result.oneOf && !result.allOf) {
+				Object.assign(result, nonNullSchemas[0])
+			} else if (nonNullSchemas.length > 1) {
+				result[key] = nonNullSchemas
+			}
+		}
+
+		applyComposition("anyOf", anyOf)
+		applyComposition("oneOf", oneOf)
+		applyComposition("allOf", allOf)
+
+		if (Array.isArray(enumValues)) {
+			const filteredEnumValues = enumValues.filter((value) => value !== null)
+
+			if (filteredEnumValues.length !== enumValues.length) {
+				nullable = true
+			}
+
+			if (filteredEnumValues.length > 0 && filteredEnumValues.every((value) => typeof value === "string")) {
+				if (!result.type) {
+					result.type = "string"
+				}
+
+				if (result.type === "string") {
+					result.enum = filteredEnumValues
+				}
+			}
+		}
+
+		if (constValue !== undefined) {
+			if (constValue === null) {
+				nullable = true
+			} else if (typeof constValue === "string") {
+				if (!result.type) {
+					result.type = "string"
+				}
+
+				if (result.type === "string") {
+					result.enum = [constValue]
+				}
+			}
+		}
+
+		if (Array.isArray(required)) {
+			const filteredRequired = required.filter((key) => !nullableProperties.has(key))
+
+			if (filteredRequired.length > 0) {
+				result.required = filteredRequired
+			}
+		}
+
+		return { schema: result, nullable }
+	}
+
 	/**
 	 * Default token counting implementation using tiktoken.
 	 * Providers can override this to use their native token counting endpoints.

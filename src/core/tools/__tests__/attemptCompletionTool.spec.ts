@@ -105,6 +105,68 @@ describe("attemptCompletionTool", () => {
 		}
 	})
 
+	describe("refine workflow validation", () => {
+		it("should prevent completion while refine mode is active", async () => {
+			const block: AttemptCompletionToolUse = {
+				type: "tool_use",
+				name: "attempt_completion",
+				params: { result: "Task completed successfully" },
+				nativeArgs: { result: "Task completed successfully" },
+				partial: false,
+			}
+
+			mockTask.isRefineMode = true
+
+			const callbacks: AttemptCompletionCallbacks = {
+				askApproval: mockAskApproval,
+				handleError: mockHandleError,
+				pushToolResult: mockPushToolResult,
+				askFinishSubTaskApproval: mockAskFinishSubTaskApproval,
+				toolDescription: mockToolDescription,
+			}
+
+			await attemptCompletionTool.handle(mockTask as Task, block, callbacks)
+
+			expect(mockTask.consecutiveMistakeCount).toBe(1)
+			expect(mockTask.recordToolError).toHaveBeenCalledWith("attempt_completion")
+			expect(mockTask.didToolFailInCurrentTurn).toBe(true)
+			expect(mockPushToolResult).toHaveBeenCalledWith(
+				expect.stringContaining("Cannot complete the task while refine planning is active"),
+			)
+			expect(mockTask.emit).not.toHaveBeenCalled()
+		})
+
+		it("should prevent completion while parallel subagent execution is pending", async () => {
+			const block: AttemptCompletionToolUse = {
+				type: "tool_use",
+				name: "attempt_completion",
+				params: { result: "Task completed successfully" },
+				nativeArgs: { result: "Task completed successfully" },
+				partial: false,
+			}
+
+			mockTask.subagentsPending = true
+
+			const callbacks: AttemptCompletionCallbacks = {
+				askApproval: mockAskApproval,
+				handleError: mockHandleError,
+				pushToolResult: mockPushToolResult,
+				askFinishSubTaskApproval: mockAskFinishSubTaskApproval,
+				toolDescription: mockToolDescription,
+			}
+
+			await attemptCompletionTool.handle(mockTask as Task, block, callbacks)
+
+			expect(mockTask.consecutiveMistakeCount).toBe(1)
+			expect(mockTask.recordToolError).toHaveBeenCalledWith("attempt_completion")
+			expect(mockTask.didToolFailInCurrentTurn).toBe(true)
+			expect(mockPushToolResult).toHaveBeenCalledWith(
+				expect.stringContaining("parallel subagent execution is pending"),
+			)
+			expect(mockTask.emit).not.toHaveBeenCalled()
+		})
+	})
+
 	describe("todo list validation", () => {
 		it("should allow completion when there is no todo list", async () => {
 			const block: AttemptCompletionToolUse = {

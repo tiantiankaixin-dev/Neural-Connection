@@ -106,8 +106,8 @@ export class VertexHandler extends BaseProvider implements SingleCompletionHandl
 		// Convert messages to AI SDK format
 		const aiSdkMessages = convertToAiSdkMessages(filteredMessages)
 
-		// Convert tools to OpenAI format first, then to AI SDK format
-		let openAiTools = this.convertToolsForOpenAI(metadata?.tools)
+		// Convert tools to Google-compatible format first, then to AI SDK format
+		let openAiTools = this.convertToolsForGoogle(metadata?.tools)
 
 		// Filter tools based on allowedFunctionNames for mode-restricted tool access
 		if (metadata?.allowedFunctionNames && metadata.allowedFunctionNames.length > 0 && openAiTools) {

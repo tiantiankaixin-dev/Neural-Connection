@@ -8,6 +8,7 @@ export interface InspectorLogEntry {
 	type: string
 	summary: string
 	data: any
+	marker?: "subagent"
 }
 
 /**
@@ -27,6 +28,8 @@ export class ContextInspectorPanel {
 	private isReady = false
 	private enabled = true
 	private _captureNextContext = false
+	private subagentNetworkRequestIds = new Set<number>()
+	private pendingSubagentNetworkMarkers: Array<{ subagentId?: string; expiresAt: number }> = []
 
 	private constructor() {}
 
@@ -124,14 +127,20 @@ export class ContextInspectorPanel {
 		modelId?: string
 		provider?: string
 	}): void {
+		const isSubagent = data.metadata?.behaviorRole === "subagent" || !!data.metadata?.subagentId
 		const behaviorRole = data.metadata?.behaviorRole ? ` role=${data.metadata.behaviorRole}` : ""
+		const subagent = data.metadata?.subagentId ? ` subagent=${data.metadata.subagentId}` : ""
+		if (isSubagent) {
+			this.queueSubagentNetworkMarker(data.metadata?.subagentId)
+		}
 		this.addEntry({
 			id: ++this.entryCounter,
 			timestamp: new Date().toISOString(),
 			direction: "ext\u2192api",
-			type: "CAPTURED CONTEXT",
-			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"}${behaviorRole} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
+			type: isSubagent ? "SUBAGENT CONTEXT" : "CAPTURED CONTEXT",
+			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"}${behaviorRole}${subagent} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
 			data,
+			marker: isSubagent ? "subagent" : undefined,
 		})
 		if (this.panel) {
 			this.panel.webview.postMessage({ type: "contextCaptured" })
@@ -152,6 +161,10 @@ export class ContextInspectorPanel {
 		startTime: number
 	}): void {
 		if (!this.enabled) return
+		const isSubagent = this.isSubagentNetworkRequest(entry) || !!this.consumeSubagentNetworkMarker()
+		if (isSubagent) {
+			this.subagentNetworkRequestIds.add(entry.requestId)
+		}
 		const bodyLen = entry.requestBody?.length ?? 0
 		let bodyPreview = ""
 		try {
@@ -176,6 +189,7 @@ export class ContextInspectorPanel {
 				headers: entry.headers,
 				requestBody: this.safeParseJson(entry.requestBody),
 			},
+			marker: isSubagent ? "subagent" : undefined,
 		})
 	}
 
@@ -193,6 +207,8 @@ export class ContextInspectorPanel {
 		endTime?: number
 	}): void {
 		if (!this.enabled) return
+		const isSubagent = this.subagentNetworkRequestIds.has(entry.requestId)
+		this.subagentNetworkRequestIds.delete(entry.requestId)
 		const duration = entry.endTime ? entry.endTime - entry.startTime : 0
 		const bodyLen = entry.responseBody?.length ?? 0
 		this.addEntry({
@@ -209,6 +225,7 @@ export class ContextInspectorPanel {
 				responseHeaders: entry.responseHeaders,
 				responseBody: this.safeParseJson(entry.responseBody ?? ""),
 			},
+			marker: isSubagent ? "subagent" : undefined,
 		})
 	}
 
@@ -224,6 +241,8 @@ export class ContextInspectorPanel {
 		endTime?: number
 	}): void {
 		if (!this.enabled) return
+		const isSubagent = this.subagentNetworkRequestIds.has(entry.requestId)
+		this.subagentNetworkRequestIds.delete(entry.requestId)
 		this.addEntry({
 			id: ++this.entryCounter,
 			timestamp: new Date().toISOString(),
@@ -231,6 +250,7 @@ export class ContextInspectorPanel {
 			type: "ERROR",
 			summary: `${entry.method} ${entry.url} — ${entry.error ?? "unknown error"}`,
 			data: entry,
+			marker: isSubagent ? "subagent" : undefined,
 		})
 	}
 
@@ -268,14 +288,20 @@ export class ContextInspectorPanel {
 		provider?: string
 	}): void {
 		if (!this.enabled) return
+		const isSubagent = data.metadata?.behaviorRole === "subagent" || !!data.metadata?.subagentId
 		const behaviorRole = data.metadata?.behaviorRole ? ` role=${data.metadata.behaviorRole}` : ""
+		const subagent = data.metadata?.subagentId ? ` subagent=${data.metadata.subagentId}` : ""
+		if (isSubagent) {
+			this.queueSubagentNetworkMarker(data.metadata?.subagentId)
+		}
 		this.addEntry({
 			id: ++this.entryCounter,
 			timestamp: new Date().toISOString(),
 			direction: "ext→api",
-			type: "createMessage",
-			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"}${behaviorRole} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
+			type: isSubagent ? "subagent.createMessage" : "createMessage",
+			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"}${behaviorRole}${subagent} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
 			data,
+			marker: isSubagent ? "subagent" : undefined,
 		})
 	}
 
@@ -299,6 +325,45 @@ export class ContextInspectorPanel {
 		} catch {
 			return str
 		}
+	}
+
+	private isSubagentNetworkRequest(entry: { headers?: Record<string, any>; requestBody?: string }): boolean {
+		const headers = entry.headers ?? {}
+		const getHeader = (name: string): string => {
+			const value = Object.entries(headers).find(([key]) => key.toLowerCase() === name)?.[1]
+			return Array.isArray(value) ? value.join(" ") : String(value ?? "")
+		}
+		const taskHeaders = [getHeader("session_id"), getHeader("x-roo-task-id"), getHeader("trace_id")]
+		if (taskHeaders.some((value) => value.includes(":"))) {
+			return true
+		}
+		const requestBody = entry.requestBody ?? ""
+		if (requestBody.includes('"behaviorRole":"subagent"') || requestBody.includes('"subagentId"')) {
+			return true
+		}
+		try {
+			const parsed = JSON.parse(requestBody)
+			const metadata = parsed?.metadata ?? parsed?.extra_body?.metadata ?? parsed?.extraBody?.metadata
+			return metadata?.behaviorRole === "subagent" || typeof metadata?.subagentId === "string"
+		} catch {
+			return false
+		}
+	}
+
+	private queueSubagentNetworkMarker(subagentId?: string): void {
+		const now = Date.now()
+		this.pendingSubagentNetworkMarkers = this.pendingSubagentNetworkMarkers.filter(
+			(marker) => marker.expiresAt > now,
+		)
+		this.pendingSubagentNetworkMarkers.push({ subagentId, expiresAt: now + 10_000 })
+	}
+
+	private consumeSubagentNetworkMarker(): { subagentId?: string; expiresAt: number } | undefined {
+		const now = Date.now()
+		this.pendingSubagentNetworkMarkers = this.pendingSubagentNetworkMarkers.filter(
+			(marker) => marker.expiresAt > now,
+		)
+		return this.pendingSubagentNetworkMarkers.shift()
 	}
 
 	private addEntry(entry: InspectorLogEntry): void {
@@ -383,6 +448,7 @@ export class ContextInspectorPanel {
 			--c-wv-ext: #dcdcaa;
 			--c-ext-api: #569cd6;
 			--c-api-ext: #c586c0;
+			--c-subagent: #4ec9b0;
 		}
 		* { box-sizing: border-box; margin: 0; padding: 0; }
 		body {
@@ -471,6 +537,14 @@ export class ContextInspectorPanel {
 		}
 		.log-entry:hover { background: var(--hover); }
 		.log-entry.expanded { background: var(--hover); }
+		.log-entry.subagent {
+			border-left: 3px solid var(--c-subagent);
+			background: rgba(78,201,176,0.06);
+		}
+		.log-entry.subagent .msg-type,
+		.log-entry.subagent .summary {
+			color: var(--c-subagent);
+		}
 		.log-entry .copy-btn {
 			background: transparent; border: 1px solid #555; color: #aaa; font-size: 10px;
 			padding: 1px 5px; border-radius: 3px; cursor: pointer; flex-shrink: 0; margin-right: 2px;
@@ -494,6 +568,7 @@ export class ContextInspectorPanel {
 		.badge.wv-ext   { background: rgba(220,220,170,0.15); color: var(--c-wv-ext); }
 		.badge.ext-api  { background: rgba(86,156,214,0.15);  color: var(--c-ext-api); }
 		.badge.api-ext  { background: rgba(197,134,192,0.15); color: var(--c-api-ext); }
+		.badge.subagent { background: rgba(78,201,176,0.18); color: var(--c-subagent); }
 		.log-entry .msg-type { color: var(--accent); min-width: 60px; flex-shrink: 0; }
 		.log-entry .summary { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 		.detail-pane {
@@ -611,6 +686,10 @@ export class ContextInspectorPanel {
 			return m[dir] || '';
 		}
 
+		function markerClass(entry) {
+			return entry && entry.marker === 'subagent' ? ' subagent' : '';
+		}
+
 		function matchesFilter(entry) {
 			if (!activeFilters.has(entry.direction)) return false;
 			const q = searchInput.value.toLowerCase();
@@ -643,13 +722,14 @@ export class ContextInspectorPanel {
 
 		function createEntryEl(entry) {
 			const row = document.createElement('div');
-			row.className = 'log-entry';
+			row.className = 'log-entry' + markerClass(entry);
 			row.setAttribute('data-id', entry.id);
+			const badgeClassName = entry.marker === 'subagent' ? 'subagent' : badgeClass(entry.direction);
 			row.innerHTML =
 				'<button class="copy-btn" title="Copy JSON">Copy</button>' +
 				'<span class="seq">#' + entry.id + '</span>' +
 				'<span class="time">' + formatTime(entry.timestamp) + '</span>' +
-				'<span class="badge ' + badgeClass(entry.direction) + '">' + escapeHtml(entry.direction) + '</span>' +
+				'<span class="badge ' + badgeClassName + '">' + escapeHtml(entry.marker === 'subagent' ? 'SUBAGENT' : entry.direction) + '</span>' +
 				'<span class="msg-type">' + escapeHtml(entry.type) + '</span>' +
 				'<span class="summary">' + escapeHtml(entry.summary) + '</span>';
 

@@ -1,0 +1,1176 @@
+{
+  "systemPrompt": "You are a coding subagent responsible for executing one already-assigned task inside a larger workflow.\n\nYour assignment has already been scoped and planned by the parent agent.\nYou are not the planner, coordinator, or user-facing assistant.\nYou are the execution agent for this task.\nYou are a child execution subagent spawned after the parent agent already decomposed and scoped the work.\n\nOperating mode:\n- You are in execution mode, not planning mode.\n- You have exactly one assigned task in this subagent run.\n- Do not orient yourself like a fresh top-level agent. Do not begin by listing workspace directories.\n- The user message is the complete task package for this subagent. Treat it as your entire user-provided context.\n- If a later request includes current execution state, it is only continuation state for this same assigned task after tool feedback or an API interruption.\n- The assigned refined todo item and relevant memories provided to you are the working brief for this run.\n- Treat the todo item's context and relevant memories as authoritative coordination guidance prepared to keep parallel subagents aligned.\n- Your goal is to complete the assigned coding work correctly, efficiently, and strictly within scope.\n\nInstruction priority:\n1. Follow the system prompt.\n2. Follow the assigned refined todo item, its context, and relevant memories.\n3. Follow the existing codebase's established patterns and conventions.\n4. Prefer the smallest correct change set that fully satisfies the assigned work.\n\nCore rules:\n- Use only the tools that are actually provided to you in this session.\n- Do not switch tasks, split into new tasks, or wait for another task. Finish this one assigned task.\n- Avoid rewriting todo lists, plans, coordination notes, or workflow artifacts unless the assigned task explicitly requires it.\n- Ask follow-up questions only when the assigned task cannot proceed safely without clarification.\n- Do not invent files, APIs, library usage, behavior, or code structure. Read first, then change.\n- Read the minimum relevant code needed to remove uncertainty before editing.\n- Do not list workspace directories to understand the project. The parent agent already performed task scoping; your assigned refined todo item is your scope.\n- If the assigned refined todo item names files, symbols, routes, types, or components, go directly to those targets instead of exploring the project tree.\n- If no exact target is named, use one precise file/symbol/content search to locate the change surface, not a directory listing.\n- Focus edits on the assigned refined todo item, its context, and relevant memories.\n- Do not modify unrelated files even if they appear related.\n- Preserve unrelated behavior and existing project architecture unless your assigned task explicitly changes it.\n- Treat tool results from this session as authoritative. Do not wait for extra confirmation after successful tool execution.\n- If implementation reveals a concrete cross-task agreement or mismatch that other tasks may need to honor, report it in attempt_completion with exact names and full shapes/signatures when relevant. The parent agent will handle STEP 3 task-context updates.\n- If the task cannot be completed with the available tools or context, report that in attempt_completion.\n- As soon as the assigned work is complete, call attempt_completion with a concise, factual summary.\n\nExecution workflow:\n1. Understand the assigned refined todo item, its context, and relevant memories.\n2. Go directly to the named targets. Only use targeted read/search when it is necessary to remove uncertainty about the assigned task.\n3. Before editing, check whether the todo item context or relevant memories define any conventions or coordination details your changes must preserve.\n4. Make the required code changes.\n5. Perform lightweight verification when feasible with the available tools.\n6. Immediately call attempt_completion when done or when blocked.\n\nCoordination behavior:\n- Apply only the conventions and coordination details that materially affect your assigned files and task.\n- If todo item context or relevant memories define a convention, follow it even if another local file uses an older pattern, unless the task explicitly requires updating that older pattern.\n- If you discover a likely cross-task mismatch but cannot safely fix it within your assigned task scope, do not guess. Keep your changes locally consistent, then report the mismatch clearly in attempt_completion.\n- If the codebase already establishes a stable convention, match it exactly rather than introducing a parallel convention.\n- Prefer additive compatibility over risky cross-cutting rewrites.\n\nWhen blocked:\n- Do not loop or keep retrying without new information.\n- State the exact blocker.\n- State what you checked.\n- State what additional context, file access, or tool would be required.\n\nattempt_completion must include:\n- what was changed or concluded\n- which files were modified or inspected\n- what verification was performed\n- any concrete shared contract, exact identifier, payload/type/route shape, or cross-task mismatch learned during implementation that other tasks may need to honor\n- any remaining risks, assumptions, cross-task mismatches, or blockers\n\nEnvironment:\n- Project base directory: c:/Users/Lenovo/OneDrive/Desktop/test\n- All file paths must be relative to this directory.\n}",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Subagent execution directive:\nYou are an isolated child execution subagent for exactly one refined todo item.\nThe parent agent has already decomposed and scoped the work.\nThe assigned todo context and plan files are your primary source of truth.\nDo not list workspace directories or inspect the project tree just to orient yourself.\nIf the plan names concrete target files, symbols, routes, types, or components, do not start by reading files just to re-confirm the plan.\nStart from the assigned refined todo item and act directly on the named files, symbols, routes, types, or components.\nOnly read a target file when the edit requires current surrounding text that is not already present in the plan.\nIf the assigned item lacks an exact target, use one precise file/symbol/content search to locate it, then implement immediately.\n\nAssigned refined todo item:\n{\n  \"id\": \"b6217d01a12d3d7c43f99cf70fc84fe9\",\n  \"status\": \"pending\",\n  \"content\": \"前端基础设施层: package.json, src/index.js, src/App.js, src/store/, src/hooks/\",\n  \"context\": \"## 前端基础设施架构  \\n- 使用Create React App初始化项目\\n- 配置Redux Toolkit进行状态管理\\n- 设置React Router路由系统\\n- 集成Tailwind CSS样式框架\\n- 创建基础的项目结构和工具函数\\n\\n<!-- BEGIN_STEP3_FILE_AGREEMENTS -->\\n## Step 3 Cross-Task Agreements By Refine File\\n\\n### Refine file: `backend/package.json`\\n- Project name must be \\\"snake-game-backend\\\" for cross-package references and Docker container naming\\n- Main entry point must be \\\"server.js\\\" for deployment and execution consistency\\n\\n### Refine file: `backend/server.js`\\n- API routes must be mounted at: /api/auth (authentication), /api/game (game), /api/leaderboard (leaderboard)\\n  - Shared with: `backend/routes/auth.js`, `backend/routes/leaderboard.js`\\n- Server must listen on port 3001 by default for frontend and deployment coordination\\n  - Shared with: `frontend/hooks/useSocket.js`\\n- CORS must be configured with whitelist settings for frontend integration\\n  - Shared with: `src/App.js`\\n\\n### Refine file: `backend/config/database.js`\\n- MongoDB connection must use MONGODB_URI environment variable with format \\\"mongodb://localhost:27017/snake-game\\\"\\n  - Shared with: `.env.example`\\n- Redis connection must use REDIS_URL environment variable with format \\\"redis://localhost:6379\\\"\\n  - Shared with: `.env.example`\\n\\n### Refine file: `backend/middleware/auth.js`\\n- JWT token must be extracted from Authorization header with format \\\"Bearer <token>\\\"\\n  - Shared with: `src/App.js`\\n- Authenticated user must be attached to req.user object for route handlers\\n  - Shared with: `backend/routes/auth.js`, `backend/routes/leaderboard.js`\\n- Must return 401 status for unauthenticated requests and 403 for insufficient permissions\\n  - Shared with: `src/App.js`\\n\\n### Refine file: `.env.example`\\n- Environment variable MONGODB_URI=mongodb://localhost:27017/snake-game must be set for database connection\\n  - Shared with: `backend/config/database.js`\\n- Environment variable REDIS_URL=redis://localhost:6379 must be set for Redis connection\\n  - Shared with: `backend/config/database.js`\\n- Environment variable PORT=3001 must be set for server port configuration\\n  - Shared with: `backend/server.js`\\n- Environment variable JWT_SECRET=your-super-secret-jwt-key-here must be set for JWT token signing\\n  - Shared with: `backend/middleware/auth.js`\\n- Environment variable JWT_EXPIRE=7d must be set for JWT token expiration\\n  - Shared with: `backend/middleware/auth.js`\\n- Environment variable FRONTEND_URL=http://localhost:3000 must be set for CORS configuration\\n  - Shared with: `backend/server.js`\\n\\n### Refine file: `backend/models/User.js`\\n- User schema must include fields: username (unique), email (unique), password (encrypted), createdAt, lastLogin, gameStats\\n  - Shared with: `backend/routes/auth.js`, `backend/middleware/auth.js`, `backend/routes/leaderboard.js`\\n- User model must provide `getPublicProfile` method for public user information retrieval\\n  - Shared with: `backend/routes/leaderboard.js`\\n- User model must provide static method `getLeaderboard` for leaderboard queries\\n  - Shared with: `backend/routes/leaderboard.js`\\n\\n### Refine file: `backend/routes/auth.js`\\n- POST /api/auth/register endpoint must accept { username: string, email: string, password: string } request body and return user information with JWT token\\n  - Shared with: `frontend/components/Auth/RegisterForm.js`\\n- POST /api/auth/login endpoint must accept { username/email: string, password: string } request body and return user information with JWT token\\n  - Shared with: `frontend/components/Auth/LoginForm.js`\\n- GET /api/auth/me endpoint must return current authenticated user information using JWT token from Authorization header\\n  - Shared with: `frontend/components/Auth/AuthProvider.js`\\n- POST /api/auth/logout endpoint must handle token invalidation\\n  - Shared with: `frontend/components/Auth/AuthProvider.js`\\n- POST /api/auth/refresh endpoint must handle JWT token refresh\\n  - Shared with: `frontend/components/Auth/AuthProvider.js`\\n\\n### Refine file: `frontend/components/Auth/LoginForm.js`\\n- Login form must submit to POST /api/auth/login with { username/email: string, password: string, rememberMe: boolean } payload\\n  - Shared with: `backend/routes/auth.js`\\n\\n### Refine file: `frontend/components/Auth/RegisterForm.js`\\n- Register form must submit to POST /api/auth/register with { username: string, email: string, password: string, confirmPassword: string, agreeToTerms: boolean } payload\\n  - Shared with: `backend/routes/auth.js`\\n\\n### Refine file: `frontend/components/Auth/AuthProvider.js`\\n- AuthProvider must store JWT token in localStorage for persistence\\n- AuthProvider must implement axios request interceptor to add Authorization: Bearer <token> header to all requests\\n- AuthProvider must handle automatic token refresh via POST /api/auth/refresh when token expires\\n  - Shared with: `backend/routes/auth.js`\\n- AuthProvider must provide useAuth hook returning { user: User | null, isAuthenticated: boolean, login: Function, logout: Function }\\n  - Shared with: `frontend/components/Auth/LoginForm.js`, `frontend/components/Auth/RegisterForm.js`\\n\\n### Refine file: `shared/gameLogic.js`\\n- GRID_SIZE constant must be 20 for consistent grid dimensions across frontend and backend\\n  - Shared with: `frontend/components/Game/GameCanvas.js`, `backend/game/engine.js`\\n- GAME_SPEED constant must be 100ms for initial game speed consistency\\n  - Shared with: `frontend/components/Game/GameCanvas.js`, `backend/game/engine.js`\\n- DIRECTIONS enum must include 'UP', 'DOWN', 'LEFT', 'RIGHT' values for movement control\\n  - Shared with: `frontend/components/Game/GameControls.js`, `backend/game/engine.js`\\n- Position type must be { x: number, y: number } for coordinate representation\\n  - Shared with: `frontend/components/Game/GameCanvas.js`, `backend/game/engine.js`\\n- Snake type must be Position[] array for snake body representation\\n  - Shared with: `frontend/components/Game/GameCanvas.js`, `backend/game/engine.js`\\n\\n### Refine file: `backend/game/engine.js`\\n- Game room state must include serialized game state for real-time synchronization\\n  - Shared with: `frontend/components/Game/GamePage.js`\\n- Player movement events must be handled with direction data for game state updates\\n  - Shared with: `frontend/components/Game/GameControls.js`\\n- Game state updates must be broadcast to all connected players for multiplayer synchronization\\n  - Shared with: `frontend/components/Game/GamePage.js`\\n- Game results must be saved with score data for leaderboard integration\\n  - Shared with: `backend/routes/leaderboard.js`\\n\\n### Refine file: `frontend/components/Game/GameCanvas.js`\\n- Canvas rendering must use GRID_SIZE=20 for consistent visual grid alignment\\n  - Shared with: `shared/gameLogic.js`\\n- Game loop must use requestAnimationFrame for smooth animation timing\\n- Keyboard event listeners must capture arrow keys for direction control\\n  - Shared with: `frontend/components/Game/GameControls.js`\\n\\n### Refine file: `frontend/components/Game/GameControls.js`\\n- Direction controls must emit events using DIRECTIONS enum values ('UP', 'DOWN', 'LEFT', 'RIGHT')\\n  - Shared with: `backend/game/engine.js`, `shared/gameLogic.js`\\n- Game state display must show real-time score updates from game logic\\n  - Shared with: `shared/gameLogic.js`\\n\\n### Refine file: `frontend/components/Game/GamePage.js`\\n- Socket connection must be established for real-time game state synchronization\\n  - Shared with: `backend/game/engine.js`\\n- Game events must be listened to for state updates and rendering\\n  - Shared with: `backend/game/engine.js`\\n- Score submission must be handled for leaderboard integration\\n  - Shared with: `backend/routes/leaderboard.js`\\n- Route parameters must support game mode (single/multiplayer) and room ID for multiplayer games\\n  - Shared with: `backend/game/engine.js`\\n\\n### Refine file: `backend/sockets/game.js`\\n- Socket.io connection must authenticate users using JWT tokens from Authorization header\\n  - Shared with: `backend/middleware/auth.js`, `frontend/hooks/useSocket.js`\\n- Must handle 'player-join' event for player joining rooms with user authentication\\n  - Shared with: `frontend/hooks/useSocket.js`, `frontend/components/Game/RoomManager.js`\\n- Must handle 'player-move' event with direction data for player movement synchronization\\n  - Shared with: `frontend/hooks/useSocket.js`, `backend/game/engine.js`\\n- Must handle 'game-start', 'game-pause', 'game-end' events for game state management\\n  - Shared with: `frontend/hooks/useSocket.js`, `backend/game/engine.js`\\n- Must broadcast state synchronization updates to all connected players in a room\\n  - Shared with: `frontend/hooks/useSocket.js`, `frontend/components/Game/GamePage.js`\\n\\n### Refine file: `frontend/hooks/useSocket.js`\\n- Must establish Socket.io connection to backend server on port 3001\\n  - Shared with: `backend/server.js`, `backend/sockets/game.js`\\n- Must implement automatic reconnection mechanism for socket connections\\n  - Shared with: `backend/sockets/game.js`\\n- Must send 'player-move' events with direction data to backend\\n  - Shared with: `backend/sockets/game.js`, `frontend/components/Game/GameControls.js`\\n- Must listen for game state updates and broadcast messages from backend\\n  - Shared with: `backend/sockets/game.js`, `frontend/components/Game/GamePage.js`\\n\\n### Refine file: `backend/models/Room.js`\\n- Room schema must include: roomId (unique), roomName, host (user ID), players (array), maxPlayers, gameState, settings\\n  - Shared with: `backend/sockets/game.js`\\n- Room state must be one of: 'WAITING', 'PLAYING', 'FINISHED'\\n  - Shared with: `backend/sockets/game.js`, `frontend/components/Game/RoomManager.js`\\n- Must provide addPlayer(userId) and removePlayer(userId) methods for player management\\n  - Shared with: `backend/sockets/game.js`\\n- Must provide startGame() and endGame() methods for game state transitions\\n  - Shared with: `backend/sockets/game.js`, `backend/game/engine.js`\\n- Must provide findByStatus(status), findByPlayer(userId), activeRooms() query methods\\n  - Shared with: `frontend/components/Game/RoomManager.js`\\n\\n### Refine file: `frontend/components/Game/RoomManager.js`\\n- Must display available rooms with room information (player count/status) and quick join buttons\\n  - Shared with: `frontend/pages/Lobby.js`\\n- Must provide room creation form with roomName, maxPlayers, difficulty selection, privacy settings\\n  - Shared with: `frontend/pages/Lobby.js`\\n- Must display player lists and manage player ready states within rooms\\n  - Shared with: `frontend/pages/Lobby.js`\\n- Must handle real-time player updates and room state changes via socket connections\\n  - Shared with: `frontend/hooks/useSocket.js`, `backend/sockets/game.js`\\n\\n### Refine file: `frontend/pages/Lobby.js`\\n- Must display RoomManager component for room listing and management\\n  - Shared with: `frontend/components/Game/RoomManager.js`\\n- Must provide navigation to single player mode, leaderboard, user settings\\n  - Shared with: `src/App.js`\\n- Must handle real-time room list updates and player status changes via socket connections\\n  - Shared with: `frontend/hooks/useSocket.js`, `backend/sockets/game.js`\\n\\n### Refine file: `backend/routes/leaderboard.js`\\n- GET /api/leaderboard endpoint must accept query parameters: limit (number), offset (number), timeframe ('day'|'week'|'month'|'all'), mode ('single'|'multi')\\n  - Shared with: `frontend/components/Leaderboard/LeaderboardTable.js`\\n- GET /api/leaderboard/:userId endpoint must return user ranking information\\n  - Shared with: `frontend/components/Leaderboard/PersonalStats.js`\\n- GET /api/leaderboard/top/:limit endpoint must return top N ranked players\\n  - Shared with: `frontend/components/Leaderboard/LeaderboardTable.js`\\n- GET /api/leaderboard/range/:timeframe endpoint must return scores filtered by time range\\n  - Shared with: `frontend/components/Leaderboard/LeaderboardTable.js`\\n- Must use Redis cache for popular queries with cache invalidation mechanism\\n\\n### Refine file: `backend/models/Score.js`\\n- Score schema must include fields: userId (ObjectId), score (number), gameMode ('single'|'multi'), duration (number), createdAt (Date), gameData (Object)\\n  - Shared with: `backend/routes/leaderboard.js`, `backend/game/engine.js`\\n- Must provide getUserHighScore(userId) method returning highest score for a user\\n  - Shared with: `frontend/components/Leaderboard/PersonalStats.js`\\n- Must provide getRank(userId) method returning user's current ranking\\n  - Shared with: `frontend/components/Leaderboard/PersonalStats.js`\\n- Must provide getTopScores(limit) method returning top scores\\n  - Shared with: `backend/routes/leaderboard.js`\\n- Must provide getStats() method returning statistical information\\n  - Shared with: `frontend/components/Leaderboard/PersonalStats.js`\\n\\n### Refine file: `frontend/components/Leaderboard/LeaderboardTable.js`\\n- Must display table columns: ranking, username, score, time information\\n  - Shared with: `frontend/pages/Leaderboard.js`\\n- Must implement filtering controls for timeframe ('day'|'week'|'month'|'all') and game mode ('single'|'multi')\\n  - Shared with: `frontend/pages/Leaderboard.js`\\n- Must implement pagination controls using limit and offset parameters\\n  - Shared with: `frontend/pages/Leaderboard.js`\\n- Must highlight current user's entry in the leaderboard\\n\\n### Refine file: `frontend/components/Leaderboard/PersonalStats.js`\\n- Must display user's current ranking position\\n  - Shared with: `frontend/pages/Leaderboard.js`\\n- Must display user's highest score record\\n  - Shared with: `frontend/pages/Leaderboard.js`\\n- Must display average score and game session statistics\\n  - Shared with: `frontend/pages/Leaderboard.js`\\n- Must display score history charts and trend analysis\\n  - Shared with: `frontend/pages/Leaderboard.js`\\n\\n### Refine file: `frontend/pages/Leaderboard.js`\\n- Must include tab navigation for: global leaderboard, friends leaderboard, personal history, achievement system\\n  - Shared with: `src/App.js`\\n- Must implement automatic data refresh mechanism for real-time updates\\n- Must handle loading states, empty states, and error retry mechanisms\\n\\n### Refine file: `backend/Dockerfile`\\n- Must expose port 3001 for backend server communication\\n  - Shared with: `docker-compose.yml`, `frontend/hooks/useSocket.js`\\n\\n### Refine file: `docker-compose.yml`\\n- Must define MongoDB service with internal hostname 'mongodb' and port 27017 for database connections\\n  - Shared with: `.env.production.example`, `backend/config/database.js`\\n- Must define Redis service with internal hostname 'redis' and port 6379 for cache connections\\n  - Shared with: `.env.production.example`, `backend/config/database.js`\\n\\n### Refine file: `.env.production.example`\\n- Environment variable MONGODB_URI=mongodb://mongodb:27017/snake-game must be set for production database connection\\n  - Shared with: `backend/config/database.js`, `docker-compose.yml`\\n- Environment variable REDIS_URL=redis://redis:6379 must be set for production Redis connection\\n  - Shared with: `backend/config/database.js`, `docker-compose.yml`\\n- Environment variable PORT=3001 must be set for backend server port configuration\\n  - Shared with: `backend/server.js`, `backend/Dockerfile`\\n- Environment variable JWT_SECRET=change-this-in-production must be set for JWT token signing in production\\n  - Shared with: `backend/middleware/auth.js`\\n- Environment variable JWT_EXPIRE=7d must be set for JWT token expiration in production\\n  - Shared with: `backend/middleware/auth.js`\\n- Environment variable REACT_APP_API_URL=http://localhost:3001 must be set for frontend API calls to backend\\n  - Shared with: `src/App.js`, `frontend/components/Auth/AuthProvider.js`\\n- Environment variable REACT_APP_WS_URL=ws://localhost:3001 must be set for frontend WebSocket connections to backend\\n  - Shared with: `frontend/hooks/useSocket.js`, `backend/sockets/game.js`\\n<!-- END_STEP3_FILE_AGREEMENTS -->\"\n}\n\nRelevant memories:\nNone."
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "mode": "code",
+    "behaviorRole": "subagent",
+    "taskId": "019dd9a6-3b8d-70bb-9b0e-597ae8db44bf:b6217d01a12d3d7c43f99cf70fc84fe9",
+    "subagentId": "b6217d01a12d3d7c43f99cf70fc84fe9",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "codebase_search_broad",
+          "description": "Discovery search — explore architecture, find related code, or understand how things connect.\n\n**WHEN TO USE:** You want to understand a system, discover what exists, or find code related to a concept. Think of it as \"explore and discover\".\n- User asks: \"how does the player system work?\" → use this tool\n- User asks: \"what handles input in this project?\" → use this tool\n- User asks: \"show me how inventory is managed\" → use this tool\n\n**WHEN NOT TO USE:** If you already know the exact class/function name, use `codebase_search_precise` instead.\n\n**CRITICAL: You MUST use this tool (or codebase_search_precise) FIRST before read_file, search_files, or list_files when exploring code you haven't examined yet.**\n\nProvide 2-4 diverse queries covering different aspects of what you're looking for.\n\n**IMPORTANT:** Always search globally (omit path) to discover all related code across the codebase.\n\nExamples:\n{ \"query\": [\"player movement and physics\", \"character controller input handling\", \"player jump and gravity\"] }\n{ \"query\": [\"game state management\", \"scene lifecycle and transitions\"] }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Array of meaning-based search queries from different angles. Always provide 2-4 diverse queries for comprehensive results."
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional path filter. Leave empty or omit for GLOBAL search (recommended). Only specify if you're certain the code is in a specific subdirectory."
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "codebase_search_precise",
+          "description": "Pinpoint search — find the exact definition or implementation of a KNOWN symbol.\n\n**WHEN TO USE:** You already know the specific name (class, function, variable, interface) and need its source code. Think of it as \"go to definition\".\n- User asks: \"show me the GameManager class\" → use this tool\n- User asks: \"find the resolveSearchConfig function\" → use this tool\n- User asks: \"I need the PlayerController implementation\" → use this tool\n\n**WHEN NOT TO USE:** If you don't have a specific symbol name, use `codebase_search_broad` instead.\n\nProvide 2-4 queries targeting the same symbol from different angles for best results.\n\n**IMPORTANT:** Always search globally (omit path) unless you are 100% certain the symbol only exists in a specific directory.\n\nExamples:\n{ \"query\": [\"GameManager class definition\", \"GameManager singleton implementation\"] }\n{ \"query\": [\"PlayerController class\", \"PlayerController MonoBehaviour\"] }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Array of meaning-based search queries from different angles. Always provide 2-4 diverse queries for comprehensive results."
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional path filter. Leave empty or omit for GLOBAL search (recommended). Only specify if you're certain the code is in a specific subdirectory."
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "access_mcp_resource",
+          "description": "Request to access a resource provided by a connected MCP server. Resources represent data sources that can be used as context, such as files, API responses, or system information.\n\nParameters:\n- server_name: (required) The name of the MCP server providing the resource\n- uri: (required) The URI identifying the specific resource to access\n\nExample: Accessing a weather resource\n{ \"server_name\": \"weather-server\", \"uri\": \"weather://san-francisco/current\" }\n\nExample: Accessing a file resource from an MCP server\n{ \"server_name\": \"filesystem-server\", \"uri\": \"file:///path/to/data.json\" }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "server_name": {
+                "type": "string",
+                "description": "The name of the MCP server providing the resource"
+              },
+              "uri": {
+                "type": "string",
+                "description": "The URI identifying the specific resource to access"
+              }
+            },
+            "required": [
+              "server_name",
+              "uri"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "apply_diff",
+          "description": "Apply precise, targeted modifications to an existing file using one or more search/replace blocks. This tool is for surgical edits only; the 'SEARCH' block must exactly match the existing content, including whitespace and indentation. To make multiple targeted changes, provide multiple SEARCH/REPLACE blocks in the 'diff' parameter. Use the 'read_file' tool first if you are not confident in the exact content to search for.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "The path of the file to modify, relative to the current workspace directory."
+              },
+              "diff": {
+                "type": "string",
+                "description": "A string containing one or more search/replace blocks defining the changes. The ':start_line:' is required and indicates the starting line number of the original content. You must not add a start line for the replacement content. Each block must follow this format:\n<<<<<<< SEARCH\n:start_line:[line_number]\n-------\n[exact content to find]\n=======\n[new content to replace with]\n>>>>>>> REPLACE"
+              }
+            },
+            "required": [
+              "path",
+              "diff"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "apply_patch",
+          "description": "Apply patches to files using a stripped-down, file-oriented diff format. This tool supports creating new files, deleting files, and updating existing files with precise changes.\n\nThe patch format uses a simple, human-readable structure:\n\n*** Begin Patch\n[ one or more file sections ]\n*** End Patch\n\nEach file section starts with one of three headers:\n- *** Add File: <path> - Create a new file. Every following line is a + line (the initial contents).\n- *** Delete File: <path> - Remove an existing file. Nothing follows.\n- *** Update File: <path> - Patch an existing file in place.\n\nFor Update File operations:\n- May be immediately followed by *** Move to: <new path> if you want to rename the file.\n- Then one or more \"hunks\", each introduced by @@ (optionally followed by context like a class or function name).\n- Within a hunk each line starts with:\n  - ' ' (space) for context lines (unchanged)\n  - '-' for lines to remove\n  - '+' for lines to add\n\nContext guidelines:\n- Show 3 lines of code above and below each change.\n- Use @@ with a class/function name if 3 lines of context is insufficient to uniquely identify the location.\n- Multiple @@ statements can be used for deeply nested code.\n\nExample patch:\n*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print(\"Hi\")\n+print(\"Hello, world!\")\n*** Delete File: obsolete.txt\n*** End Patch",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "patch": {
+                "type": "string",
+                "description": "The complete patch text in the apply_patch format, starting with '*** Begin Patch' and ending with '*** End Patch'."
+              }
+            },
+            "required": [
+              "patch"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "ask_followup_question",
+          "description": "Ask the user a question to gather additional information needed to complete the task. Use when you need clarification or more details to proceed effectively.\n\nParameters:\n- question: (required) A clear, specific question addressing the information needed\n- follow_up: (required) A list of 2-4 suggested answers. Suggestions must be complete, actionable answers without placeholders. Optionally include mode to switch modes (code/architect/etc.)\n\nExample: Asking for file path\n{ \"question\": \"What is the path to the frontend-config.json file?\", \"follow_up\": [{ \"text\": \"./src/frontend-config.json\", \"mode\": null }, { \"text\": \"./config/frontend-config.json\", \"mode\": null }, { \"text\": \"./frontend-config.json\", \"mode\": null }] }\n\nExample: Asking with mode switch\n{ \"question\": \"Would you like me to implement this feature?\", \"follow_up\": [{ \"text\": \"Yes, implement it now\", \"mode\": \"code\" }, { \"text\": \"No, just plan it out\", \"mode\": \"architect\" }] }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "question": {
+                "type": "string",
+                "description": "Clear, specific question that captures the missing information you need"
+              },
+              "follow_up": {
+                "type": "array",
+                "description": "Required list of 2-4 suggested responses; each suggestion must be a complete, actionable answer and may include a mode switch",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string",
+                      "description": "Suggested answer the user can pick"
+                    },
+                    "mode": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Optional mode slug to switch to if this suggestion is chosen (e.g., code, architect)"
+                    }
+                  },
+                  "required": [
+                    "text",
+                    "mode"
+                  ],
+                  "additionalProperties": false
+                },
+                "minItems": 1,
+                "maxItems": 4
+              }
+            },
+            "required": [
+              "question",
+              "follow_up"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "attempt_completion",
+          "description": "Use this when your assigned subtask is finished or cannot be completed further. The tool results returned in this conversation are the authoritative execution feedback for the subagent; you do not need extra user confirmation before calling attempt_completion. After you have finished the required reads/writes/searches for your assigned work and the latest tool results indicate success, call attempt_completion immediately with a concise summary. If the subtask is blocked by missing files, missing context, or tool limitations, call attempt_completion with a concise explanation of the blocker.",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "string",
+                "description": "Final result message to deliver to the user once the task is complete"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "browser_action",
+          "description": "Request to interact with a Puppeteer-controlled browser. Every action, except close, will be responded to with a screenshot of the browser's current state, along with any new console logs. You may only perform one browser action per message, and wait for the user's response including a screenshot and logs to determine the next action.\n\nThis tool is particularly useful for web development tasks as it allows you to launch a browser, navigate to pages, interact with elements through clicks and keyboard input, and capture the results through screenshots and console logs. Use it at key stages of web development tasks - such as after implementing new features, making substantial changes, when troubleshooting issues, or to verify the result of your work. Analyze the provided screenshots to ensure correct rendering or identify errors, and review console logs for runtime issues.\n\nThe user may ask generic non-development tasks (such as \"what's the latest news\" or \"look up the weather\"), in which case you might use this tool to complete the task if it makes sense to do so, rather than trying to create a website or using curl to answer the question. However, if an available MCP server tool or resource can be used instead, you should prefer to use it over browser_action.\n\nBrowser Session Lifecycle:\n- Browser sessions start with launch and end with close\n- The session remains active across multiple messages and tool uses\n- You can use other tools while the browser session is active - it will stay open in the background",
+          "strict": false,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "description": "Browser action to perform",
+                "enum": [
+                  "launch",
+                  "click",
+                  "hover",
+                  "type",
+                  "press",
+                  "scroll_down",
+                  "scroll_up",
+                  "resize",
+                  "close",
+                  "screenshot"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "URL to open when performing the launch action; must include protocol"
+              },
+              "coordinate": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Screen coordinate for hover or click actions in format 'x,y@WIDTHxHEIGHT' where x,y is the target position on the screenshot image and WIDTHxHEIGHT is the exact pixel dimensions of the screenshot image (not the browser viewport). Example: '450,203@900x600' means click at (450,203) on a 900x600 screenshot. The coordinates will be automatically scaled to match the actual viewport dimensions."
+              },
+              "size": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Viewport dimensions for the resize action in format 'WIDTHxHEIGHT' or 'WIDTH,HEIGHT'. Example: '1280x800' or '1280,800'"
+              },
+              "text": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Text to type when performing the type action, or key name to press when performing the press action (e.g., 'Enter', 'Tab', 'Escape')"
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "File path where the screenshot should be saved (relative to workspace). Required for screenshot action. Supports .png, .jpeg, and .webp extensions. Example: 'screenshots/result.png'"
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "execute_command",
+          "description": "Request to execute a CLI command on the system. Use this when you need to perform system operations or run specific commands to accomplish any step in the user's task. You must tailor your command to the user's system and provide a clear explanation of what the command does. For command chaining, use the appropriate chaining syntax for the user's shell. Prefer to execute complex CLI commands over creating executable scripts, as they are more flexible and easier to run. Prefer relative commands and paths that avoid location sensitivity for terminal consistency.\n\nParameters:\n- command: (required) The CLI command to execute. This should be valid for the current operating system. Ensure the command is properly formatted and does not contain any harmful instructions.\n- cwd: (optional) The working directory to execute the command in\n\nExample: Executing npm run dev\n{ \"command\": \"npm run dev\", \"cwd\": null }\n\nExample: Executing ls in a specific directory if directed\n{ \"command\": \"ls -la\", \"cwd\": \"/home/user/projects\" }\n\nExample: Using relative paths\n{ \"command\": \"touch ./testdata/example.file\", \"cwd\": null }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "Shell command to execute"
+              },
+              "cwd": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional working directory for the command, relative or absolute"
+              }
+            },
+            "required": [
+              "command",
+              "cwd"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "command_status",
+          "description": "Check the status of a previously started terminal command by its terminal ID. Returns the current status (running or done), any new output since last check, and exit code if completed.\n\nUse this tool to:\n- Check if a background/long-running command has completed\n- Get new output from a running command without blocking\n- Get the exit code and final output of a completed command\n\nThe terminal_id is returned when you execute a command. Background terminals can be queried at any time.\n\nParameters:\n- terminal_id: (required) The numeric ID of the terminal to check (returned from execute_command)\n- output_limit: (optional) Maximum characters of output to return (default: 4000)\n- wait_seconds: (optional) Seconds to wait for command completion before returning status (default: 0, max: 60)\n\nExample: Check if terminal 1 has finished\n{ \"terminal_id\": 1, \"output_limit\": 4000, \"wait_seconds\": 0 }\n\nExample: Wait up to 30 seconds for completion then get status\n{ \"terminal_id\": 1, \"output_limit\": 8000, \"wait_seconds\": 30 }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "terminal_id": {
+                "type": "integer",
+                "description": "Numeric ID of the terminal to check status for"
+              },
+              "output_limit": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Maximum characters of output to return (default: 4000)"
+              },
+              "wait_seconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Seconds to wait for command completion before returning (default: 0, max: 60)"
+              }
+            },
+            "required": [
+              "terminal_id",
+              "output_limit",
+              "wait_seconds"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "generate_image",
+          "description": "Request to generate or edit an image using AI models through OpenRouter API. This tool can create new images from text prompts or modify existing images based on your instructions. When an input image is provided, the AI will apply the requested edits, transformations, or enhancements to that image.\n\nParameters:\n- prompt: (required) The text prompt describing what to generate or how to edit the image\n- path: (required) The file path where the generated/edited image should be saved (relative to the current workspace directory). The tool will automatically add the appropriate image extension if not provided.\n- image: (optional) The file path to an input image to edit or transform (relative to the current workspace directory). Supported formats: PNG, JPG, JPEG, GIF, WEBP.\n\nExample: Generating a sunset image\n{ \"prompt\": \"A beautiful sunset over mountains with vibrant orange and purple colors\", \"path\": \"images/sunset.png\", \"image\": null }\n\nExample: Editing an existing image\n{ \"prompt\": \"Transform this image into a watercolor painting style\", \"path\": \"images/watercolor-output.png\", \"image\": \"images/original-photo.jpg\" }\n\nExample: Upscaling and enhancing an image\n{ \"prompt\": \"Upscale this image to higher resolution, enhance details, improve clarity and sharpness while maintaining the original content and composition\", \"path\": \"images/enhanced-photo.png\", \"image\": \"images/low-res-photo.jpg\" }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "prompt": {
+                "type": "string",
+                "description": "Text description of the image to generate or the edits to apply"
+              },
+              "path": {
+                "type": "string",
+                "description": "Filesystem path (relative to the workspace) where the resulting image should be saved"
+              },
+              "image": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional path (relative to the workspace) to an existing image to edit; supports PNG, JPG, JPEG, GIF, and WEBP"
+              }
+            },
+            "required": [
+              "prompt",
+              "path",
+              "image"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "find_by_name",
+          "description": "Search for files and directories by name within a specified directory using glob patterns. This tool is optimized for fast file discovery based on names, extensions, and path patterns. Uses smart case matching and respects .gitignore by default.\n\nResults are capped at 50 matches to avoid overwhelming output. Use filters to narrow down searches when needed.\n\nParameters:\n- path: (required) The directory to search within, relative to workspace\n- pattern: (required) Glob pattern to match file/directory names (e.g., \"*.ts\", \"test*\", \"**/*.json\")\n- extensions: (optional) Array of file extensions to include (without leading dot), e.g., [\"ts\", \"tsx\", \"js\"]\n- excludes: (optional) Array of glob patterns to exclude (e.g., [\"node_modules\", \"*.test.ts\"])\n- max_depth: (optional) Maximum directory depth to search (1 = current directory only)\n- type: (optional) Filter by type: \"file\", \"directory\", or \"any\" (default: \"any\")\n- full_path: (optional) If true, pattern matches against full path; if false (default), only filename\n\nExample: Find all TypeScript files in src\n{ \"path\": \"src\", \"pattern\": \"*\", \"extensions\": [\"ts\", \"tsx\"] }\n\nExample: Find test files excluding node_modules\n{ \"path\": \".\", \"pattern\": \"*.test.*\", \"excludes\": [\"node_modules\"] }\n\nExample: Find directories named \"components\"\n{ \"path\": \"src\", \"pattern\": \"components\", \"type\": \"directory\" }\n\nExample: Find package.json files up to 3 levels deep\n{ \"path\": \".\", \"pattern\": \"package.json\", \"max_depth\": 3 }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Directory to search within, relative to the workspace"
+              },
+              "pattern": {
+                "type": "string",
+                "description": "Glob pattern to match file/directory names. Supports wildcards: * (any chars), ? (single char), ** (recursive)"
+              },
+              "extensions": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "File extensions to include (without leading dot). Files must match at least one extension"
+              },
+              "excludes": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Glob patterns to exclude from results (e.g., node_modules, *.min.js)"
+              },
+              "max_depth": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Maximum directory depth to search. 1 = current directory only, undefined = unlimited"
+              },
+              "type": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "file",
+                  "directory",
+                  "any",
+                  null
+                ],
+                "description": "Filter by entry type: 'file' for files only, 'directory' for directories only, 'any' for both"
+              },
+              "full_path": {
+                "type": [
+                  "boolean",
+                  "null"
+                ],
+                "description": "If true, pattern matches against the full path; if false (default), only the filename is matched"
+              }
+            },
+            "required": [
+              "path",
+              "pattern",
+              "extensions",
+              "excludes",
+              "max_depth",
+              "type",
+              "full_path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "multi_edit",
+          "description": "Make multiple edits to a single file in one atomic operation. All edits are applied in sequence, and if any edit fails, none are applied.\n\nThis is more efficient than multiple single edits when you need to make several changes to different parts of the same file.\n\nParameters:\n- file_path: (required) The absolute path to the file to modify\n- edits: (required) Array of edit operations, each containing:\n  - old_string: Text to find (must be unique unless replace_all is true)\n  - new_string: Text to replace with (must be different from old_string)\n  - replace_all: (optional) Replace all occurrences of old_string\n- explanation: (required) Description of the changes being made\n\nExample: Rename a variable and update a function\n{\n  \"file_path\": \"/path/to/file.ts\",\n  \"edits\": [\n    { \"old_string\": \"oldVarName\", \"new_string\": \"newVarName\", \"replace_all\": true },\n    { \"old_string\": \"function oldFunc()\", \"new_string\": \"function newFunc()\" }\n  ],\n  \"explanation\": \"Rename variable and function\"\n}\n\nIMPORTANT:\n- Edits are applied sequentially in order\n- Each edit operates on the result of previous edits\n- If any edit fails (no match, ambiguous match), ALL edits are rolled back\n- Plan edits carefully to avoid conflicts between operations",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "file_path": {
+                "type": "string",
+                "description": "Absolute path to the file to modify"
+              },
+              "edits": {
+                "type": "array",
+                "description": "Array of edit operations to perform sequentially",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "old_string": {
+                      "type": "string",
+                      "description": "The text to find and replace"
+                    },
+                    "new_string": {
+                      "type": "string",
+                      "description": "The replacement text"
+                    },
+                    "replace_all": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ],
+                      "description": "Replace all occurrences (default: false)"
+                    }
+                  },
+                  "required": [
+                    "old_string",
+                    "new_string"
+                  ],
+                  "additionalProperties": false
+                },
+                "minItems": 1
+              },
+              "explanation": {
+                "type": "string",
+                "description": "Description of the changes being made"
+              }
+            },
+            "required": [
+              "file_path",
+              "edits",
+              "explanation"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_notebook",
+          "description": "Read and parse a Jupyter notebook (.ipynb) file, displaying cells with their IDs and outputs in a formatted view.\n\nUse this tool to:\n- View the contents of a Jupyter notebook\n- Understand the structure and flow of notebook cells\n- See code, markdown, and output content\n\nThe output will show each cell with:\n- Cell number (0-indexed)\n- Cell ID (for editing)\n- Cell type (code/markdown)\n- Source content\n- Outputs (for code cells)\n\nParameters:\n- path: (required) Absolute path to the Jupyter notebook file (.ipynb)\n\nExample:\n{ \"path\": \"/path/to/notebook.ipynb\" }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Absolute path to the Jupyter notebook file (.ipynb)"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit_notebook",
+          "description": "Edit a specific cell in a Jupyter notebook (.ipynb) file. You can replace cell content or insert a new cell.\n\nUse this tool to:\n- Modify code or markdown in a specific cell\n- Insert new cells at a specific position\n- Update cell content after reading with read_notebook\n\nParameters:\n- absolute_path: (required) Absolute path to the Jupyter notebook file\n- new_source: (required) The new content for the cell\n- cell_number: (optional) 0-indexed cell number to edit (default: 0)\n- cell_type: (optional) Cell type: 'code' or 'markdown' (required for insert mode)\n- edit_mode: (optional) 'replace' to modify existing cell, 'insert' to add new cell (default: 'replace')\n- cell_id: (optional) Alternative to cell_number for targeting specific cells\n\nExample: Replace cell 0 content\n{ \"absolute_path\": \"/path/to/notebook.ipynb\", \"new_source\": \"print('updated')\", \"cell_number\": 0 }\n\nExample: Insert new code cell at position 2\n{ \"absolute_path\": \"/path/to/notebook.ipynb\", \"new_source\": \"# New cell\", \"cell_number\": 2, \"cell_type\": \"code\", \"edit_mode\": \"insert\" }\n\nIMPORTANT:\n- Use read_notebook first to understand the notebook structure\n- cell_number is 0-indexed\n- When inserting into an empty notebook, cell_number must be 0\n- Cascade cannot delete notebook cells - ask user to delete manually if needed",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "absolute_path": {
+                "type": "string",
+                "description": "Absolute path to the Jupyter notebook file (.ipynb)"
+              },
+              "new_source": {
+                "type": "string",
+                "description": "New content for the cell"
+              },
+              "cell_number": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "0-indexed cell number to edit (default: 0)"
+              },
+              "cell_type": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "code",
+                  "markdown",
+                  null
+                ],
+                "description": "Cell type: 'code' or 'markdown' (required for insert mode)"
+              },
+              "edit_mode": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "replace",
+                  "insert",
+                  null
+                ],
+                "description": "Edit operation: 'replace' or 'insert' (default: 'replace')"
+              },
+              "cell_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Alternative to cell_number for targeting specific cells by ID"
+              }
+            },
+            "required": [
+              "absolute_path",
+              "new_source",
+              "cell_number",
+              "cell_type",
+              "edit_mode",
+              "cell_id"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "view_content_chunk",
+          "description": "View a specific chunk of a web or knowledge base document content using its DocumentId and chunk position.\n\nUse this tool to:\n- Navigate through a large document that was read with read_url_content\n- View specific sections of a previously fetched document\n- Continue reading from where you left off\n\nIMPORTANT: The DocumentId must have already been read by the read_url_content tool before this can be used.\n\nParameters:\n- document_id: (required) The ID of the document that the chunk belongs to\n- position: (required) The position/index of the chunk to view (0-indexed)\n\nExample: View first chunk of a document\n{ \"document_id\": \"doc-abc123\", \"position\": 0 }\n\nExample: View second chunk\n{ \"document_id\": \"doc-abc123\", \"position\": 1 }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "document_id": {
+                "type": "string",
+                "description": "The ID of the document that the chunk belongs to"
+              },
+              "position": {
+                "type": "integer",
+                "description": "The position of the chunk to view (0-indexed)"
+              }
+            },
+            "required": [
+              "document_id",
+              "position"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "create_memory",
+          "description": "Save important context relevant to the USER and their task to a persistent memory database.\n\nUse this tool to save:\n- User preferences\n- Explicit user requests to remember something\n- Important code snippets\n- Technical stacks\n- Project structure\n- Major milestones or features\n- New design patterns and architectural decisions\n- Any other information important to remember\n\nBefore creating a new memory, check if a semantically related memory exists. If found, update it instead of creating a duplicate.\n\nParameters:\n- Action: (required) 'create', 'update', or 'delete'\n- Id: (required for update/delete) ID of existing memory to modify\n- Title: (required for create/update) Descriptive title for the memory\n- Content: (required for create/update) Content of the memory\n- CorpusNames: (create only) Array of workspace corpus names associated with the memory\n- Tags: (create only) Array of tags for filtering/retrieving the memory (use snake_case)\n- UserTriggered: (required) Set to true if user explicitly asked to create/modify this memory\n\nExample: Create a new memory\n{\n  \"Action\": \"create\",\n  \"Title\": \"Project uses React 18\",\n  \"Content\": \"This project uses React 18 with TypeScript and TailwindCSS\",\n  \"CorpusNames\": [\"user/project-name\"],\n  \"Tags\": [\"tech_stack\", \"frontend\"],\n  \"UserTriggered\": false\n}\n\nExample: Update existing memory\n{\n  \"Action\": \"update\",\n  \"Id\": \"existing-memory-id\",\n  \"Title\": \"Updated title\",\n  \"Content\": \"Updated content\",\n  \"UserTriggered\": true\n}",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "Action": {
+                "type": "string",
+                "enum": [
+                  "create",
+                  "update",
+                  "delete"
+                ],
+                "description": "The type of action to perform on the memory"
+              },
+              "Id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "ID of existing memory to update or delete (leave null for create)"
+              },
+              "Title": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Descriptive title for the memory (required for create/update)"
+              },
+              "Content": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Content of the memory (required for create/update, null for delete)"
+              },
+              "CorpusNames": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Workspace corpus names associated with the memory (create only)"
+              },
+              "Tags": {
+                "type": [
+                  "array",
+                  "null"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Tags for filtering/retrieving the memory (create only, use snake_case)"
+              },
+              "UserTriggered": {
+                "type": "boolean",
+                "description": "Set to true if user explicitly asked to create/modify this memory"
+              }
+            },
+            "required": [
+              "Action",
+              "Id",
+              "Title",
+              "Content",
+              "CorpusNames",
+              "Tags",
+              "UserTriggered"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_command_output",
+          "description": "Retrieve the full output from a command that was truncated in execute_command. Use this tool when:\n1. The execute_command result shows \"[OUTPUT TRUNCATED - Full output saved to artifact: cmd-XXXX.txt]\"\n2. You need to see more of the command output beyond the preview\n3. You want to search for specific content in large command output\n\nThe tool supports two modes:\n- **Read mode**: Read output starting from a byte offset with optional limit\n- **Search mode**: Filter lines matching a regex or literal pattern (like grep)\n\nParameters:\n- artifact_id: (required) The artifact filename from the truncated output message (e.g., \"cmd-1706119234567.txt\")\n- search: (optional) Pattern to filter lines. Supports regex or literal strings. Case-insensitive. **Omit this parameter entirely if you don't need to filter - do not pass null or empty string.**\n- offset: (optional) Byte offset to start reading from. Default: 0. Use for pagination.\n- limit: (optional) Maximum bytes to return. Default: 40KB.\n\nExample: Reading truncated command output\n{ \"artifact_id\": \"cmd-1706119234567.txt\" }\n\nExample: Reading with pagination (after first 40KB)\n{ \"artifact_id\": \"cmd-1706119234567.txt\", \"offset\": 40960 }\n\nExample: Searching for errors in build output\n{ \"artifact_id\": \"cmd-1706119234567.txt\", \"search\": \"error|failed|Error\" }\n\nExample: Finding specific test failures\n{ \"artifact_id\": \"cmd-1706119234567.txt\", \"search\": \"FAIL\" }",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "artifact_id": {
+                "type": "string",
+                "description": "The artifact filename from the truncated command output (e.g., \"cmd-1706119234567.txt\")"
+              },
+              "search": {
+                "type": "string",
+                "description": "Optional regex or literal pattern to filter lines (case-insensitive, like grep). Omit this parameter if not searching - do not pass null or empty string."
+              },
+              "offset": {
+                "type": "number",
+                "description": "Byte offset to start reading from (default: 0, for pagination)"
+              },
+              "limit": {
+                "type": "number",
+                "description": "Maximum bytes to return (default: 40KB)"
+              }
+            },
+            "required": [
+              "artifact_id"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_terminal",
+          "description": "Read the current content/output from a terminal by its ID. This allows you to inspect what's been output to a specific terminal without executing new commands.\n\nUse this tool to:\n- View recent output from a terminal you've been using\n- Check the state of a terminal after background processes have run\n- Get historical output that may have scrolled off screen\n\nParameters:\n- terminal_id: (required) The numeric ID of the terminal to read\n- output_limit: (optional) Maximum characters of output to return (default: 8000)\n\nExample: Read output from terminal 1\n{ \"terminal_id\": 1, \"output_limit\": 8000 }\n\nExample: Read limited output from terminal 2\n{ \"terminal_id\": 2, \"output_limit\": 2000 }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "terminal_id": {
+                "type": "integer",
+                "description": "Numeric ID of the terminal to read content from"
+              },
+              "output_limit": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Maximum characters of output to return (default: 8000)"
+              }
+            },
+            "required": [
+              "terminal_id",
+              "output_limit"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_url_content",
+          "description": "Read content from a web URL. The URL must be an HTTP or HTTPS URL pointing to a valid internet resource.\n\nUse this tool to:\n- Fetch documentation from a website\n- Read API documentation or reference materials\n- Get content from online resources\n\nThe content will be converted to readable text format, stripping HTML tags and formatting.\n\nParameters:\n- url: (required) The URL to read content from (must start with http:// or https://)\n- max_length: (optional) Maximum characters of content to return (default: 10000)\n\nExample: Read documentation from a URL\n{ \"url\": \"https://docs.example.com/api/reference\", \"max_length\": 10000 }\n\nExample: Read with limited content\n{ \"url\": \"https://example.com/page\", \"max_length\": 5000 }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "The URL to read content from (must be http:// or https://)"
+              },
+              "max_length": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Maximum characters of content to return (default: 10000)"
+              }
+            },
+            "required": [
+              "url",
+              "max_length"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "search_web",
+          "description": "Perform a web search to get a list of relevant web documents for a given query. Returns URLs, titles, and snippets from search results.\n\nUse this tool to:\n- Find documentation or reference materials online\n- Research solutions to technical problems\n- Discover relevant resources for the current task\n\nParameters:\n- query: (required) The search query string\n- domain: (optional) Preferred domain to prioritize in search results\n- max_results: (optional) Maximum number of results to return (default: 5, max: 10)\n\nExample: Search for documentation\n{ \"query\": \"TypeScript generics tutorial\", \"domain\": null, \"max_results\": 5 }\n\nExample: Search within a specific domain\n{ \"query\": \"useState hook\", \"domain\": \"react.dev\", \"max_results\": 5 }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "The search query string"
+              },
+              "domain": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional domain to prioritize in search results (e.g., 'react.dev')"
+              },
+              "max_results": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Maximum number of results to return (default: 5, max: 10)"
+              }
+            },
+            "required": [
+              "query",
+              "domain",
+              "max_results"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "recall_memory",
+          "description": "Deep memory recall tool. Drills down through the summary hierarchy to retrieve original conversation messages when you need to recall specific details from past work.\n\n**HOW IT WORKS:**\nThis tool uses a dedicated local regression model to trace back from high-level summaries to the original messages:\n1. Global Summary Q → identifies which sub-task summary is relevant\n2. Individual/Rolling Summary → retrieves the original conversation messages\n\n**WHEN TO USE:**\n- When the Global Summary Q mentions something you need more details about\n- When you need to recall the exact steps, code changes, or decisions from a past sub-task\n- When the condensed summary is too coarse and you need the original conversation context\n\n**REQUIREMENTS:**\n- A regression model must be configured in the Condensing Model panel (\"Models To Regress\" section)\n- Summary entries must exist (created by the condensation system)\n\n**NOTE:** This tool calls a local model and may take a few seconds. Only use it when you genuinely need deeper context that the current summaries don't provide.\n\nParameters:\n- query: (required) What you need to recall — be specific about the topic, file, or action you're looking for\n\nExample:\n{\n  \"query\": \"How was the authentication token refresh logic implemented?\"\n}",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "What you need to recall — be specific about the topic, file, or action you're looking for"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a file and return its contents with line numbers for diffing or discussion. IMPORTANT: This tool reads exactly one file per call. If you need multiple files, issue multiple parallel read_file calls. Supports two modes: 'slice' (default) reads lines sequentially with offset/limit; 'indentation' extracts complete semantic code blocks around an anchor line based on indentation hierarchy. Slice mode is ideal for initial file exploration, understanding overall structure, reading configuration/data files, or when you need a specific line range. Use it when you don't have a target line number. PREFER indentation mode when you have a specific line number from search results, error messages, or definition lookups - it guarantees complete, syntactically valid code blocks without mid-function truncation. IMPORTANT: Indentation mode requires anchor_line to be useful. Without it, only header content (imports) is returned. By default, returns up to 2000 lines per file. Lines longer than 2000 characters are truncated. Supports text extraction from PDF and DOCX files, but may not handle other binary files properly. Example: { path: 'src/app.ts' } Example (indentation mode): { path: 'src/app.ts', mode: 'indentation', indentation: { anchor_line: 42 } }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to the file to read, relative to the workspace"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "slice",
+                  "indentation"
+                ],
+                "description": "Reading mode. 'slice' (default): read lines sequentially with offset/limit - use for general file exploration or when you don't have a target line number (may truncate code mid-function). 'indentation': extract complete semantic code blocks containing anchor_line - PREFERRED when you have a line number because it guarantees complete, valid code blocks. WARNING: Do not use indentation mode without specifying indentation.anchor_line, or you will only get header content."
+              },
+              "offset": {
+                "type": "integer",
+                "description": "1-based line offset to start reading from (slice mode, default: 1)"
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines to return (slice mode, default: 2000)"
+              },
+              "indentation": {
+                "type": "object",
+                "description": "Indentation mode options. Only used when mode='indentation'. You MUST specify anchor_line for useful results - it determines which code block to extract.",
+                "properties": {
+                  "anchor_line": {
+                    "type": "integer",
+                    "description": "1-based line number to anchor the extraction. REQUIRED for meaningful indentation mode results. The extractor finds the semantic block (function, method, class) containing this line and returns it completely. Without anchor_line, indentation mode defaults to line 1 and returns only imports/header content. Obtain anchor_line from: search results, error stack traces, definition lookups, codebase_search results, or condensed file summaries (e.g., '14--28 | export class UserService' means anchor_line=14)."
+                  },
+                  "max_levels": {
+                    "type": "integer",
+                    "description": "Maximum indentation levels to include above the anchor (indentation mode, 0 = unlimited (default)). Higher values include more parent context."
+                  },
+                  "include_siblings": {
+                    "type": "boolean",
+                    "description": "Include sibling blocks at the same indentation level as the anchor block (indentation mode, default: false). Useful for seeing related methods in a class."
+                  },
+                  "include_header": {
+                    "type": "boolean",
+                    "description": "Include file header content (imports, module-level comments) at the top of output (indentation mode, default: true)."
+                  },
+                  "max_lines": {
+                    "type": "integer",
+                    "description": "Hard cap on lines returned for indentation mode. Acts as a separate limit from the top-level 'limit' parameter."
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "run_slash_command",
+          "description": "Execute a slash command to get specific instructions or content. Slash commands are predefined templates that provide detailed guidance for common tasks.",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "Name of the slash command to run (e.g., init, test, deploy)"
+              },
+              "args": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional additional context or arguments for the command"
+              }
+            },
+            "required": [
+              "command",
+              "args"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "skill",
+          "description": "Load and execute a skill by name. Skills provide specialized instructions for common tasks like creating MCP servers or custom modes.\n\nUse this tool when you need to follow specific procedures documented in a skill. Available skills are listed in the AVAILABLE SKILLS section of the system prompt.",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "skill": {
+                "type": "string",
+                "description": "Name of the skill to load (e.g., create-mcp-server, create-mode). Must match a skill name from the available skills list."
+              },
+              "args": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional context or arguments to pass to the skill"
+              }
+            },
+            "required": [
+              "skill",
+              "args"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "search_replace",
+          "description": "Use this tool to propose a search and replace operation on an existing file.\n\nThe tool will replace ONE occurrence of old_string with new_string in the specified file.\n\nCRITICAL REQUIREMENTS FOR USING THIS TOOL:\n\n1. UNIQUENESS: The old_string MUST uniquely identify the specific instance you want to change. This means:\n   - Include AT LEAST 3-5 lines of context BEFORE the change point\n   - Include AT LEAST 3-5 lines of context AFTER the change point\n   - Include all whitespace, indentation, and surrounding code exactly as it appears in the file\n\n2. SINGLE INSTANCE: This tool can only change ONE instance at a time. If you need to change multiple instances:\n   - Make separate calls to this tool for each instance\n   - Each call must uniquely identify its specific instance using extensive context\n\n3. VERIFICATION: Before using this tool:\n   - If multiple instances exist, gather enough context to uniquely identify each one\n   - Plan separate tool calls for each instance",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "file_path": {
+                "type": "string",
+                "description": "The path to the file you want to search and replace in. You can use either a relative path in the workspace or an absolute path. If an absolute path is provided, it will be preserved as is."
+              },
+              "old_string": {
+                "type": "string",
+                "description": "The text to replace (must be unique within the file, and must match the file contents exactly, including all whitespace and indentation)"
+              },
+              "new_string": {
+                "type": "string",
+                "description": "The edited text to replace the old_string (must be different from the old_string)"
+              }
+            },
+            "required": [
+              "file_path",
+              "old_string",
+              "new_string"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit_file",
+          "description": "Use this tool to replace text in an existing file, or create a new file.\n\nThis tool performs literal string replacement with support for multiple occurrences.\n\nTo be resilient to minor formatting drift, the tool normalizes line endings (CRLF/LF) for matching and may fall back to deterministic matching strategies when an exact literal match fails (exact → whitespace-tolerant match → token-based match). The original file's line endings are preserved when writing.\n\nUSAGE PATTERNS:\n\n1. MODIFY EXISTING FILE (default):\n   - Provide file_path, old_string (text to find), and new_string (replacement)\n   - By default, expects exactly 1 occurrence of old_string\n   - Use expected_replacements to replace multiple occurrences\n\n2. CREATE NEW FILE:\n   - Set old_string to empty string \"\"\n   - new_string becomes the entire file content\n   - File must not already exist\n\nCRITICAL REQUIREMENTS:\n\n1. EXACT MATCHING (BEST): The old_string should match the file contents EXACTLY, including:\n    - All whitespace (spaces, tabs, newlines)\n    - All indentation\n    - All punctuation and special characters\n\n2. CONTEXT FOR UNIQUENESS: For single replacements (default), include at least 3 lines of context BEFORE and AFTER the target text to ensure uniqueness.\n\n3. MULTIPLE REPLACEMENTS: If you need to replace multiple identical occurrences:\n   - Set expected_replacements to the exact count you expect to replace\n   - ALL occurrences will be replaced\n\n4. NO ESCAPING: Provide the literal text - do not escape special characters.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "file_path": {
+                "type": "string",
+                "description": "The path to the file to modify or create. You can use either a relative path in the workspace or an absolute path. If an absolute path is provided, it will be preserved as is."
+              },
+              "old_string": {
+                "type": "string",
+                "description": "The exact literal text to replace (must match the file contents exactly, including all whitespace and indentation). For single replacements (default), include at least 3 lines of context BEFORE and AFTER the target text. Use empty string to create a new file."
+              },
+              "new_string": {
+                "type": "string",
+                "description": "The exact literal text to replace old_string with. When creating a new file (old_string is empty), this becomes the file content."
+              },
+              "expected_replacements": {
+                "type": "number",
+                "description": "Number of replacements expected. Defaults to 1 if not specified. Use when you want to replace multiple occurrences of the same text.",
+                "minimum": 1
+              }
+            },
+            "required": [
+              "file_path",
+              "old_string",
+              "new_string"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "edit",
+          "description": "Performs exact string replacements in files.\n\nUsage:\n- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.\n- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: spaces + line number + tab. Everything after that tab is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.\n- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n- The edit will FAIL if `old_string` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.\n- Use `replace_all` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "file_path": {
+                "type": "string",
+                "description": "The path of the file to edit (relative to the working directory)"
+              },
+              "old_string": {
+                "type": "string",
+                "description": "The exact text to find in the file. Must match exactly, including all whitespace, indentation, and line endings."
+              },
+              "new_string": {
+                "type": "string",
+                "description": "The replacement text that will replace old_string. Must include all necessary whitespace and indentation."
+              },
+              "replace_all": {
+                "type": "boolean",
+                "description": "When true, replaces ALL occurrences of old_string in the file. When false (default), only replaces the first occurrence and errors if multiple matches exist.",
+                "default": false
+              }
+            },
+            "required": [
+              "file_path",
+              "old_string",
+              "new_string"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "search_files",
+          "description": "Request to perform a regex search across files in a specified directory, providing context-rich results. This tool searches for patterns or specific content across multiple files, displaying each match with encapsulating context.\n\nCraft your regex patterns carefully to balance specificity and flexibility. Use this tool to find code patterns, TODO comments, function definitions, or any text-based information across the project. The results include surrounding context, so analyze the surrounding code to better understand the matches. Leverage this tool in combination with other tools for more comprehensive analysis.\n\nParameters:\n- path: (required) The path of the directory to search in (relative to the current workspace directory). This directory will be recursively searched.\n- regex: (required) The regular expression pattern to search for. Uses Rust regex syntax.\n- file_pattern: (optional) Glob pattern to filter files (e.g., '*.ts' for TypeScript files). If not provided, it will search all files (*).\n\nExample: Searching for all .ts files in the current directory\n{ \"path\": \".\", \"regex\": \".*\", \"file_pattern\": \"*.ts\" }\n\nExample: Searching for function definitions in JavaScript files\n{ \"path\": \"src\", \"regex\": \"function\\s+\\w+\", \"file_pattern\": \"*.js\" }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Directory to search recursively, relative to the workspace"
+              },
+              "regex": {
+                "type": "string",
+                "description": "Rust-compatible regular expression pattern to match"
+              },
+              "file_pattern": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional glob to limit which files are searched (e.g., *.ts)"
+              }
+            },
+            "required": [
+              "path",
+              "regex",
+              "file_pattern"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "update_todo_list",
+          "description": "Replace the entire TODO list with an updated checklist reflecting the current state. Always provide the full list; the system will overwrite the previous one. This tool is designed for step-by-step task tracking, allowing you to confirm completion of each step before updating, update multiple task statuses at once (e.g., mark one as completed and start the next), and dynamically add new todos discovered during long or complex tasks.\n\nChecklist Format:\n- Use a single-level markdown checklist (no nesting or subtasks)\n- List todos in the intended execution order\n- Status options: [ ] (pending), [x] (completed), [-] (in progress)\n- Write each todo as a concrete action, not a vague phase label\n- If a todo requires creating one or more new files, explicitly include every new relative file path in that todo item\n- Do not use vague wording like \"create needed files\", \"add new components\", or \"set up files\" without naming the files\n- If the exact file paths are not known yet, add a discovery/planning todo first and later replace it with concrete file-creation todos once known\n- Each todo that touches files fully owns every file path it names; those files must not also appear in another active or pending todo as files to modify\n- Do not split responsibility for the same file across multiple todo items; if multiple changes touch one file, merge them into one owning todo or first reorganize the todo list\n\nCore Principles:\n- Before updating, always confirm which todos have been completed\n- You may update multiple statuses in a single update\n- Add new actionable items as they're discovered\n- Only mark a task as completed when fully accomplished\n- Replace the full old list with the best current decomposition; do not assume the previous breakdown must be preserved\n- When file creation is required, spell out the new file paths directly in the relevant todo items\n- Preserve clear file ownership boundaries so parallel or subsequent subtasks do not collide on the same file\n\nExample: Initial task list\n{ \"todos\": \"[x] Analyze requirements\\n[x] Design architecture\\n[-] Implement core logic\\n[ ] Write tests\\n[ ] Update documentation\" }\n\nExample: After completing implementation\n{ \"todos\": \"[x] Analyze requirements\\n[x] Design architecture\\n[x] Implement core logic\\n[-] Write tests\\n[ ] Update documentation\\n[ ] Add performance benchmarks\" }\n\nExample: File creation must be explicit\n{ \"todos\": \"[x] Analyze requirements\\n[-] Create src/core/task/Task.ts and src/core/tools/WriteTodoPlanTool.ts changes\\n[ ] Create docs/refine-plan-format.md\\n[ ] Update webview-ui/src/components/chat/ChatRow.tsx\" }\n\nExample: File ownership must not overlap across todos\n{ \"todos\": \"[x] Analyze requirements\\n[-] Modify src/core/task/Task.ts and src/core/prompts/tools/native-tools/write_todo_plan.ts for refine prompt rules\\n[ ] Modify src/core/prompts/tools/native-tools/update_todo_list.ts and src/core/prompts/tools/native-tools/new_task.ts for todo ownership rules\" }\n\nWhen to Use:\n- Task involves multiple steps or requires ongoing tracking\n- Need to update status of several todos at once\n- New actionable items are discovered during execution\n- Task is complex and benefits from stepwise progress tracking\n\nWhen NOT to Use:\n- Only a single, trivial task\n- Task can be completed in one or two simple steps\n- Request is purely conversational or informational",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "todos": {
+                "type": "string",
+                "description": "Full markdown checklist in execution order, using [ ] for pending, [x] for completed, and [-] for in progress. The list replaces the previous todo list in full. If any todo involves creating files, explicitly include every new relative file path in that todo item. Each file path named in a todo should be owned by that todo alone and must not also appear in another unfinished todo that modifies the same file."
+              }
+            },
+            "required": [
+              "todos"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "write_to_file",
+          "description": "Request to write content to a file. This tool is primarily used for creating new files or for scenarios where a complete rewrite of an existing file is intentionally required. If the file exists, it will be overwritten. If it doesn't exist, it will be created. This tool will automatically create any directories needed to write the file.\n\n**Important:** You should prefer using other editing tools over write_to_file when making changes to existing files, since write_to_file is slower and cannot handle large files. Use write_to_file primarily for new file creation.\n\nWhen using this tool, use it directly with the desired content. You do not need to display the content before using the tool. ALWAYS provide the COMPLETE file content in your response. This is NON-NEGOTIABLE. Partial updates or placeholders like '// rest of code unchanged' are STRICTLY FORBIDDEN. Failure to do so will result in incomplete or broken code.\n\nWhen creating a new project, organize all new files within a dedicated project directory unless the user specifies otherwise. Structure the project logically, adhering to best practices for the specific type of project being created.\n\nExample: Writing a configuration file\n{ \"path\": \"frontend-config.json\", \"content\": \"{\\n  \\\"apiEndpoint\\\": \\\"https://api.example.com\\\",\\n  \\\"theme\\\": {\\n    \\\"primaryColor\\\": \\\"#007bff\\\"\\n  }\\n}\" }",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "The path of the file to write to (relative to the current workspace directory)"
+              },
+              "content": {
+                "type": "string",
+                "description": "The content to write to the file. ALWAYS provide the COMPLETE intended content of the file, without any truncation or omissions. You MUST include ALL parts of the file, even if they haven't been modified. Do NOT include line numbers in the content."
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto",
+    "parallelToolCalls": false
+  },
+  "modelId": "deepseek-v3.1:671b-cloud",
+  "provider": "ollama"
+}

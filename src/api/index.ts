@@ -92,6 +92,7 @@ export interface ApiHandlerCreateMessageMetadata {
 	 * distinguished from the base task mode.
 	 */
 	behaviorRole?: string
+	subagentId?: string
 }
 
 export interface ApiHandler {

@@ -16,7 +16,13 @@ import pWaitFor from "p-wait-for"
 import { serializeError } from "serialize-error"
 import { Package } from "../../shared/package"
 import { formatToolInvocation } from "../tools/helpers/toolResultFormatting"
-import { readPlanFiles, type PlanFile } from "../task-persistence/plan-persistence"
+import {
+	appendFileAgreementsToPlanFiles,
+	parsePlanTargetHeader,
+	readPlanFiles,
+	type PlanFileAgreement,
+	type PlanFile,
+} from "../task-persistence/plan-persistence"
 
 import {
 	type TaskLike,
@@ -72,8 +78,9 @@ import { t } from "../../i18n"
 import { getApiMetrics, hasTokenUsageChanged, hasToolUsageChanged } from "../../shared/getApiMetrics"
 import { ClineAskResponse } from "../../shared/WebviewMessage"
 import { defaultModeSlug, getModeBySlug, getGroupName } from "../../shared/modes"
-import { DiffStrategy, type ToolUse, type ToolParamName, toolParamNames } from "../../shared/tools"
+import { DiffStrategy, type ToolUse, type ToolParamName, type ToolResponse, toolParamNames } from "../../shared/tools"
 import { getModelMaxOutputTokens } from "../../shared/api"
+import { renderAgreementChecklistBullets } from "../../shared/agreement-checklist"
 
 // services
 import { UrlContentFetcher } from "../../services/browser/UrlContentFetcher"
@@ -94,6 +101,7 @@ import { calculateApiCostAnthropic, calculateApiCostOpenAI } from "../../shared/
 import { getReadablePath, getWorkspacePath } from "../../utils/path"
 import { isPathOutsideWorkspace } from "../../utils/pathUtils"
 import { sanitizeToolUseId } from "../../utils/tool-id"
+import { singleCompletionHandler } from "../../utils/single-completion-handler"
 import { getTaskDirectoryPath, getTaskOptimizePlanPath } from "../../utils/storage"
 
 // prompts
@@ -103,7 +111,7 @@ import { buildNativeToolsArrayWithRestrictions } from "./build-tools"
 
 // core modules
 import { ToolRepetitionDetector } from "../tools/ToolRepetitionDetector"
-import { restoreTodoListForTask } from "../tools/UpdateTodoListTool"
+import { restoreTodoListForTask, setTodoListForTask } from "../tools/UpdateTodoListTool"
 import { FileContextTracker } from "../context-tracking/FileContextTracker"
 import { RooIgnoreController } from "../ignore/RooIgnoreController"
 import { RooProtectedController } from "../protect/RooProtectedController"
@@ -156,6 +164,9 @@ import {
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
+const STEP3_AGREEMENT_PASS_TIMEOUT_MS = 30_000
+const REFINE_RESUME_STATE_FILE = "refine_state.json"
+const SUBAGENT_RESUME_STATE_FILE = "subagent_state.json"
 
 export interface TaskOptions extends CreateTaskOptions {
 	provider: ClineProvider
@@ -177,6 +188,414 @@ export interface TaskOptions extends CreateTaskOptions {
 	workspacePath?: string
 	/** Initial status for the task's history item (e.g., "active" for child tasks) */
 	initialStatus?: "active" | "delegated" | "completed"
+}
+
+type PostSubtaskAgreementItem = {
+	text: string
+	shared_with: string[]
+}
+
+type PostSubtaskFileAgreement = {
+	file_path: string
+	agreements: PostSubtaskAgreementItem[]
+}
+
+type PostSubtaskAgreementResponse = {
+	fileAgreements: PostSubtaskFileAgreement[]
+}
+
+type PostSubtaskAgreementPassOutcome = {
+	executed: boolean
+	appendedCount: number
+	fileAgreementCount: number
+	planAgreementCount?: number
+	planAgreements?: PlanFileAgreement[]
+	skippedReason?: string
+	error?: string
+}
+
+type RefineResumeState = {
+	status: "in_progress"
+	activeTodoItemIds: string[]
+	updatedAt: number
+}
+
+type SubagentResumeState = {
+	status: "in_progress"
+	todoItemIds: string[]
+	completedTodoItemIds: string[]
+	startedAt: number
+	updatedAt: number
+}
+
+type AgreementPassOptions = {
+	updateAllTodoContexts?: boolean
+}
+
+const STEP3_FILE_AGREEMENTS_BEGIN = "<!-- BEGIN_STEP3_FILE_AGREEMENTS -->"
+const STEP3_FILE_AGREEMENTS_END = "<!-- END_STEP3_FILE_AGREEMENTS -->"
+const STEP3_FILE_AGREEMENTS_TITLE = "## Step 3 Cross-Task Agreements By Refine File"
+const PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE = "### Cross-Task Agreements Owned By This File"
+
+function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+	let timeout: ReturnType<typeof setTimeout> | undefined
+	const timeoutPromise = new Promise<never>((_, reject) => {
+		timeout = setTimeout(() => {
+			timeout = undefined
+			reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`))
+		}, timeoutMs)
+	})
+
+	return Promise.race([
+		operation.finally(() => {
+			if (timeout) {
+				clearTimeout(timeout)
+			}
+		}),
+		timeoutPromise,
+	])
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function normalizeCodeTargetPath(value: string): string {
+	return value
+		.trim()
+		.replace(/^`|`$/g, "")
+		.replace(/^["']|["']$/g, "")
+		.replace(/\\/g, "/")
+		.trim()
+}
+
+function collectCodePlanTargets(planFiles: PlanFile[]): string[] {
+	const targets: string[] = []
+	const seen = new Set<string>()
+	for (const plan of planFiles) {
+		const parsedHeader = parsePlanTargetHeader(plan.content)
+		if (parsedHeader?.action === "GENERAL") {
+			continue
+		}
+
+		const target = normalizeCodeTargetPath(parsedHeader?.path ?? plan.filePath)
+		if (!target || seen.has(target)) {
+			continue
+		}
+		seen.add(target)
+		targets.push(target)
+	}
+	return targets
+}
+
+function collectTodoMentionedCodeTargets(todos: TodoItem[]): string[] {
+	const targets: string[] = []
+	const seen = new Set<string>()
+	const pathRegex =
+		/(?:^|[\s,;:()[\]{}"'`])((?:\.{1,2}[\\/])?(?:[A-Za-z0-9_@.+-]+[\\/])+[A-Za-z0-9_@.+-]+\.[A-Za-z0-9_+-]+)(?=$|[\s,;:()[\]{}"'`])/g
+
+	for (const todo of todos) {
+		const source = `${todo.content}\n${todo.context ?? ""}`
+		for (const match of source.matchAll(pathRegex)) {
+			const target = normalizeCodeTargetPath(match[1] ?? "")
+			if (target && !seen.has(target)) {
+				seen.add(target)
+				targets.push(target)
+			}
+		}
+	}
+
+	return targets
+}
+
+function collectAvailableCodeTargets(todos: TodoItem[], planFiles: PlanFile[]): string[] {
+	const targets: string[] = []
+	const seen = new Set<string>()
+	for (const target of [...collectCodePlanTargets(planFiles), ...collectTodoMentionedCodeTargets(todos)]) {
+		if (target && !seen.has(target)) {
+			seen.add(target)
+			targets.push(target)
+		}
+	}
+	return targets
+}
+
+function normalizeAgreementText(value: string): string {
+	return value
+		.trim()
+		.replace(/^\s*[-*]\s+/, "")
+		.trim()
+}
+
+function normalizeSharedWithTargets(targets: string[]): string[] {
+	const unique: string[] = []
+	for (const target of targets) {
+		const normalized = normalizeCodeTargetPath(target)
+		if (normalized && !unique.includes(normalized)) {
+			unique.push(normalized)
+		}
+	}
+	return unique
+}
+
+function parseSharedWithTargets(value: string): string[] {
+	return normalizeSharedWithTargets(value.split(","))
+}
+
+function normalizeAgreementItem(agreement: PostSubtaskAgreementItem): PostSubtaskAgreementItem | undefined {
+	const text = normalizeAgreementText(agreement.text)
+	if (!text) {
+		return undefined
+	}
+	return {
+		text,
+		shared_with: normalizeSharedWithTargets(agreement.shared_with),
+	}
+}
+
+function mergeAgreementItem(existing: PostSubtaskAgreementItem[], agreement: PostSubtaskAgreementItem): void {
+	const normalized = normalizeAgreementItem(agreement)
+	if (!normalized) {
+		return
+	}
+
+	const match = existing.find((item) => item.text === normalized.text)
+	if (match) {
+		match.shared_with = normalizeSharedWithTargets([...match.shared_with, ...normalized.shared_with])
+		return
+	}
+
+	existing.push(normalized)
+}
+
+function normalizeFileAgreements(
+	fileAgreements: PostSubtaskFileAgreement[],
+	planFiles: PlanFile[],
+	availableSharedTargets?: string[],
+): PostSubtaskFileAgreement[] {
+	const ownerTargets = new Set(collectCodePlanTargets(planFiles))
+	const sharedTargets = new Set(availableSharedTargets ?? collectCodePlanTargets(planFiles))
+	const grouped = new Map<string, PostSubtaskAgreementItem[]>()
+	for (const entry of fileAgreements) {
+		const filePath = normalizeCodeTargetPath(entry.file_path)
+		if (!filePath || (ownerTargets.size > 0 && !ownerTargets.has(filePath))) {
+			continue
+		}
+
+		const existing = grouped.get(filePath) ?? []
+		for (const agreement of entry.agreements) {
+			const normalized = normalizeAgreementItem(agreement)
+			if (!normalized) {
+				continue
+			}
+			normalized.shared_with = normalized.shared_with.filter(
+				(target) => target !== filePath && (sharedTargets.size === 0 || sharedTargets.has(target)),
+			)
+			mergeAgreementItem(existing, normalized)
+		}
+		if (existing.length > 0) {
+			grouped.set(filePath, existing)
+		}
+	}
+
+	return Array.from(grouped.entries()).map(([file_path, agreements]) => ({ file_path, agreements }))
+}
+
+function parseStep3FileAgreementSection(context: string): Map<string, PostSubtaskAgreementItem[]> {
+	const result = new Map<string, PostSubtaskAgreementItem[]>()
+	const sectionRegex = new RegExp(
+		`${escapeRegExp(STEP3_FILE_AGREEMENTS_BEGIN)}\\s*([\\s\\S]*?)\\s*${escapeRegExp(STEP3_FILE_AGREEMENTS_END)}`,
+	)
+	const match = context.match(sectionRegex)
+	const body = match?.[1] ?? ""
+	const headingRegex = /^### (?:Refine file:\s*)?`([^`]+)`\s*$/gm
+	const headings = Array.from(body.matchAll(headingRegex))
+	for (let i = 0; i < headings.length; i++) {
+		const heading = headings[i]
+		const filePath = heading[1]?.trim()
+		if (!filePath) {
+			continue
+		}
+
+		const start = (heading.index ?? 0) + heading[0].length
+		const end = i + 1 < headings.length ? (headings[i + 1].index ?? body.length) : body.length
+		const section = body.slice(start, end)
+		const agreements: PostSubtaskAgreementItem[] = []
+		let currentAgreement: PostSubtaskAgreementItem | undefined
+		for (const line of section.split(/\r?\n/)) {
+			const sharedWithMatch = line.match(/^\s+[-*]\s+Shared with:\s*(.+?)\s*$/i)
+			if (sharedWithMatch && currentAgreement) {
+				currentAgreement.shared_with = normalizeSharedWithTargets([
+					...currentAgreement.shared_with,
+					...parseSharedWithTargets(sharedWithMatch[1] ?? ""),
+				])
+				continue
+			}
+
+			const agreementMatch = line.match(/^\s*[-*]\s+(.+?)\s*$/)
+			if (!agreementMatch) {
+				continue
+			}
+
+			const text = normalizeAgreementText(agreementMatch[1] ?? "")
+			if (!text || /^Shared with:/i.test(text)) {
+				continue
+			}
+
+			currentAgreement = { text, shared_with: [] }
+			agreements.push(currentAgreement)
+		}
+		if (agreements.length > 0) {
+			const merged: PostSubtaskAgreementItem[] = []
+			for (const agreement of agreements) {
+				mergeAgreementItem(merged, agreement)
+			}
+			result.set(normalizeCodeTargetPath(filePath), merged)
+		}
+	}
+	return result
+}
+
+function stripStep3FileAgreementSection(context: string): string {
+	const sectionRegex = new RegExp(
+		`\\n*${escapeRegExp(STEP3_FILE_AGREEMENTS_BEGIN)}\\s*[\\s\\S]*?\\s*${escapeRegExp(STEP3_FILE_AGREEMENTS_END)}\\n*`,
+	)
+	return context.replace(sectionRegex, "\n\n").trim()
+}
+
+function formatAgreementItemLines(agreement: PostSubtaskAgreementItem): string[] {
+	const normalized = normalizeAgreementItem(agreement)
+	if (!normalized) {
+		return []
+	}
+
+	const lines = [`- ${normalized.text}`]
+	if (normalized.shared_with.length > 0) {
+		lines.push(`  - Shared with: ${normalized.shared_with.map((target) => `\`${target}\``).join(", ")}`)
+	}
+	return lines
+}
+
+function buildStep3FileAgreementBlock(agreementsByFile: Map<string, PostSubtaskAgreementItem[]>): string {
+	const sections: string[] = []
+	for (const [filePath, agreements] of agreementsByFile.entries()) {
+		const uniqueAgreements: PostSubtaskAgreementItem[] = []
+		for (const agreement of agreements) {
+			mergeAgreementItem(uniqueAgreements, agreement)
+		}
+		if (uniqueAgreements.length === 0) {
+			continue
+		}
+		sections.push(
+			[`### Refine file: \`${filePath}\``, ...uniqueAgreements.flatMap(formatAgreementItemLines)].join("\n"),
+		)
+	}
+
+	return sections.length > 0
+		? [
+				STEP3_FILE_AGREEMENTS_BEGIN,
+				STEP3_FILE_AGREEMENTS_TITLE,
+				"",
+				sections.join("\n\n"),
+				STEP3_FILE_AGREEMENTS_END,
+			].join("\n")
+		: ""
+}
+
+function buildPlanSectionAgreementContent(agreements: PostSubtaskAgreementItem[]): string {
+	const uniqueAgreements: PostSubtaskAgreementItem[] = []
+	for (const agreement of agreements) {
+		mergeAgreementItem(uniqueAgreements, agreement)
+	}
+	return uniqueAgreements.length > 0
+		? [PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE, ...uniqueAgreements.flatMap(formatAgreementItemLines)].join("\n")
+		: ""
+}
+
+function stripPlanSectionAgreementContent(content: string): string {
+	const sectionRegex = new RegExp(`\\n*${escapeRegExp(PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE)}\\r?\\n[\\s\\S]*$`)
+	return content.replace(sectionRegex, "").trimEnd()
+}
+
+function buildPlanAgreementsFromFileAgreements(fileAgreements: PostSubtaskFileAgreement[]): PlanFileAgreement[] {
+	return fileAgreements
+		.map((entry) => ({
+			plan_target_path: entry.file_path,
+			content: buildPlanSectionAgreementContent(entry.agreements),
+		}))
+		.filter((entry) => entry.plan_target_path.trim().length > 0 && entry.content.trim().length > 0)
+}
+
+function getTaskContextPlanAgreements(context: string | undefined, planFiles: PlanFile[]): PlanFileAgreement[] {
+	const agreementsByFile = parseStep3FileAgreementSection(context?.trim() ?? "")
+	const planTargets = collectCodePlanTargets(planFiles)
+	return planTargets
+		.map((target) => ({
+			plan_target_path: target,
+			content: buildPlanSectionAgreementContent(agreementsByFile.get(target) ?? []),
+		}))
+		.filter((entry) => entry.content.trim().length > 0)
+}
+
+function applyPlanAgreementsToPlanEntries(
+	planFiles: PlanFile[],
+	agreements: PlanFileAgreement[],
+): { plans: PlanFile[]; appliedCount: number } {
+	const agreementsByTarget = new Map<string, string>()
+	for (const agreement of agreements) {
+		const target = normalizeCodeTargetPath(agreement.plan_target_path)
+		const content = agreement.content.trim()
+		if (target && content) {
+			agreementsByTarget.set(target, content)
+		}
+	}
+
+	let appliedCount = 0
+	const plans = planFiles.map((plan) => {
+		const parsedHeader = parsePlanTargetHeader(plan.content)
+		if (parsedHeader?.action === "GENERAL") {
+			return plan
+		}
+
+		const target = normalizeCodeTargetPath(parsedHeader?.path ?? plan.filePath)
+		const content = agreementsByTarget.get(target)
+		if (!content || plan.content.includes(content)) {
+			return plan
+		}
+
+		const baseContent = stripPlanSectionAgreementContent(plan.content)
+		appliedCount++
+		return {
+			...plan,
+			content: `${baseContent}\n\n${content}`,
+		}
+	})
+
+	return { plans, appliedCount }
+}
+
+function mergeStep3FileAgreementsIntoContext(
+	context: string | undefined,
+	fileAgreements: PostSubtaskFileAgreement[],
+): string {
+	const existingContext = context?.trim() ?? ""
+	const agreementsByFile = parseStep3FileAgreementSection(existingContext)
+	for (const entry of fileAgreements) {
+		const existing = agreementsByFile.get(entry.file_path) ?? []
+		for (const agreement of entry.agreements) {
+			mergeAgreementItem(existing, agreement)
+		}
+		if (existing.length > 0) {
+			agreementsByFile.set(entry.file_path, existing)
+		}
+	}
+
+	const nextBlock = buildStep3FileAgreementBlock(agreementsByFile)
+	const baseContext = stripStep3FileAgreementSection(existingContext)
+	if (!nextBlock) {
+		return baseContext
+	}
+	return baseContext ? `${baseContext}\n\n${nextBlock}` : nextBlock
 }
 
 export class Task extends EventEmitter<TaskEvents> implements TaskLike {
@@ -597,12 +1016,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * can take over without the main loop continuing to send API requests.
 	 */
 	subagentsPending = false
-	/**
-	 * Files this task is allowed to edit (for parallel dispatch file ownership).
-	 * When set, edit operations to files NOT in this list will be rejected.
-	 * Undefined = no restriction (normal task).
-	 */
-	ownedFiles?: string[]
+	private subtaskAgreementPassChain: Promise<void> = Promise.resolve()
+	private subagentResumeStateWriteChain: Promise<void> = Promise.resolve()
+	private subagentResumeReviewPending = false
 	private _started = false
 	// No streaming parser is required.
 	assistantMessageParser?: undefined
@@ -933,16 +1349,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * - When switching between tasks with different modes
 	 * - Before operations that depend on mode-based permissions
 	 *
-	 * ## Example usage
-	 * ```typescript
-	 * // Wait for mode initialization before mode-dependent operations
-	 * await task.waitForModeInitialization();
-	 * const mode = task.taskMode; // Now safe to access synchronously
-	 *
-	 * // Or use with getTaskMode() for a one-liner
-	 * const mode = await task.getTaskMode(); // Internally waits for initialization
-	 * ```
-	 *
 	 * @returns Promise that resolves when the task mode is initialized
 	 * @public
 	 */
@@ -960,18 +1366,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * - Returns the initialized mode or `defaultModeSlug` as fallback
 	 * - Safe to call multiple times - subsequent calls return immediately if already initialized
 	 *
-	 * ## Example usage
-	 * ```typescript
-	 * // Safe async access
-	 * const mode = await task.getTaskMode();
-	 * console.log(`Task is running in ${mode} mode`);
-	 *
-	 * // Use in conditional logic
-	 * if (await task.getTaskMode() === 'architect') {
-	 *   // Perform architect-specific operations
-	 * }
-	 * ```
-	 *
 	 * @returns Promise resolving to the task mode string
 	 * @public
 	 */
@@ -988,18 +1382,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * - In synchronous contexts where async/await is not available
 	 * - After explicitly waiting for initialization via `waitForModeInitialization()`
 	 * - In event handlers or callbacks where mode is guaranteed to be initialized
-	 *
-	 * ## Example usage
-	 * ```typescript
-	 * // After ensuring initialization
-	 * await task.waitForModeInitialization();
-	 * const mode = task.taskMode; // Safe synchronous access
-	 *
-	 * // In an event handler after task is started
-	 * task.on('taskStarted', () => {
-	 *   console.log(`Task started in ${task.taskMode} mode`); // Safe here
-	 * });
-	 * ```
 	 *
 	 * @throws {Error} If the mode hasn't been initialized yet
 	 * @returns The task mode string
@@ -1470,87 +1852,361 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			} as ApiMessage)
 		}
 
-		// 3. Inject plan files for current item (if any exist)
-		if (!this.isRefineMode) {
-			try {
-				const { plans: planFiles, contexts: fileContexts } = await readPlanFiles(
-					this.globalStoragePath,
-					this.taskId,
-					this.taskTimestamp,
-					currentItem.id,
-					currentItem.content,
-				)
-
-				const todoContext = currentItem.context?.trim()
-				const taskContexts =
-					todoContext && !fileContexts.includes(todoContext)
-						? [todoContext, ...fileContexts]
-						: todoContext
-							? [todoContext, ...fileContexts.filter((c) => c !== todoContext)]
-							: [...fileContexts]
-
-				// Inject context blocks FIRST — each one is a separate interface contract / convention block
-				for (let ci = 0; ci < taskContexts.length; ci++) {
-					const label = taskContexts.length === 1 ? "" : ` (${ci + 1}/${taskContexts.length})`
-					result.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: `[TASK CONTEXT${label} for "${currentItem.content}"]\nThe following context was prepared by the planning agent. It contains task-specific requirements, dependencies, constraints, conventions, and background findings. Use this as your primary reference:\n\n${taskContexts[ci]}`,
-							},
-						],
-						ts: Date.now(),
-					} as ApiMessage)
-
-					result.push({
-						role: "assistant",
-						content: [
-							{
-								type: "text",
-								text: `Understood. I have task context${label} for "${currentItem.content}".`,
-							},
-						],
-						ts: Date.now(),
-					} as ApiMessage)
-				}
-
-				if (planFiles.length > 0) {
-					const planText = planFiles.map((pf) => `### ${pf.filePath}\n${pf.content}`).join("\n\n")
-
-					result.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: `[IMPLEMENTATION PLAN for "${currentItem.content}"]\nThe following refine plans were created during the refine phase. They may describe concrete project file changes or non-code planning sections such as project review, project planning, debugging strategy, architecture analysis, or investigation guidance. Follow them closely:\n\n${planText}`,
-							},
-						],
-						ts: Date.now(),
-					} as ApiMessage)
-
-					result.push({
-						role: "assistant",
-						content: [
-							{
-								type: "text",
-								text: `Understood. I will follow the refine plan for "${currentItem.content}" covering ${planFiles.length} plan section(s).`,
-							},
-						],
-						ts: Date.now(),
-					} as ApiMessage)
-				}
-			} catch (err) {
-				console.warn("[buildEffectiveHistory] Failed to read plan files (non-critical):", err)
-			}
-		}
-
-		// 4. Keep all messages from the current item's boundary onwards
+		// 3. Keep all messages from the current item's boundary onwards
 		for (let i = currentItemStart; i < this.apiConversationHistory.length; i++) {
 			result.push(this.apiConversationHistory[i])
 		}
 
 		return result
+	}
+
+	private async getRefineResumeStatePath(): Promise<string> {
+		const taskDir = await getTaskDirectoryPath(this.globalStoragePath, this.taskId)
+		return path.join(taskDir, REFINE_RESUME_STATE_FILE)
+	}
+
+	public async persistRefineResumeState(activeTodoItemIds?: string[] | null): Promise<void> {
+		try {
+			const statePath = await this.getRefineResumeStatePath()
+			const ids = activeTodoItemIds ?? this.activeRefineTodoItemIds ?? []
+			const state: RefineResumeState = {
+				status: "in_progress",
+				activeTodoItemIds: ids,
+				updatedAt: Date.now(),
+			}
+			await fs.mkdir(path.dirname(statePath), { recursive: true })
+			await fs.writeFile(statePath, JSON.stringify(state, null, 2), "utf8")
+		} catch (error) {
+			console.warn("[Task] Failed to persist refine resume state:", error)
+		}
+	}
+
+	public async clearRefineResumeState(): Promise<void> {
+		try {
+			await fs.rm(await this.getRefineResumeStatePath(), { force: true })
+		} catch (error) {
+			console.warn("[Task] Failed to clear refine resume state:", error)
+		}
+	}
+
+	private async readRefineResumeState(): Promise<RefineResumeState | undefined> {
+		try {
+			const raw = await fs.readFile(await this.getRefineResumeStatePath(), "utf8")
+			const parsed = JSON.parse(raw) as Partial<RefineResumeState>
+			if (parsed.status !== "in_progress") {
+				return undefined
+			}
+			return {
+				status: "in_progress",
+				activeTodoItemIds: Array.isArray(parsed.activeTodoItemIds) ? parsed.activeTodoItemIds : [],
+				updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
+			}
+		} catch {
+			return undefined
+		}
+	}
+
+	private async getSubagentResumeStatePath(): Promise<string> {
+		const taskDir = await getTaskDirectoryPath(this.globalStoragePath, this.taskId)
+		return path.join(taskDir, SUBAGENT_RESUME_STATE_FILE)
+	}
+
+	private normalizeTodoItemIds(todoItemIds?: string[] | null): string[] {
+		const source = todoItemIds ?? (this.todoList ?? []).map((todo) => todo.id)
+		return Array.from(
+			new Set(
+				source
+					.map((id) => (typeof id === "string" ? id.trim() : ""))
+					.filter((id): id is string => id.length > 0),
+			),
+		)
+	}
+
+	public async persistSubagentResumeState(
+		todoItemIds?: string[] | null,
+		completedTodoItemIds?: string[] | null,
+	): Promise<void> {
+		const write = async () => {
+			try {
+				const previous = await this.readSubagentResumeState()
+				const ids = this.normalizeTodoItemIds(todoItemIds ?? previous?.todoItemIds)
+				const nextCompletedTodoItemIds = completedTodoItemIds ?? []
+				const completedIds = this.normalizeTodoItemIds(
+					completedTodoItemIds === undefined
+						? previous?.completedTodoItemIds
+						: [...(previous?.completedTodoItemIds ?? []), ...nextCompletedTodoItemIds],
+				)
+				const state: SubagentResumeState = {
+					status: "in_progress",
+					todoItemIds: ids,
+					completedTodoItemIds: completedIds.filter((id) => ids.includes(id)),
+					startedAt: previous?.startedAt && previous.startedAt > 0 ? previous.startedAt : Date.now(),
+					updatedAt: Date.now(),
+				}
+				const statePath = await this.getSubagentResumeStatePath()
+				await fs.mkdir(path.dirname(statePath), { recursive: true })
+				await fs.writeFile(statePath, JSON.stringify(state, null, 2), "utf8")
+			} catch (error) {
+				console.warn("[Task] Failed to persist subagent resume state:", error)
+			}
+		}
+		this.subagentResumeStateWriteChain = this.subagentResumeStateWriteChain.then(write, write)
+		await this.subagentResumeStateWriteChain
+	}
+
+	public async markSubagentResumeTodoCompleted(todoItemId: string): Promise<void> {
+		const state = await this.readSubagentResumeState()
+		if (!state || !state.todoItemIds.includes(todoItemId)) {
+			return
+		}
+		await this.persistSubagentResumeState(state.todoItemIds, [...state.completedTodoItemIds, todoItemId])
+	}
+
+	public async clearSubagentResumeState(): Promise<void> {
+		this.subagentResumeReviewPending = false
+		try {
+			await fs.rm(await this.getSubagentResumeStatePath(), { force: true })
+		} catch (error) {
+			console.warn("[Task] Failed to clear subagent resume state:", error)
+		}
+	}
+
+	private async readSubagentResumeState(): Promise<SubagentResumeState | undefined> {
+		try {
+			const raw = await fs.readFile(await this.getSubagentResumeStatePath(), "utf8")
+			const parsed = JSON.parse(raw) as Partial<SubagentResumeState>
+			if (parsed.status !== "in_progress") {
+				return undefined
+			}
+			const todoItemIds = this.normalizeTodoItemIds(Array.isArray(parsed.todoItemIds) ? parsed.todoItemIds : [])
+			return {
+				status: "in_progress",
+				todoItemIds,
+				completedTodoItemIds: this.normalizeTodoItemIds(
+					Array.isArray(parsed.completedTodoItemIds) ? parsed.completedTodoItemIds : [],
+				).filter((id) => todoItemIds.includes(id)),
+				startedAt: typeof parsed.startedAt === "number" ? parsed.startedAt : 0,
+				updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
+			}
+		} catch {
+			return undefined
+		}
+	}
+
+	private getUnfinishedSubagentTodoIds(state: SubagentResumeState): string[] {
+		const existingTodos = this.todoList ?? []
+		const completedTodoIds = new Set(state.completedTodoItemIds)
+		if (existingTodos.length === 0) {
+			return state.todoItemIds.filter((id) => !completedTodoIds.has(id))
+		}
+		const existingTodoIds = new Set(existingTodos.map((todo) => todo.id))
+		return state.todoItemIds.filter((id) => existingTodoIds.has(id) && !completedTodoIds.has(id))
+	}
+
+	public async hasSubagentResumeState(): Promise<boolean> {
+		const state = await this.readSubagentResumeState()
+		if (!state) {
+			return false
+		}
+		const unfinishedTodoIds = this.getUnfinishedSubagentTodoIds(state)
+		if (unfinishedTodoIds.length === 0) {
+			await this.clearSubagentResumeState()
+			return false
+		}
+		return true
+	}
+
+	public async shouldReviewSubagentResumeState(): Promise<boolean> {
+		return this.subagentResumeReviewPending && (await this.hasSubagentResumeState())
+	}
+
+	public clearSubagentResumeReviewState(): void {
+		this.subagentResumeReviewPending = false
+	}
+
+	private formatTodoListForPrompt(todos: TodoItem[]): string {
+		return todos
+			.map((todo) => {
+				const mark = todo.status === "completed" ? "x" : todo.status === "in_progress" ? "-" : " "
+				return `[${mark}] ${todo.content}`
+			})
+			.join("\n")
+	}
+
+	private async buildRefineResumeReminder(): Promise<string | undefined> {
+		const state = await this.readRefineResumeState()
+		if (!state) {
+			return undefined
+		}
+		if (!this.isRefineMode && state.activeTodoItemIds.length === 0) {
+			await this.clearRefineResumeState()
+			return undefined
+		}
+		const activeIds = state.activeTodoItemIds.length > 0 ? state.activeTodoItemIds.join(", ") : "(none recorded)"
+		const todoList =
+			this.todoList && this.todoList.length > 0 ? this.formatTodoListForPrompt(this.todoList) : "(not available)"
+		const updatedAt = state.updatedAt > 0 ? new Date(state.updatedAt).toISOString() : "unknown"
+		const writeTodoPlanFormatReminder = [
+			"Do not copy compact previous_context placeholders such as plans=[object Object]; they are lossy summaries, not valid tool arguments.",
+			"Every write_todo_plan plans entry must include target, action, and body.",
+			'For plan_type="general", target must be a descriptive section title and action must be "GENERAL".',
+		].join("\n")
+		if (this.isRefineMode) {
+			return [
+				"[REFINE IN PROGRESS]",
+				"A refine operation is currently active. Keep working in refine mode until all required todo plans are recorded with write_todo_plan.",
+				"This temporary marker is injected while refine is active and will be removed when parallel subagents start.",
+				"",
+				writeTodoPlanFormatReminder,
+				"",
+				`Recorded active refine todo item ids: ${activeIds}`,
+				`Refine state last updated: ${updatedAt}`,
+				"",
+				"Current todo list:",
+				todoList,
+			].join("\n")
+		}
+		return [
+			"[REFINE IN PROGRESS - RESUME CHECK]",
+			"The previous session stopped after the user entered refine mode and before parallel subagents started.",
+			"You are now resuming in the main AI layer, not automatically inside refine mode.",
+			"Review the current conversation and todo state, then decide whether the previous refine flow should be resumed or normal main-mode work should continue.",
+			"If refine should be resumed, continue the refine workflow and record the remaining implementation plans with write_todo_plan before starting implementation work.",
+			"If normal work should continue, proceed in main mode; the pending refine marker will be cleared when normal execution work begins.",
+			"",
+			writeTodoPlanFormatReminder,
+			"",
+			`Recorded active refine todo item ids: ${activeIds}`,
+			`Refine state last updated: ${updatedAt}`,
+			"",
+			"Current todo list:",
+			todoList,
+		].join("\n")
+	}
+
+	private async buildHistoryWithRefineContextMarker(messages: ApiMessage[]): Promise<ApiMessage[]> {
+		const marker = await this.buildRefineResumeReminder()
+		if (!marker) {
+			return messages
+		}
+		return [
+			...messages,
+			{
+				role: "user",
+				content: [{ type: "text", text: marker }],
+				ts: Date.now(),
+			} as ApiMessage,
+		]
+	}
+
+	private async buildSubagentResumeReminder(): Promise<string | undefined> {
+		if (this.isRefineMode || !this.subagentResumeReviewPending) {
+			return undefined
+		}
+		const state = await this.readSubagentResumeState()
+		if (!state) {
+			return undefined
+		}
+		const unfinishedTodoIds = this.getUnfinishedSubagentTodoIds(state)
+		if (unfinishedTodoIds.length === 0) {
+			await this.clearSubagentResumeState()
+			return undefined
+		}
+		const todoList =
+			this.todoList && this.todoList.length > 0 ? this.formatTodoListForPrompt(this.todoList) : "(not available)"
+		const todoById = new Map((this.todoList ?? []).map((todo) => [todo.id, todo.content]))
+		const unfinishedSummary = unfinishedTodoIds
+			.map((id) => `${id}: ${todoById.get(id) ?? "(missing todo)"}`)
+			.join("\n")
+		const completedSummary =
+			state.completedTodoItemIds.length > 0
+				? state.completedTodoItemIds.map((id) => `${id}: ${todoById.get(id) ?? "(missing todo)"}`).join("\n")
+				: "(none recorded)"
+		const updatedAt = state.updatedAt > 0 ? new Date(state.updatedAt).toISOString() : "unknown"
+
+		return [
+			"[SUBAGENT EXECUTION INTERRUPTED - RESUME CHECK]",
+			"The previous session was interrupted after refine planning had handed execution to parallel subagents.",
+			"You are now resuming in the main AI layer, not inside any individual subagent.",
+			"Do not continue only the most recent child-agent conversation and do not assume a single subagent's local state is authoritative.",
+			"Review the current conversation, todo list, and saved plan state, then decide whether parallel subagent execution should be restarted or normal main-mode work should continue.",
+			"If parallel subagent execution should continue, call resume_subagents. The scheduler will launch the unfinished refined todo items from saved plan files.",
+			"If normal main-mode work should continue, do not call resume_subagents; proceed normally and the pending subagent marker will be cleared when normal execution work begins.",
+			"",
+			`Subagent state last updated: ${updatedAt}`,
+			"",
+			"Unfinished subagent todo item ids:",
+			unfinishedSummary,
+			"",
+			"Completed subagent todo item ids:",
+			completedSummary,
+			"",
+			"Current todo list:",
+			todoList,
+		].join("\n")
+	}
+
+	private async buildHistoryWithSubagentContextMarker(messages: ApiMessage[]): Promise<ApiMessage[]> {
+		const marker = await this.buildSubagentResumeReminder()
+		if (!marker) {
+			return messages
+		}
+		return [
+			...messages,
+			{
+				role: "user",
+				content: [{ type: "text", text: marker }],
+				ts: Date.now(),
+			} as ApiMessage,
+		]
+	}
+
+	public async hasRefineResumeState(): Promise<boolean> {
+		const state = await this.readRefineResumeState()
+		if (!state) {
+			return false
+		}
+		if (state.activeTodoItemIds.length === 0) {
+			await this.clearRefineResumeState()
+			return false
+		}
+		return true
+	}
+
+	public async restoreRefineModeFromResumeState(): Promise<boolean> {
+		const state = await this.readRefineResumeState()
+		if (!state) {
+			return false
+		}
+		const existingTodoIds = new Set((this.todoList ?? []).map((todo) => todo.id))
+		const activeTodoItemIds = state.activeTodoItemIds.filter((id) => existingTodoIds.has(id))
+		if (activeTodoItemIds.length === 0) {
+			return false
+		}
+		this.activeRefineTodoItemIds = activeTodoItemIds
+		this.isRefineMode = true
+		await this.persistRefineResumeState(activeTodoItemIds)
+		return true
+	}
+
+	private async prepareRefinePromptForTodos(todos: TodoItem[]): Promise<string | undefined> {
+		if (todos.length === 0) {
+			return undefined
+		}
+		const refinePrompt = buildRefinePrompt(this.formatTodoListForPrompt(todos))
+		this.activeRefineTodoItemIds = todos.map((todo) => todo.id)
+		this.isRefineMode = true
+		await this.persistRefineResumeState(this.activeRefineTodoItemIds)
+		await this.say(
+			"todo_item_divider",
+			JSON.stringify({ content: "Refine", todoItemId: "__refine__" }),
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ isNonInteractive: true },
+		)
+		return refinePrompt
 	}
 
 	// NOTE: We intentionally do NOT mutate stored messages to merge consecutive user turns.
@@ -1716,11 +2372,23 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	}
 
 	/**
-	 * Update or create a user_edit_todos message. If the last user_edit_todos
-	 * message exists, update its text in-place instead of creating a duplicate.
+	 * Update or create the latest todo list display message. If the latest
+	 * updateTodoList message exists, update its text in-place instead of
+	 * creating a duplicate todo list entry in chat.
 	 */
 	public async upsertUserEditTodos(text: string): Promise<void> {
-		const lastIdx = findLastIndex(this.clineMessages, (m) => m.type === "say" && m.say === "user_edit_todos")
+		const lastIdx = findLastIndex(this.clineMessages, (m) => {
+			if (!((m.type === "say" && m.say === "user_edit_todos") || (m.type === "ask" && m.ask === "tool"))) {
+				return false
+			}
+
+			try {
+				const data = JSON.parse(m.text || "{}")
+				return data.tool === "updateTodoList" && Array.isArray(data.todos)
+			} catch {
+				return false
+			}
+		})
 		if (lastIdx !== -1) {
 			// Preserve the original previousTodos from the first edit in this session
 			try {
@@ -1863,13 +2531,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					throw new AskIgnoredError("new partial")
 				}
 			} else {
+				// New now have a complete version of a previously partial
+				// message, so replace the partial with the complete version.
 				if (isUpdatingPreviousPartial) {
-					// This is the complete version of a previously partial
-					// message, so replace the partial with the complete version.
-					this.askResponse = undefined
-					this.askResponseText = undefined
-					this.askResponseImages = undefined
-
 					// Bug for the history books:
 					// In the webview we use the ts as the chatrow key for the
 					// virtuoso list. Since we would update this ts right at the
@@ -1891,9 +2555,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					this.updateClineMessage(lastMessage)
 				} else {
 					// This is a new and complete message, so add it like normal.
-					this.askResponse = undefined
-					this.askResponseText = undefined
-					this.askResponseImages = undefined
 					askTs = Date.now()
 					this.lastMessageTs = askTs
 					await this.addToClineMessages({ ts: askTs, type: "ask", ask: type, text, isProtected })
@@ -1901,9 +2562,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 		} else {
 			// This is a new non-partial message, so add it like normal.
-			this.askResponse = undefined
-			this.askResponseText = undefined
-			this.askResponseImages = undefined
 			askTs = Date.now()
 			this.lastMessageTs = askTs
 			await this.addToClineMessages({ ts: askTs, type: "ask", ask: type, text, isProtected })
@@ -2197,7 +2855,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const provider = this.providerRef.deref()
 
 			if (provider) {
-				if (mode) {
+				if (mode && !this.isRefineMode) {
 					await provider.setMode(mode)
 				}
 
@@ -2294,8 +2952,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					})
 				}
 			} else {
-				// New now have a complete version of a previously partial message.
-				// This is the complete version of a previously partial
+				// New now have a complete version of a previously partial
 				// message, so replace the partial with the complete version.
 				if (isUpdatingPreviousPartial) {
 					if (!options.isNonInteractive) {
@@ -2418,7 +3075,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	/**
 	 * Execute a tool on behalf of a subagent. This is a simplified tool execution
-	 * path that auto-approves within file ownership constraints.
+	 * path for isolated subagent runs.
 	 *
 	 * Returns the tool result text.
 	 */
@@ -2432,6 +3089,323 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// This is a simplified execution path — full tool routing via presentAssistantMessage
 		// is too coupled to the single-task model.
 		const cwd = this.cwd
+		const resolvePath = (filePath: string) => (path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath))
+		const countOccurrences = (source: string, search: string) => (search ? source.split(search).length - 1 : 0)
+		const replaceLiteral = (source: string, search: string, replacement: string) =>
+			source.split(search).join(replacement)
+		const detectLineEnding = (content: string) => (content.includes("\r\n") ? "\r\n" : "\n")
+		const restoreLineEnding = (content: string, lineEnding: string) =>
+			lineEnding === "\r\n" ? content.replace(/\n/g, "\r\n") : content
+		const writeSubagentFile = async (filePath: string, content: string, toolLabel?: string): Promise<string> => {
+			const absolutePath = resolvePath(filePath)
+			let previousContent = ""
+			let fileExists = false
+			try {
+				previousContent = await fs.readFile(absolutePath, "utf-8")
+				fileExists = true
+			} catch {}
+			await fs.mkdir(path.dirname(absolutePath), { recursive: true })
+			await fs.writeFile(absolutePath, content, "utf-8")
+			const readablePath = getReadablePath(cwd, filePath)
+			const isOutsideWorkspace = isPathOutsideWorkspace(absolutePath)
+			let diff = fileExists
+				? formatResponse.createPrettyPatch(readablePath, previousContent, content)
+				: convertNewFileToUnifiedDiff(content, readablePath)
+			diff = sanitizeUnifiedDiff(diff)
+			await this.pushSubagentMessage({
+				ts: Date.now(),
+				type: "say",
+				say: "tool",
+				text: JSON.stringify({
+					tool: toolLabel ?? (fileExists ? "editedExistingFile" : "newFileCreated"),
+					path: readablePath,
+					isOutsideWorkspace,
+					content: diff,
+					diffStats: computeDiffStats(diff) || undefined,
+				}),
+				subagentId,
+			})
+			this.didEditFile = true
+			return `File written successfully: ${filePath}`
+		}
+		const deleteSubagentFile = async (filePath: string): Promise<string> => {
+			const absolutePath = resolvePath(filePath)
+			const previousContent = await fs.readFile(absolutePath, "utf-8")
+			await fs.unlink(absolutePath)
+			const readablePath = getReadablePath(cwd, filePath)
+			const isOutsideWorkspace = isPathOutsideWorkspace(absolutePath)
+			let diff = formatResponse.createPrettyPatch(readablePath, previousContent, "")
+			diff = sanitizeUnifiedDiff(diff)
+			await this.pushSubagentMessage({
+				ts: Date.now(),
+				type: "say",
+				say: "tool",
+				text: JSON.stringify({
+					tool: "appliedDiff",
+					path: readablePath,
+					isOutsideWorkspace,
+					content: diff,
+					diffStats: computeDiffStats(diff) || undefined,
+				}),
+				subagentId,
+			})
+			this.didEditFile = true
+			return `File deleted successfully: ${filePath}`
+		}
+		const globToRegExp = (pattern: string) => {
+			const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+			const regex = escaped.replace(/\*\*/g, ".*").replace(/\*/g, "[^/\\\\]*").replace(/\?/g, "[^/\\\\]")
+			return new RegExp(`^${regex}$`, "i")
+		}
+		const formatDelegatedToolResponse = (content: ToolResponse): string => {
+			if (typeof content === "string") {
+				return content || "(tool did not return anything)"
+			}
+			const text = content
+				.map((item) => (item.type === "text" ? item.text : item.type === "image" ? "[image]" : ""))
+				.filter(Boolean)
+				.join("\n")
+			return text || "(tool did not return anything)"
+		}
+		const executeDelegatedSubagentTool = async (
+			requestedToolName: string,
+			params: Record<string, unknown>,
+		): Promise<string> => {
+			if (requestedToolName === "switch_mode" || requestedToolName === "write_todo_plan") {
+				return `[ERROR] Tool "${requestedToolName}" is disabled in subagent mode.`
+			}
+
+			const { resolveToolAlias } = await import("../prompts/tools/filter-tools-for-mode")
+			const { isMcpTool, parseMcpToolName } = await import("../../utils/mcp-name")
+			const canonicalToolName = resolveToolAlias(requestedToolName)
+			let resultText = "(tool did not return anything)"
+			const pushToolResult = (content: ToolResponse) => {
+				resultText = formatDelegatedToolResponse(content)
+			}
+			const handleError = async (action: string, error: Error) => {
+				resultText = `[ERROR] Error ${action}: ${error.message}`
+				await this.pushSubagentMessage({
+					ts: Date.now(),
+					type: "say",
+					say: "error",
+					text: resultText,
+					subagentId,
+				})
+			}
+			const askApproval = async (
+				type: ClineAsk,
+				partialMessage?: string,
+				progressStatus?: ToolProgressStatus,
+				forceApproval?: boolean,
+			): Promise<boolean> => {
+				const { response, text, images } = await this.ask(
+					type,
+					partialMessage,
+					false,
+					progressStatus,
+					forceApproval,
+				)
+				if (response !== "yesButtonClicked") {
+					resultText = text
+						? (formatResponse.toolResult(formatResponse.toolDeniedWithFeedback(text), images) as string)
+						: formatResponse.toolDenied()
+					return false
+				}
+				if (text) {
+					await this.say("user_feedback", text, images)
+				}
+				return true
+			}
+			const block = {
+				type: "tool_use" as const,
+				id: toolUseId,
+				name: canonicalToolName as ToolName,
+				originalName: requestedToolName !== canonicalToolName ? requestedToolName : undefined,
+				params: params as ToolUse["params"],
+				partial: false,
+				nativeArgs: params as never,
+			}
+
+			if (isMcpTool(requestedToolName)) {
+				const parsed = parseMcpToolName(requestedToolName)
+				if (!parsed) {
+					return `[ERROR] Invalid MCP tool name: ${requestedToolName}`
+				}
+				const { useMcpToolTool } = await import("../tools/UseMcpToolTool")
+				await useMcpToolTool.handle(
+					this,
+					{
+						...block,
+						name: "use_mcp_tool",
+						params: {
+							server_name: parsed.serverName,
+							tool_name: parsed.toolName,
+							arguments: JSON.stringify(params),
+						},
+						nativeArgs: {
+							server_name: parsed.serverName,
+							tool_name: parsed.toolName,
+							arguments: params,
+						},
+					} as ToolUse<"use_mcp_tool">,
+					{ askApproval, handleError, pushToolResult },
+				)
+				return resultText
+			}
+
+			const delegatedBlock = block as any
+			switch (canonicalToolName) {
+				case "read_file": {
+					const { readFileTool } = await import("../tools/ReadFileTool")
+					await readFileTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "list_files": {
+					const { listFilesTool } = await import("../tools/ListFilesTool")
+					await listFilesTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "find_by_name": {
+					const { findByNameTool } = await import("../tools/FindByNameTool")
+					await findByNameTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "codebase_search": {
+					const { codebaseSearchTool } = await import("../tools/CodebaseSearchTool")
+					await codebaseSearchTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "search_files": {
+					const { searchFilesTool } = await import("../tools/SearchFilesTool")
+					await searchFilesTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "read_command_output": {
+					const { readCommandOutputTool } = await import("../tools/ReadCommandOutputTool")
+					await readCommandOutputTool.handle(this, delegatedBlock, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				}
+				case "read_terminal": {
+					const { readTerminalTool } = await import("../tools/ReadTerminalTool")
+					await readTerminalTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "read_url_content": {
+					const { readUrlContentTool } = await import("../tools/ReadUrlContentTool")
+					await readUrlContentTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "read_notebook": {
+					const { readNotebookTool } = await import("../tools/ReadNotebookTool")
+					await readNotebookTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "view_content_chunk": {
+					const { viewContentChunkTool } = await import("../tools/ViewContentChunkTool")
+					await viewContentChunkTool.handle(this, delegatedBlock, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				}
+				case "create_memory": {
+					const { createMemoryTool } = await import("../tools/CreateMemoryTool")
+					await createMemoryTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "recall_memory": {
+					const { recallMemoryTool } = await import("../tools/RecallMemoryTool")
+					await recallMemoryTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "search_web": {
+					const { searchWebTool } = await import("../tools/SearchWebTool")
+					await searchWebTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "use_mcp_tool": {
+					const { useMcpToolTool } = await import("../tools/UseMcpToolTool")
+					await useMcpToolTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "access_mcp_resource": {
+					const { accessMcpResourceTool } = await import("../tools/accessMcpResourceTool")
+					await accessMcpResourceTool.handle(this, delegatedBlock, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				}
+				case "ask_followup_question": {
+					const { askFollowupQuestionTool } = await import("../tools/AskFollowupQuestionTool")
+					await askFollowupQuestionTool.handle(this, delegatedBlock, {
+						askApproval,
+						handleError,
+						pushToolResult,
+					})
+					break
+				}
+				case "browser_action": {
+					const { browserActionTool } = await import("../tools/BrowserActionTool")
+					await browserActionTool(this, delegatedBlock, askApproval, handleError, pushToolResult)
+					break
+				}
+				case "execute_command": {
+					const { executeCommandTool } = await import("../tools/ExecuteCommandTool")
+					await executeCommandTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "command_status": {
+					const { commandStatusTool } = await import("../tools/CommandStatusTool")
+					await commandStatusTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "generate_image": {
+					const { generateImageTool } = await import("../tools/GenerateImageTool")
+					await generateImageTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "update_todo_list": {
+					const { updateTodoListTool } = await import("../tools/UpdateTodoListTool")
+					await updateTodoListTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "run_slash_command": {
+					const { runSlashCommandTool } = await import("../tools/RunSlashCommandTool")
+					await runSlashCommandTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				case "skill": {
+					const { skillTool } = await import("../tools/SkillTool")
+					await skillTool.handle(this, delegatedBlock, { askApproval, handleError, pushToolResult })
+					break
+				}
+				default: {
+					const state = await this.providerRef.deref()?.getState()
+					if (state?.experiments?.customTools) {
+						const { customToolRegistry } = await import("@roo-code/core")
+						const customTool = customToolRegistry.get(requestedToolName)
+						if (customTool) {
+							const customToolArgs = customTool.parameters ? customTool.parameters.parse(params) : params
+							const customResult = await customTool.execute(customToolArgs, {
+								mode: this.taskMode,
+								task: this,
+							})
+							pushToolResult(customResult)
+							break
+						}
+					}
+					return `[ERROR] Tool "${requestedToolName}" is not available in subagent mode.`
+				}
+			}
+			return resultText
+		}
 
 		switch (toolName) {
 			case "read_file": {
@@ -2466,40 +3440,336 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				const content = toolParams.content as string
 				if (!filePath) return "[ERROR] Missing path parameter"
 				if (content === undefined) return "[ERROR] Missing content parameter"
-				const absolutePath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath)
 				try {
-					const fs = await import("fs/promises")
+					return await writeSubagentFile(filePath, content)
+				} catch (err) {
+					return `[ERROR] Failed to write file: ${err instanceof Error ? err.message : String(err)}`
+				}
+			}
+
+			case "apply_diff": {
+				const filePath = toolParams.path as string
+				const diffContent = toolParams.diff as string
+				if (!filePath) return "[ERROR] Missing path parameter"
+				if (!diffContent) return "[ERROR] Missing diff parameter"
+				const absolutePath = resolvePath(filePath)
+				try {
+					const originalContent = await fs.readFile(absolutePath, "utf-8")
+					const diffResult = (await this.diffStrategy?.applyDiff(
+						originalContent,
+						diffContent,
+						parseInt(diffContent.match(/:start_line:(\d+)/)?.[1] ?? ""),
+					)) ?? {
+						success: false,
+						error: "No diff strategy available",
+					}
+					if (!diffResult.success) {
+						return `[ERROR] Failed to apply diff: ${diffResult.error ?? "unknown error"}`
+					}
+					await writeSubagentFile(filePath, diffResult.content, "appliedDiff")
+					return `Applied diff successfully: ${filePath}`
+				} catch (err) {
+					return `[ERROR] Failed to apply diff: ${err instanceof Error ? err.message : String(err)}`
+				}
+			}
+
+			case "apply_patch": {
+				const patchContent = toolParams.patch as string
+				if (!patchContent) return "[ERROR] Missing patch parameter"
+				try {
+					const { parsePatch, processAllHunks } = await import("../tools/apply-patch")
+					const parsedPatch = parsePatch(patchContent)
+					if (parsedPatch.hunks.length === 0) {
+						return "No file operations found in patch."
+					}
+					for (const hunk of parsedPatch.hunks) {
+						const hunkPaths = [
+							hunk.path,
+							hunk.type === "UpdateFile" && hunk.movePath ? hunk.movePath : undefined,
+						].filter((candidate): candidate is string => !!candidate)
+						for (const hunkPath of hunkPaths) {
+							const accessAllowed = this.rooIgnoreController?.validateAccess(hunkPath)
+							if (!accessAllowed) {
+								return formatResponse.rooIgnoreError(hunkPath) as string
+							}
+							if (this.rooProtectedController?.isWriteProtected(hunkPath)) {
+								return `[ERROR] Cannot modify write-protected path: ${hunkPath}`
+							}
+						}
+						if (hunk.type === "AddFile") {
+							try {
+								await fs.access(resolvePath(hunk.path))
+								return `[ERROR] File already exists: ${hunk.path}. Use Update File instead.`
+							} catch {}
+						}
+						if (
+							hunk.type === "UpdateFile" &&
+							hunk.movePath &&
+							isPathOutsideWorkspace(resolvePath(hunk.movePath))
+						) {
+							return `[ERROR] Cannot move file to path outside workspace: ${hunk.movePath}`
+						}
+					}
+					const changes = await processAllHunks(parsedPatch.hunks, async (filePath: string) => {
+						return await fs.readFile(resolvePath(filePath), "utf-8")
+					})
+					const touchedFiles: string[] = []
+					for (const change of changes) {
+						const relPath = change.path
+						const absolutePath = resolvePath(relPath)
+						const accessAllowed = this.rooIgnoreController?.validateAccess(relPath)
+						if (!accessAllowed) {
+							return formatResponse.rooIgnoreError(relPath) as string
+						}
+						if (this.rooProtectedController?.isWriteProtected(relPath)) {
+							return `[ERROR] Cannot modify write-protected path: ${relPath}`
+						}
+						if (change.type === "add") {
+							await writeSubagentFile(relPath, change.newContent ?? "", "appliedDiff")
+							touchedFiles.push(relPath)
+							continue
+						}
+						if (change.type === "delete") {
+							await deleteSubagentFile(relPath)
+							touchedFiles.push(relPath)
+							continue
+						}
+						const newContent = change.newContent ?? ""
+						if (change.movePath) {
+							const movePath = change.movePath
+							const moveAbsolutePath = resolvePath(movePath)
+							const moveAccessAllowed = this.rooIgnoreController?.validateAccess(movePath)
+							if (!moveAccessAllowed) {
+								return formatResponse.rooIgnoreError(movePath) as string
+							}
+							if (this.rooProtectedController?.isWriteProtected(movePath)) {
+								return `[ERROR] Cannot move file to write-protected path: ${movePath}`
+							}
+							if (isPathOutsideWorkspace(moveAbsolutePath)) {
+								return `[ERROR] Cannot move file to path outside workspace: ${movePath}`
+							}
+							await writeSubagentFile(movePath, newContent, "appliedDiff")
+							await fs.unlink(absolutePath)
+							touchedFiles.push(relPath, movePath)
+							continue
+						}
+						await writeSubagentFile(relPath, newContent, "appliedDiff")
+						touchedFiles.push(relPath)
+					}
+					return `Applied patch successfully: ${Array.from(new Set(touchedFiles)).join(", ")}`
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err)
+					const isParseError = err instanceof Error && err.name === "ParseError"
+					return `[ERROR] ${isParseError ? "Invalid patch format" : "Failed to apply patch"}: ${message}`
+				}
+			}
+
+			case "edit":
+			case "search_and_replace": {
+				const filePath = toolParams.file_path as string
+				const oldString = toolParams.old_string as string
+				const newString = toolParams.new_string as string
+				const replaceAll = toolParams.replace_all === true
+				if (!filePath) return "[ERROR] Missing file_path parameter"
+				if (!oldString) return "[ERROR] Missing old_string parameter"
+				if (newString === undefined) return "[ERROR] Missing new_string parameter"
+				try {
+					const originalContent = await fs.readFile(resolvePath(filePath), "utf-8")
+					const lineEnding = detectLineEnding(originalContent)
+					const normalizedContent = originalContent.replace(/\r\n/g, "\n")
+					const normalizedOld = oldString.replace(/\r\n/g, "\n")
+					const normalizedNew = newString.replace(/\r\n/g, "\n")
+					const matches = countOccurrences(normalizedContent, normalizedOld)
+					if (matches === 0) return "[ERROR] No match found for old_string"
+					if (!replaceAll && matches > 1) return `[ERROR] Found ${matches} matches for old_string`
+					const nextContent = restoreLineEnding(
+						replaceAll
+							? replaceLiteral(normalizedContent, normalizedOld, normalizedNew)
+							: normalizedContent.replace(normalizedOld, normalizedNew),
+						lineEnding,
+					)
+					await writeSubagentFile(filePath, nextContent, "appliedDiff")
+					return `Edited file successfully: ${filePath}`
+				} catch (err) {
+					return `[ERROR] Failed to ${toolName}: ${err instanceof Error ? err.message : String(err)}`
+				}
+			}
+
+			case "search_replace": {
+				const filePath = toolParams.file_path as string
+				const oldString = toolParams.old_string as string
+				const newString = toolParams.new_string as string
+				if (!filePath) return "[ERROR] Missing file_path parameter"
+				if (!oldString) return "[ERROR] Missing old_string parameter"
+				if (newString === undefined) return "[ERROR] Missing new_string parameter"
+				try {
+					const originalContent = await fs.readFile(resolvePath(filePath), "utf-8")
+					const lineEnding = detectLineEnding(originalContent)
+					const normalizedContent = originalContent.replace(/\r\n/g, "\n")
+					const normalizedOld = oldString.replace(/\r\n/g, "\n")
+					const normalizedNew = newString.replace(/\r\n/g, "\n")
+					const matches = countOccurrences(normalizedContent, normalizedOld)
+					if (matches === 0) return "[ERROR] No match found for old_string"
+					if (matches > 1) return `[ERROR] Found ${matches} matches for old_string; provide more context`
+					const nextContent = restoreLineEnding(
+						normalizedContent.replace(normalizedOld, normalizedNew),
+						lineEnding,
+					)
+					await writeSubagentFile(filePath, nextContent, "appliedDiff")
+					return `Replaced one occurrence successfully: ${filePath}`
+				} catch (err) {
+					return `[ERROR] Failed to search_replace: ${err instanceof Error ? err.message : String(err)}`
+				}
+			}
+
+			case "edit_file": {
+				const filePath = toolParams.file_path as string
+				const oldString = typeof toolParams.old_string === "string" ? toolParams.old_string : ""
+				const newString = typeof toolParams.new_string === "string" ? toolParams.new_string : ""
+				const expectedReplacements =
+					typeof toolParams.expected_replacements === "number" ? toolParams.expected_replacements : 1
+				if (!filePath) return "[ERROR] Missing file_path parameter"
+				try {
+					const absolutePath = resolvePath(filePath)
+					if (oldString === "") {
+						try {
+							await fs.access(absolutePath)
+							return `[ERROR] File already exists: ${filePath}`
+						} catch {}
+						await writeSubagentFile(filePath, newString)
+						return `Created file successfully: ${filePath}`
+					}
+					const originalContent = await fs.readFile(absolutePath, "utf-8")
+					const lineEnding = detectLineEnding(originalContent)
+					const normalizedContent = originalContent.replace(/\r\n/g, "\n")
+					const normalizedOld = oldString.replace(/\r\n/g, "\n")
+					const normalizedNew = newString.replace(/\r\n/g, "\n")
+					const matches = countOccurrences(normalizedContent, normalizedOld)
+					if (matches !== expectedReplacements) {
+						return `[ERROR] Expected ${expectedReplacements} replacement(s), found ${matches}`
+					}
+					const nextContent = restoreLineEnding(
+						replaceLiteral(normalizedContent, normalizedOld, normalizedNew),
+						lineEnding,
+					)
+					await writeSubagentFile(filePath, nextContent, "appliedDiff")
+					return `Edited file successfully: ${filePath}`
+				} catch (err) {
+					return `[ERROR] Failed to edit_file: ${err instanceof Error ? err.message : String(err)}`
+				}
+			}
+
+			case "multi_edit": {
+				const filePath = toolParams.file_path as string
+				const edits = Array.isArray(toolParams.edits)
+					? (toolParams.edits as Array<Record<string, unknown>>)
+					: []
+				if (!filePath) return "[ERROR] Missing file_path parameter"
+				if (edits.length === 0) return "[ERROR] Missing edits parameter"
+				try {
+					const originalContent = await fs.readFile(resolvePath(filePath), "utf-8")
+					const lineEnding = detectLineEnding(originalContent)
+					let currentContent = originalContent.replace(/\r\n/g, "\n")
+					for (let index = 0; index < edits.length; index++) {
+						const edit = edits[index]
+						const oldString =
+							typeof edit.old_string === "string" ? edit.old_string.replace(/\r\n/g, "\n") : ""
+						const newString =
+							typeof edit.new_string === "string" ? edit.new_string.replace(/\r\n/g, "\n") : ""
+						const replaceAll = edit.replace_all === true
+						if (!oldString) return `[ERROR] Edit ${index + 1} is missing old_string`
+						const matches = countOccurrences(currentContent, oldString)
+						if (matches === 0) return `[ERROR] Edit ${index + 1} found no matches`
+						if (!replaceAll && matches > 1) return `[ERROR] Edit ${index + 1} found ${matches} matches`
+						currentContent = replaceAll
+							? replaceLiteral(currentContent, oldString, newString)
+							: currentContent.replace(oldString, newString)
+					}
+					await writeSubagentFile(filePath, restoreLineEnding(currentContent, lineEnding), "appliedDiff")
+					return `Applied ${edits.length} edits successfully: ${filePath}`
+				} catch (err) {
+					return `[ERROR] Failed to multi_edit: ${err instanceof Error ? err.message : String(err)}`
+				}
+			}
+
+			case "edit_notebook": {
+				const absolutePathParam = toolParams.absolute_path as string
+				const newSource = toolParams.new_source as string
+				const cellNumber = typeof toolParams.cell_number === "number" ? toolParams.cell_number : 0
+				const cellType = toolParams.cell_type === "markdown" ? "markdown" : "code"
+				const mode = toolParams.edit_mode === "insert" ? "insert" : "replace"
+				const cellId =
+					typeof toolParams.cell_id === "string" && toolParams.cell_id ? toolParams.cell_id : undefined
+				if (!absolutePathParam) return "[ERROR] Missing absolute_path parameter"
+				if (newSource === undefined) return "[ERROR] Missing new_source parameter"
+				if (!absolutePathParam.endsWith(".ipynb")) return "[ERROR] File must be a Jupyter notebook (.ipynb)"
+				const absolutePath = resolvePath(absolutePathParam)
+				const readablePath = getReadablePath(cwd, absolutePathParam)
+				const accessAllowed = this.rooIgnoreController?.validateAccess(absolutePathParam)
+				if (!accessAllowed) return formatResponse.rooIgnoreError(absolutePathParam) as string
+				if (this.rooProtectedController?.isWriteProtected(absolutePathParam)) {
+					return `[ERROR] Cannot modify write-protected path: ${absolutePathParam}`
+				}
+				try {
 					let previousContent = ""
 					let fileExists = false
 					try {
 						previousContent = await fs.readFile(absolutePath, "utf-8")
 						fileExists = true
 					} catch {}
-					const dir = path.dirname(absolutePath)
-					await fs.mkdir(dir, { recursive: true })
-					await fs.writeFile(absolutePath, content, "utf-8")
-					const readablePath = getReadablePath(cwd, filePath)
-					const isOutsideWorkspace = isPathOutsideWorkspace(absolutePath)
-					let diff = fileExists
-						? formatResponse.createPrettyPatch(readablePath, previousContent, content)
-						: convertNewFileToUnifiedDiff(content, readablePath)
-					diff = sanitizeUnifiedDiff(diff)
-					await this.pushSubagentMessage({
-						ts: Date.now(),
-						type: "say",
-						say: "tool",
-						text: JSON.stringify({
-							tool: fileExists ? "editedExistingFile" : "newFileCreated",
-							path: readablePath,
-							isOutsideWorkspace,
-							content: diff,
-							diffStats: computeDiffStats(diff) || undefined,
-						}),
-						subagentId,
-					})
-					return `File written successfully: ${filePath}`
+					if (!fileExists && mode === "replace") {
+						return `[ERROR] Notebook not found: ${absolutePathParam}`
+					}
+					const notebook = fileExists
+						? JSON.parse(previousContent)
+						: { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 }
+					if (!Array.isArray(notebook.cells)) {
+						return "[ERROR] Invalid notebook format: missing cells array"
+					}
+					let targetIndex = cellNumber
+					if (cellId) {
+						targetIndex = notebook.cells.findIndex((cell: { id?: string }) => cell.id === cellId)
+						if (targetIndex === -1 && mode === "replace") {
+							return `[ERROR] Cell with id '${cellId}' not found`
+						}
+						if (targetIndex === -1) {
+							targetIndex = notebook.cells.length
+						}
+					}
+					if (mode === "replace") {
+						if (targetIndex < 0 || targetIndex >= notebook.cells.length) {
+							return `[ERROR] Cell index ${targetIndex} out of range. Notebook has ${notebook.cells.length} cells.`
+						}
+					} else if (targetIndex < 0 || targetIndex > notebook.cells.length) {
+						return `[ERROR] Insert position ${targetIndex} out of range. Notebook has ${notebook.cells.length} cells.`
+					}
+					const newCell: Record<string, unknown> = {
+						cell_type: cellType,
+						id: crypto.randomUUID().replace(/-/g, "").slice(0, 8),
+						source: newSource
+							.split("\n")
+							.map((line, index, lines) => (index < lines.length - 1 ? `${line}\n` : line)),
+						metadata: {},
+					}
+					if (cellType === "code") {
+						newCell.outputs = []
+						newCell.execution_count = null
+					}
+					if (mode === "insert") {
+						notebook.cells.splice(targetIndex, 0, newCell)
+					} else {
+						const oldCell = notebook.cells[targetIndex]
+						newCell.cell_type = oldCell.cell_type
+						if (oldCell.id) {
+							newCell.id = oldCell.id
+						}
+						notebook.cells[targetIndex] = newCell
+					}
+					const nextContent = JSON.stringify(notebook, null, 1)
+					await writeSubagentFile(absolutePathParam, nextContent, "editedExistingFile")
+					return `${mode === "insert" ? "Inserted" : "Replaced"} cell ${targetIndex} in ${readablePath}`
 				} catch (err) {
-					return `[ERROR] Failed to write file: ${err instanceof Error ? err.message : String(err)}`
+					return `[ERROR] Failed to edit_notebook: ${err instanceof Error ? err.message : String(err)}`
 				}
 			}
 
@@ -2529,6 +3799,74 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						path: getReadablePath(cwd, searchPath),
 						regex,
 						filePattern: filePattern ?? "",
+						isOutsideWorkspace: isPathOutsideWorkspace(absoluteSearchPath),
+						content: result,
+					}),
+					subagentId,
+				})
+				return result
+			}
+
+			case "find_by_name": {
+				const searchPath = (toolParams.path as string) || "."
+				const pattern = (toolParams.pattern as string) || "*"
+				const extensions = Array.isArray(toolParams.extensions)
+					? (toolParams.extensions as string[])
+							.filter(Boolean)
+							.map((ext) => ext.replace(/^\./, "").toLowerCase())
+					: []
+				const excludes = Array.isArray(toolParams.excludes)
+					? (toolParams.excludes as string[]).filter(Boolean)
+					: []
+				const maxDepth = typeof toolParams.max_depth === "number" ? toolParams.max_depth : undefined
+				const entryType = typeof toolParams.type === "string" ? toolParams.type : "any"
+				const fullPath = toolParams.full_path === true
+				const absoluteSearchPath = resolvePath(searchPath)
+				const matcher = globToRegExp(pattern)
+				const excludeMatchers = excludes.map(globToRegExp)
+				const results: string[] = []
+				const visit = async (directory: string, depth: number): Promise<void> => {
+					if (results.length >= 50 || (maxDepth !== undefined && depth > maxDepth)) return
+					let entries: import("fs").Dirent[]
+					try {
+						entries = await fs.readdir(directory, { withFileTypes: true })
+					} catch {
+						return
+					}
+					for (const entry of entries) {
+						if (results.length >= 50) return
+						const absoluteEntryPath = path.join(directory, entry.name)
+						const relativeEntryPath = path
+							.relative(absoluteSearchPath, absoluteEntryPath)
+							.replace(/\\/g, "/")
+						if (excludeMatchers.some((excludeMatcher) => excludeMatcher.test(relativeEntryPath))) continue
+						const isDirectory = entry.isDirectory()
+						const isFile = entry.isFile()
+						const matchesType =
+							entryType === "any" ||
+							(entryType === "directory" && isDirectory) ||
+							(entryType === "file" && isFile)
+						const target = fullPath ? relativeEntryPath : entry.name
+						const matchesExtension =
+							extensions.length === 0 ||
+							(isFile && extensions.includes(path.extname(entry.name).replace(/^\./, "").toLowerCase()))
+						if (matchesType && matchesExtension && matcher.test(target)) {
+							results.push(`${isDirectory ? "[DIR]" : "[FILE]"} ${relativeEntryPath}`)
+						}
+						if (isDirectory) {
+							await visit(absoluteEntryPath, depth + 1)
+						}
+					}
+				}
+				await visit(absoluteSearchPath, 1)
+				const result = results.length > 0 ? results.join("\n") : "No matches found"
+				await this.pushSubagentMessage({
+					ts: Date.now(),
+					type: "say",
+					say: "tool",
+					text: JSON.stringify({
+						tool: "findByName",
+						path: getReadablePath(cwd, searchPath),
 						isOutsideWorkspace: isPathOutsideWorkspace(absoluteSearchPath),
 						content: result,
 					}),
@@ -2569,7 +3907,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 
 			default:
-				return `[ERROR] Tool "${toolName}" is not supported in subagent mode. Supported tools: read_file, write_to_file, search_files, list_files, attempt_completion`
+				return await executeDelegatedSubagentTool(toolName, toolParams)
 		}
 	}
 
@@ -2584,23 +3922,32 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.warn("[runParallelSubagents] No todo items found")
 			return
 		}
+		const resumeState = await this.readSubagentResumeState()
+		const unfinishedTodoIds = resumeState ? new Set(this.getUnfinishedSubagentTodoIds(resumeState)) : undefined
+		const todosToRun = unfinishedTodoIds ? todos.filter((todo) => unfinishedTodoIds.has(todo.id)) : todos
+		if (todosToRun.length === 0) {
+			await this.clearSubagentResumeState()
+			console.warn("[runParallelSubagents] No unfinished todo items found")
+			return
+		}
 
 		const globalStoragePath = this.globalStoragePath
 		const taskId = this.taskId
 		const taskTimestamp = this.taskTimestamp
+		await this.persistSubagentResumeState(resumeState?.todoItemIds ?? todos.map((todo) => todo.id))
 
 		// Emit a divider indicating parallel execution is starting
-		await this.say("text", "\n\n---\n**Starting parallel execution for all todo items...**\n---\n")
+		await this.say("text", "\n\n---\n**Starting parallel execution for unfinished todo items...**\n---\n")
 
 		// Exit refine mode
 		this.isRefineMode = false
 		this.activeRefineTodoItemIds = null
 
 		// Build system prompt for subagents (build mode)
-		const systemPrompt = buildSubagentExecutionSystemPrompt(this.cwd)
+		const systemPrompt = buildDetachedSubagentExecutionSystemPrompt(this.cwd)
 		console.log("[runParallelSubagents] Prepared system prompt", {
 			taskId: this.taskId,
-			todoCount: todos.length,
+			todoCount: todosToRun.length,
 			systemPromptHasRefineMarkers:
 				systemPrompt.includes("Plan mode ACTIVE") ||
 				systemPrompt.includes("write_todo_plan") ||
@@ -2609,17 +3956,51 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		})
 
 		// Get tools for subagents
-		const { getSubagentTools } = await import("../prompts/tools/native-tools")
 		const modelInfo = this.api.getModel().info
-		const tools = getSubagentTools({ supportsImages: (modelInfo as any)?.supportsImages === true })
+		const provider = this.providerRef.deref()
+		if (!provider) {
+			throw new Error("Provider reference lost during subagent tool building")
+		}
+		const providerState = await provider.getState()
+		const { tools: rawSubagentTools } = await buildNativeToolsArrayWithRestrictions({
+			provider,
+			cwd: this.cwd,
+			mode: this.taskMode,
+			customModes: providerState?.customModes,
+			experiments: providerState?.experiments,
+			apiConfiguration: this.apiConfiguration,
+			browserToolEnabled: providerState?.browserToolEnabled ?? true,
+			disabledTools: providerState?.disabledTools,
+			modelInfo,
+			includeAllToolsWithRestrictions: true,
+			taskEstablished: true,
+		})
+		const { subagentAttemptCompletion } = await import("../prompts/tools/native-tools")
+		const tools = rawSubagentTools
+			.filter(
+				(tool) =>
+					!("function" in tool) ||
+					(tool.function.name !== "switch_mode" &&
+						tool.function.name !== "write_todo_plan" &&
+						tool.function.name !== "list_files"),
+			)
+			.map((tool) => {
+				if ("function" in tool && tool.function.name === "attempt_completion") {
+					return subagentAttemptCompletion
+				}
+				return tool
+			})
 
 		// Import SubagentRunner
 		const { SubagentRunner } = await import("./SubagentRunner")
-		const { extractFilePathsFromTodoContent } = await import("../tools/file-ownership")
 
 		// Create a runner for each todo item
-		const runners: InstanceType<typeof SubagentRunner>[] = []
-		for (const todo of todos) {
+		const runnerEntries: Array<{
+			runner: InstanceType<typeof SubagentRunner>
+			todo: TodoItem
+			planFiles: PlanFile[]
+		}> = []
+		for (const todo of todosToRun) {
 			// Read plan files for this todo item
 			let planResult: { plans: import("../task-persistence/plan-persistence").PlanFile[] }
 			try {
@@ -2628,18 +4009,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				planResult = { plans: [] }
 			}
 
-			const ownedFiles = Array.from(
-				new Set([
-					...planResult.plans.map((plan) => plan.filePath),
-					...extractFilePathsFromTodoContent(todo.content),
-				]),
-			)
 			console.log("[runParallelSubagents] Creating subagent runner", {
 				taskId: this.taskId,
 				todoId: todo.id,
 				todoContent: todo.content,
 				planFilePaths: planResult.plans.map((plan) => plan.filePath),
-				ownedFiles,
 			})
 
 			const runner = new SubagentRunner({
@@ -2648,24 +4022,61 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				planFiles: planResult.plans,
 				systemPrompt,
 				tools,
-				ownedFiles,
 			})
-			runners.push(runner)
+			runnerEntries.push({ runner, todo, planFiles: planResult.plans })
 		}
 
 		// Run all subagents concurrently
-		console.log(`[runParallelSubagents] Starting ${runners.length} subagents for task ${taskId}`)
-		const results = await Promise.allSettled(runners.map((runner) => runner.run()))
+		console.log(`[runParallelSubagents] Starting ${runnerEntries.length} subagents for task ${taskId}`)
+		const results = await Promise.allSettled(
+			runnerEntries.map(async ({ runner, todo, planFiles }) => {
+				const subagentResult = await runner.run()
+				const agreementPass = subagentResult.completionResult?.trim()
+					? await this.enqueuePostSubtaskAgreementPass(todo, planFiles, subagentResult.completionResult)
+					: {
+							executed: false,
+							appendedCount: 0,
+							fileAgreementCount: 0,
+							skippedReason: "missing attempt_completion result",
+						}
+				if (subagentResult.success) {
+					await this.markSubagentResumeTodoCompleted(todo.id)
+				}
+
+				return {
+					subagentResult,
+					agreementPass,
+				}
+			}),
+		)
 
 		// Collect results
 		const summaryParts: string[] = []
 		for (let i = 0; i < results.length; i++) {
 			const result = results[i]
-			const todo = todos[i]
+			const todo = runnerEntries[i]?.todo ?? todosToRun[i]
 			if (result.status === "fulfilled") {
-				const r = result.value
+				const { subagentResult, agreementPass } = result.value
+				const agreementActions: string[] = []
+				if (agreementPass.appendedCount > 0) {
+					agreementActions.push(
+						`appended agreements to ${agreementPass.appendedCount} task context block${agreementPass.appendedCount === 1 ? "" : "s"}`,
+					)
+				}
+				if (agreementPass.fileAgreementCount > 0) {
+					agreementActions.push(
+						`merged ${agreementPass.fileAgreementCount} file-owned agreement${agreementPass.fileAgreementCount === 1 ? "" : "s"} into task context`,
+					)
+				}
+				const agreementSummary = agreementPass.error
+					? ` (STEP 3 error: ${agreementPass.error})`
+					: !agreementPass.executed
+						? ` (STEP 3 skipped: ${agreementPass.skippedReason ?? "not triggered"})`
+						: agreementActions.length > 0
+							? ` (STEP 3 ${agreementActions.join(" and ")})`
+							: ` (STEP 3 checked: no new agreements)`
 				summaryParts.push(
-					`- **${todo.content}**: ${r.success ? "✅ " + (r.completionResult ?? "Done") : "❌ " + (r.error ?? "Failed")}`,
+					`- **${todo.content}**: ${subagentResult.success ? "✅ " + (subagentResult.completionResult ?? "Done") : "❌ " + (subagentResult.error ?? "Failed")}${agreementSummary}`,
 				)
 			} else {
 				summaryParts.push(`- **${todo.content}**: ❌ Error: ${result.reason}`)
@@ -2675,7 +4086,303 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Emit aggregated results summary
 		await this.say("text", `\n\n---\n**Parallel execution complete:**\n${summaryParts.join("\n")}\n---`)
 
-		console.log(`[runParallelSubagents] All ${runners.length} subagents finished for task ${taskId}`)
+		await this.clearSubagentResumeState()
+		console.log(`[runParallelSubagents] All ${runnerEntries.length} subagents finished for task ${taskId}`)
+	}
+
+	public applyTaskContextAgreementsToPlanEntries(
+		planFiles: PlanFile[],
+		context?: string,
+	): { plans: PlanFile[]; appliedCount: number } {
+		return applyPlanAgreementsToPlanEntries(planFiles, getTaskContextPlanAgreements(context, planFiles))
+	}
+
+	public applyPlanAgreementsToPlanEntries(
+		planFiles: PlanFile[],
+		agreements: PlanFileAgreement[],
+	): { plans: PlanFile[]; appliedCount: number } {
+		return applyPlanAgreementsToPlanEntries(planFiles, agreements)
+	}
+
+	/**
+	 * Public entry used by WriteTodoPlanTool to run STEP 3 immediately after
+	 * a refine item's plan is recorded. Uses a refine-specific prompt that
+	 * mines the just-written plan for concrete cross-task agreements, then
+	 * appends them to OTHER refine items' contexts before they are refined.
+	 */
+	public enqueuePostRefineAgreementPass(
+		refinedTodo: TodoItem,
+		planFiles: PlanFile[],
+	): Promise<PostSubtaskAgreementPassOutcome> {
+		if (planFiles.length === 0) {
+			return Promise.resolve({
+				executed: false,
+				appendedCount: 0,
+				fileAgreementCount: 0,
+				skippedReason: "no plan files for refine-time agreement pass",
+			})
+		}
+		return this.enqueueAgreementPass(
+			refinedTodo,
+			(todos) =>
+				buildPostRefineAgreementPrompt({
+					refinedTodo,
+					planFiles,
+					todos,
+				}),
+			planFiles,
+			{ updateAllTodoContexts: true },
+		)
+	}
+
+	private enqueuePostSubtaskAgreementPass(
+		completedTodo: TodoItem,
+		planFiles: PlanFile[],
+		completionResult: string,
+	): Promise<PostSubtaskAgreementPassOutcome> {
+		const trimmedCompletionResult = completionResult.trim()
+		if (!trimmedCompletionResult) {
+			return Promise.resolve({
+				executed: false,
+				appendedCount: 0,
+				fileAgreementCount: 0,
+				skippedReason: "empty attempt_completion result",
+			})
+		}
+		return this.enqueueAgreementPass(
+			completedTodo,
+			(todos) =>
+				buildPostSubtaskAgreementPrompt({
+					completedTodo,
+					planFiles,
+					completionResult: trimmedCompletionResult,
+					todos,
+				}),
+			planFiles,
+			{ updateAllTodoContexts: true },
+		)
+	}
+
+	private enqueueAgreementPass(
+		focusTodo: TodoItem,
+		buildPrompt: (todos: TodoItem[]) => string,
+		planFiles: PlanFile[] = [],
+		options: AgreementPassOptions = {},
+	): Promise<PostSubtaskAgreementPassOutcome> {
+		let release: (() => void) | undefined
+		const previous = this.subtaskAgreementPassChain
+		this.subtaskAgreementPassChain = new Promise<void>((resolve) => {
+			release = resolve
+		})
+
+		return previous
+			.catch(() => undefined)
+			.then(async () => {
+				try {
+					return await this.runAgreementPass(focusTodo, buildPrompt, planFiles, options)
+				} finally {
+					release?.()
+				}
+			})
+	}
+
+	private async runAgreementPass(
+		focusTodo: TodoItem,
+		buildPrompt: (todos: TodoItem[]) => string,
+		planFiles: PlanFile[] = [],
+		options: AgreementPassOptions = {},
+	): Promise<PostSubtaskAgreementPassOutcome> {
+		const currentTodos = (this.todoList ?? []).map((todo) => ({ ...todo }))
+		if (currentTodos.length === 0) {
+			return {
+				executed: false,
+				appendedCount: 0,
+				fileAgreementCount: 0,
+				skippedReason: "todo list unavailable",
+			}
+		}
+
+		// Visible signal that Step 3 is running — so the user can see it in chat
+		// even when no agreements end up being appended.
+		await this.say(
+			"text",
+			`\u2699\ufe0f STEP 3 agreement pass running for "${focusTodo.content}"...`,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ isNonInteractive: true },
+		)
+
+		let rawResponse: string
+		try {
+			rawResponse = await withTimeout(
+				singleCompletionHandler(this.apiConfiguration, buildPrompt(currentTodos)),
+				STEP3_AGREEMENT_PASS_TIMEOUT_MS,
+				`STEP 3 agreement pass for "${focusTodo.content}"`,
+			)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			console.error(`[STEP 3] agreement pass API call failed for "${focusTodo.content}":`, error)
+			await this.say(
+				"text",
+				`\u26a0\ufe0f STEP 3 error for "${focusTodo.content}": ${message}`,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ isNonInteractive: true },
+			)
+			return { executed: true, appendedCount: 0, fileAgreementCount: 0, error: message }
+		}
+
+		let agreementResponse: PostSubtaskAgreementResponse
+		try {
+			agreementResponse = parsePostSubtaskAgreementResponse(rawResponse)
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error)
+			console.error(`[STEP 3] failed to parse agreement response for "${focusTodo.content}":`, error, rawResponse)
+			await this.say(
+				"text",
+				`\u26a0\ufe0f STEP 3 parse error for "${focusTodo.content}": ${message}`,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ isNonInteractive: true },
+			)
+			return { executed: true, appendedCount: 0, fileAgreementCount: 0, error: message }
+		}
+
+		const availableSharedTargets = collectAvailableCodeTargets(currentTodos, planFiles)
+		const fileAgreements = normalizeFileAgreements(
+			agreementResponse.fileAgreements,
+			planFiles,
+			availableSharedTargets,
+		)
+		if (fileAgreements.length === 0) {
+			await this.say(
+				"text",
+				`\u2705 STEP 3 for "${focusTodo.content}": no new agreements`,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ isNonInteractive: true },
+			)
+			return { executed: true, appendedCount: 0, fileAgreementCount: 0, planAgreements: [] }
+		}
+
+		const previousTodos = currentTodos.map((todo) => ({ ...todo }))
+		const updatedTodos = currentTodos.map((todo) => ({ ...todo }))
+		let appendedCount = 0
+		for (const todo of updatedTodos) {
+			if (!options.updateAllTodoContexts && todo.id !== focusTodo.id) {
+				continue
+			}
+			const nextContext = mergeStep3FileAgreementsIntoContext(todo.context, fileAgreements)
+			if ((todo.context?.trim() ?? "") !== nextContext.trim()) {
+				todo.context = nextContext
+				appendedCount++
+			}
+		}
+
+		if (appendedCount > 0) {
+			await this.recordStep3TodoContextUpdate(previousTodos, updatedTodos, focusTodo, appendedCount)
+		}
+
+		const successParts: string[] = []
+		if (appendedCount > 0) {
+			successParts.push(
+				`appended agreements to ${appendedCount} task context block${appendedCount === 1 ? "" : "s"}`,
+			)
+		}
+		const fileAgreementCount = fileAgreements.reduce((count, entry) => count + entry.agreements.length, 0)
+		if (fileAgreementCount > 0) {
+			successParts.push(
+				`merged ${fileAgreementCount} file-owned agreement${fileAgreementCount === 1 ? "" : "s"} into task context`,
+			)
+		}
+		let planAgreementCount = 0
+		const planAgreements = buildPlanAgreementsFromFileAgreements(fileAgreements)
+		if (planAgreements.length > 0) {
+			try {
+				planAgreementCount = await appendFileAgreementsToPlanFiles(
+					this.globalStoragePath,
+					this.taskId,
+					this.taskTimestamp,
+					focusTodo.id,
+					planAgreements,
+					focusTodo.content,
+				)
+				if (planAgreementCount > 0) {
+					successParts.push(
+						`distributed ${planAgreementCount} agreement block${planAgreementCount === 1 ? "" : "s"} into refine plan section${planAgreementCount === 1 ? "" : "s"}`,
+					)
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error)
+				console.error(
+					`[STEP 3] failed to distribute agreements into refine plan sections for "${focusTodo.content}":`,
+					error,
+				)
+				await this.say(
+					"text",
+					`\u26a0\ufe0f STEP 3 plan agreement distribution error for "${focusTodo.content}": ${message}`,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{ isNonInteractive: true },
+				)
+			}
+		}
+
+		if (successParts.length === 0) {
+			await this.say(
+				"text",
+				`\u2705 STEP 3 for "${focusTodo.content}": no new agreements`,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ isNonInteractive: true },
+			)
+		} else {
+			await this.say(
+				"text",
+				`\u2705 STEP 3 for "${focusTodo.content}": ${successParts.join(" and ")}`,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{ isNonInteractive: true },
+			)
+		}
+
+		return { executed: true, appendedCount, fileAgreementCount, planAgreementCount, planAgreements }
+	}
+
+	private async recordStep3TodoContextUpdate(
+		previousTodos: TodoItem[],
+		updatedTodos: TodoItem[],
+		completedTodo: TodoItem,
+		appendedCount: number,
+	): Promise<void> {
+		await setTodoListForTask(this, updatedTodos)
+		await this.upsertUserEditTodos(
+			JSON.stringify({
+				tool: "updateTodoList",
+				todos: updatedTodos,
+				previousTodos,
+				source: "step3",
+				step3: {
+					completedTodoItemId: completedTodo.id,
+					completedTodoContent: completedTodo.content,
+					appendedCount,
+				},
+			}),
+		)
 	}
 
 	async sayAndCreateMissingParamError(toolName: ToolName, paramName: string, relPath?: string) {
@@ -2894,6 +4601,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// This is important in case the user deletes messages without resuming
 		// the task first.
 		this.apiConversationHistory = await this.getSavedApiConversationHistory()
+		this.subagentResumeReviewPending = await this.hasSubagentResumeState()
 
 		// Restore taskTimestamp from existing turn directories on disk, or generate new one.
 		// Turn files and context_refs.json are stored under <taskDir>/task/<timestamp>/,
@@ -3438,6 +5146,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					// Main loop exited because subagents are taking over.
 					// Launch parallel execution now that the main loop is no longer interfering.
 					this.subagentsPending = false
+					await this.clearRefineResumeState()
 					try {
 						await this.runParallelSubagents()
 					} catch (err) {
@@ -4125,39 +5834,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						if (this.pendingRefineRequest) {
 							// Stream was intentionally aborted for a refine request.
 							// Consume it here and push refine prompt onto the stack.
-							const { todoItemIds } = this.pendingRefineRequest
 							this.pendingRefineRequest = null
 							console.log(
 								`[Task#${this.taskId}.${this.instanceId}] Stream aborted for refine request, injecting refine prompt`,
 							)
 
 							const allTodos = this.todoList ?? []
-							if (allTodos.length > 0) {
-								const fullListDescription = allTodos
-									.map((t) => {
-										const mark =
-											t.status === "completed" ? "x" : t.status === "in_progress" ? "-" : " "
-										return `[${mark}] ${t.content}`
-									})
-									.join("\n")
-
-								const refinePrompt = buildRefinePrompt(fullListDescription)
-
-								this.activeRefineTodoItemIds = allTodos.map((t) => t.id)
-								this.isRefineMode = true
-
-								// Emit a refine divider so exploration messages are grouped
-								// below the entire old todo list, not under the first old item.
-								await this.say(
-									"todo_item_divider",
-									JSON.stringify({ content: "Refine", todoItemId: "__refine__" }),
-									undefined,
-									undefined,
-									undefined,
-									undefined,
-									{ isNonInteractive: true },
-								)
-
+							// Emit a refine divider so exploration messages are grouped
+							// below the entire old todo list, not under the first old item.
+							const refinePrompt = await this.prepareRefinePromptForTodos(allTodos)
+							if (refinePrompt) {
 								stack.push({
 									userContent: [{ type: "text", text: refinePrompt }],
 									includeFileDetails: false,
@@ -4267,38 +5953,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				if (this.pendingRefineRequest) {
 					await abortStream("user_cancelled")
 
-					const { todoItemIds } = this.pendingRefineRequest
 					this.pendingRefineRequest = null
 					console.log(
 						`[Task#${this.taskId}.${this.instanceId}] Stream interrupted for refine request, injecting refine prompt`,
 					)
 
 					const allTodos = this.todoList ?? []
-					if (allTodos.length > 0) {
-						const fullListDescription = allTodos
-							.map((t) => {
-								const mark = t.status === "completed" ? "x" : t.status === "in_progress" ? "-" : " "
-								return `[${mark}] ${t.content}`
-							})
-							.join("\n")
-
-						const refinePrompt = buildRefinePrompt(fullListDescription)
-
-						this.activeRefineTodoItemIds = allTodos.map((t) => t.id)
-						this.isRefineMode = true
-
-						// Emit a refine divider so exploration messages are grouped
-						// below the entire old todo list, not under the first old item.
-						await this.say(
-							"todo_item_divider",
-							JSON.stringify({ content: "Refine", todoItemId: "__refine__" }),
-							undefined,
-							undefined,
-							undefined,
-							undefined,
-							{ isNonInteractive: true },
-						)
-
+					// Emit a refine divider so exploration messages are grouped
+					// below the entire old todo list, not under the first old item.
+					const refinePrompt = await this.prepareRefinePromptForTodos(allTodos)
+					if (refinePrompt) {
 						stack.push({
 							userContent: [{ type: "text", text: refinePrompt }],
 							includeFileDetails: false,
@@ -4693,35 +6357,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					// If user requested todo item refinement, inject a prompt asking AI to create plans
 					if (this.pendingRefineRequest) {
-						const { todoItemIds } = this.pendingRefineRequest
 						this.pendingRefineRequest = null
 
 						const allTodos = this.todoList ?? []
-						if (allTodos.length > 0) {
-							const fullListDescription = allTodos
-								.map((t) => {
-									const mark = t.status === "completed" ? "x" : t.status === "in_progress" ? "-" : " "
-									return `[${mark}] ${t.content}`
-								})
-								.join("\n")
-
-							const refinePrompt = buildRefinePrompt(fullListDescription)
-
-							this.activeRefineTodoItemIds = allTodos.map((t) => t.id)
-							this.isRefineMode = true
-
-							// Emit a refine divider so exploration messages are grouped
-							// below the entire old todo list, not under the first old item.
-							await this.say(
-								"todo_item_divider",
-								JSON.stringify({ content: "Refine", todoItemId: "__refine__" }),
-								undefined,
-								undefined,
-								undefined,
-								undefined,
-								{ isNonInteractive: true },
-							)
-
+						// Emit a refine divider so exploration messages are grouped
+						// below the entire old todo list, not under the first old item.
+						const refinePrompt = await this.prepareRefinePromptForTodos(allTodos)
+						if (refinePrompt) {
 							this.userMessageContent.push({
 								type: "text",
 								text: refinePrompt,
@@ -4935,6 +6577,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						vscode.workspace.getConfiguration(Package.name).get<boolean>("useAgentRules") ?? true,
 					enableSubfolderRules: enableSubfolderRules ?? false,
 					isStealthModel: modelInfo?.isStealthModel,
+					suppressCompletionInstructions: this.isRefineMode,
 				},
 				undefined, // todoList
 				this.api.getModel().id,
@@ -5095,7 +6738,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		// Full history pipeline: apply context stripping, merge consecutive same-role messages, then clean for API submission.
 		const effectiveHistory = await this.buildEffectiveHistory()
-		const requestHistory = this.isRefineMode ? this.buildRefineSafeHistory(effectiveHistory) : effectiveHistory
+		const effectiveHistoryWithRefineMarker = await this.buildHistoryWithRefineContextMarker(effectiveHistory)
+		const effectiveHistoryWithResumeMarkers = await this.buildHistoryWithSubagentContextMarker(
+			effectiveHistoryWithRefineMarker,
+		)
+		const requestHistory = this.isRefineMode
+			? this.buildRefineSafeHistory(effectiveHistoryWithResumeMarkers)
+			: effectiveHistoryWithResumeMarkers
 		const mergedMessages = mergeConsecutiveApiMessages(requestHistory)
 		const messagesWithoutImages = maybeRemoveImageBlocks(mergedMessages, this.api)
 		const cleanConversationHistory = this.buildCleanConversationHistory(messagesWithoutImages as ApiMessage[])
@@ -5122,6 +6771,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// Only Gemini currently supports this - other providers filter tools normally.
 		let allTools: OpenAI.Chat.ChatCompletionTool[] = []
 		let allowedFunctionNames: string[] | undefined
+
+		const hasRefineResumeState = await this.hasRefineResumeState()
+		const hasSubagentResumeState = !this.isRefineMode && (await this.shouldReviewSubagentResumeState())
 
 		if (this.isRefineMode) {
 			const { getRefineOnlyTools } = await import("../prompts/tools/native-tools")
@@ -5155,6 +6807,24 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				})
 				allTools = toolsResult.tools
 				allowedFunctionNames = toolsResult.allowedFunctionNames
+			}
+			if (hasRefineResumeState) {
+				const { default: writeTodoPlan } = await import("../prompts/tools/native-tools/write_todo_plan")
+				if (!allTools.some((tool) => "function" in tool && tool.function.name === "write_todo_plan")) {
+					allTools = [...allTools, writeTodoPlan]
+				}
+				if (allowedFunctionNames && !allowedFunctionNames.includes("write_todo_plan")) {
+					allowedFunctionNames = [...allowedFunctionNames, "write_todo_plan"]
+				}
+			}
+			if (hasSubagentResumeState) {
+				const { default: resumeSubagents } = await import("../prompts/tools/native-tools/resume_subagents")
+				if (!allTools.some((tool) => "function" in tool && tool.function.name === "resume_subagents")) {
+					allTools = [...allTools, resumeSubagents]
+				}
+				if (allowedFunctionNames && !allowedFunctionNames.includes("resume_subagents")) {
+					allowedFunctionNames = [...allowedFunctionNames, "resume_subagents"]
+				}
 			}
 		}
 
@@ -5805,24 +7475,80 @@ You are permitted to make file changes, run shell commands, and utilize your ars
 ${planReference}`
 }
 
-function buildSubagentExecutionSystemPrompt(cwd: string): string {
-	return `You are a coding subagent executing one already-assigned task inside a larger workflow.
+function buildDetachedSubagentExecutionSystemPrompt(cwd: string): string {
+	return `You are a coding subagent responsible for executing one already-assigned task inside a larger workflow.
 
-Your task has already been established and planned by the parent agent.
-You are in build mode, not refine mode.
+Your assignment has already been scoped and planned by the parent agent.
+You are not the planner, coordinator, or user-facing assistant.
+You are the execution agent for this task.
+You are a child execution subagent spawned after the parent agent already decomposed and scoped the work.
 
-Rules:
+Operating mode:
+- You are in execution mode, not planning mode.
+- You have exactly one assigned task in this subagent run.
+- Do not orient yourself like a fresh top-level agent. Do not begin by listing workspace directories.
+- The user message is the complete task package for this subagent. Treat it as your entire user-provided context.
+- If a later request includes current execution state, it is only continuation state for this same assigned task after tool feedback or an API interruption.
+- The assigned refined todo item and relevant memories provided to you are the working brief for this run.
+- Treat the todo item's context and relevant memories as authoritative coordination guidance prepared to keep parallel subagents aligned.
+- Your goal is to complete the assigned coding work correctly, efficiently, and strictly within scope.
+
+Instruction priority:
+1. Follow the system prompt.
+2. Follow the assigned refined todo item, its context, and relevant memories.
+3. Follow the existing codebase's established patterns and conventions.
+4. Prefer the smallest correct change set that fully satisfies the assigned work.
+
+Core rules:
 - Use only the tools that are actually provided to you in this session.
-- Do not create or rewrite todo lists, plans, or markdown task artifacts.
-- Do not ask the user follow-up questions.
-- Read the relevant files you need, then make the required code changes.
-- Only edit files that are explicitly allowed in the user message.
-- If the task cannot be completed with the available tools or allowed files, explain that in attempt_completion.
-- When the assigned work is complete, call attempt_completion with a concise summary.
+- Do not switch tasks, split into new tasks, or wait for another task. Finish this one assigned task.
+- Avoid rewriting todo lists, plans, coordination notes, or workflow artifacts unless the assigned task explicitly requires it.
+- Ask follow-up questions only when the assigned task cannot proceed safely without clarification.
+- Do not invent files, APIs, library usage, behavior, or code structure. Read first, then change.
+- Read the minimum relevant code needed to remove uncertainty before editing.
+- Do not list workspace directories to understand the project. The parent agent already performed task scoping; your assigned refined todo item is your scope.
+- If the assigned refined todo item names files, symbols, routes, types, or components, go directly to those targets instead of exploring the project tree.
+- If no exact target is named, use one precise file/symbol/content search to locate the change surface, not a directory listing.
+- Focus edits on the assigned refined todo item, its context, and relevant memories.
+- Do not modify unrelated files even if they appear related.
+- Preserve unrelated behavior and existing project architecture unless your assigned task explicitly changes it.
+- Treat tool results from this session as authoritative. Do not wait for extra confirmation after successful tool execution.
+- If implementation reveals a concrete cross-task agreement or mismatch that other tasks may need to honor, report it in attempt_completion with exact names and full shapes/signatures when relevant. The parent agent will handle STEP 3 task-context updates.
+- If the task cannot be completed with the available tools or context, report that in attempt_completion.
+- As soon as the assigned work is complete, call attempt_completion with a concise, factual summary.
+
+Execution workflow:
+1. Understand the assigned refined todo item, its context, and relevant memories.
+2. Go directly to the named targets. Only use targeted read/search when it is necessary to remove uncertainty about the assigned task.
+3. Before editing, check whether the todo item context or relevant memories define any conventions or coordination details your changes must preserve.
+4. Make the required code changes.
+5. Perform lightweight verification when feasible with the available tools.
+6. Immediately call attempt_completion when done or when blocked.
+
+Coordination behavior:
+- Apply only the conventions and coordination details that materially affect your assigned files and task.
+- If todo item context or relevant memories define a convention, follow it even if another local file uses an older pattern, unless the task explicitly requires updating that older pattern.
+- If you discover a likely cross-task mismatch but cannot safely fix it within your assigned task scope, do not guess. Keep your changes locally consistent, then report the mismatch clearly in attempt_completion.
+- If the codebase already establishes a stable convention, match it exactly rather than introducing a parallel convention.
+- Prefer additive compatibility over risky cross-cutting rewrites.
+
+When blocked:
+- Do not loop or keep retrying without new information.
+- State the exact blocker.
+- State what you checked.
+- State what additional context, file access, or tool would be required.
+
+attempt_completion must include:
+- what was changed or concluded
+- which files were modified or inspected
+- what verification was performed
+- any concrete shared contract, exact identifier, payload/type/route shape, or cross-task mismatch learned during implementation that other tasks may need to honor
+- any remaining risks, assumptions, cross-task mismatches, or blockers
 
 Environment:
 - Project base directory: ${cwd.toPosix()}
-- All file paths must be relative to this directory.`
+- All file paths must be relative to this directory.
+}`
 }
 
 // OpenCode plan.txt + experimental plan workflow — merged into ONE system prompt block.
@@ -5882,31 +7608,30 @@ Goal: Gain a comprehensive understanding of the user's request by reading throug
 Goal: Use \`update_todo_list\` to replace the current todo list with an architecture-based decomposition.
 
 **MANDATORY — Architecture-Based Task Grouping:**
-You MUST group tasks by **architectural layer or subsystem**, NOT by individual file. All files belonging to the same architectural layer go into ONE todo item. The goal is to produce the MINIMUM number of coarse-grained tasks.
+You MUST group tasks by **architectural layer or subsystem**, NOT by individual file, feature, or step. Combine all files belonging to the same layer into ONE todo item and aim for the MINIMUM number of coarse-grained execution units.
+Each todo item SHOULD list the main files involved so that the build agent can implement the entire layer in one focused turn.
+Do NOT create todo items for planning/specification-only work; keep only concrete implementation units in the rewritten list.
 
-Examples of correct grouping:
-- A full-stack web app → 2 tasks: "Backend: server.js, routes/api.js, models/user.js, middleware/auth.js, package.json" + "Frontend: public/index.html, public/login.html, public/css/style.css, public/js/app.js"
-- A CLI tool with a library → 2 tasks: "Core library (src/lib/**)" + "CLI interface (src/cli/**)" 
-- A monorepo with 3 packages → 3 tasks, one per package
-- A simple single-layer project → 1 task covering everything
+**MANDATORY — \`item_contexts\` on \`update_todo_list\`:** In STEP 1 you MUST pass \`item_contexts\` — an array of markdown strings, **one per checklist line** (same order and length as \`todos\`). Use \`""\` for a line with no extra spec. For each non-empty entry, include only the architecture-level context the build subagent must independently honor: subsystem role, involved files/modules, task boundaries, major dependencies, integration direction, and other high-level constraints from the rewritten decomposition.
+Treat each non-empty \`item_contexts\` entry as the base architecture context for the rewritten task that STEP 2 will plan against and STEP 3 may later extend with execution-derived agreements.
 
-Examples of WRONG grouping (DO NOT do this):
-- ❌ One task per file (e.g., "Create server.js", "Create login.html", "Create snake.js")
-- ❌ One task per feature within the same layer (e.g., "Implement login page", "Implement game page" when both are frontend)
-- ❌ One task per step (e.g., "Init project", "Add dependencies", "Write config")
-
-Each todo item MUST list ALL the files it owns so that the build agent can implement the entire layer in one focused turn.
-
-**MANDATORY — \`item_contexts\` on \`update_todo_list\`:** In STEP 1 you MUST pass \`item_contexts\` — an array of markdown strings, **one per checklist line** (same order and length as \`todos\`). Use \`""\` for a line with no extra spec. For each non-empty entry, include only the task-specific context the build subagent must independently honor: requirements, dependencies, constraints, conventions, integration details, and any exact snippets that truly must be preserved.
-
-**CRITICAL — Shared Context Rule:** If two or more tasks must independently honor the same requirement, dependency, convention, or integration detail, you MUST copy the relevant text into EVERY task's \`item_contexts\` entry. Each build subagent is isolated — it only sees its own context. If you omit shared context from an affected task, that task can produce incompatible or incomplete output. Never assume a task can "see" another task's context.
+**CRITICAL — Shared Context Rule:** If two or more tasks must independently honor the same architectural boundary, task rule, dependency, or high-level integration constraint from the rewritten decomposition, you MUST copy the relevant text into EVERY task's \`item_contexts\` entry. Each build subagent is isolated — it only sees its own context. If you omit shared context from an affected task, that task can produce incompatible or incomplete output. Never assume a task can "see" another task's context.
 
 Call \`update_todo_list\` NOW with the rewritten list **and** \`item_contexts\`. The response will show the new todo ids; you will need those ids for Phase 3.
 
 ### Phase 3: Write Plans (STEP 2)
 Goal: Use \`write_todo_plan\` for EACH todo item from the rewritten list.
 
+**CRITICAL — Sequential STEP 2 Context Flow:** STEP 2 is strictly sequential. Call \`write_todo_plan\` for exactly ONE todo item at a time, in the order returned by \`update_todo_list\`. After each \`write_todo_plan\` call, STOP that assistant response and wait for the tool result. The system will run STEP 3 immediately after that plan, merge any new cross-task agreements into todo contexts, and return a fresh "Sequential refine state" snapshot. Use that latest snapshot before writing the next todo's plan. Never issue multiple \`write_todo_plan\` calls in the same assistant response.
+
 **CRITICAL — Context Isolation:** The build agent receives the todo-level task context from Phase 2 (\`item_contexts\`) plus these plan entries. It has NO access to Phase 1 exploration results, the full conversation history, or other items' plans. Each \`write_todo_plan\` call must supply **self-contained implementation blueprints** (per-file or general sections) that enable fully autonomous implementation.
+
+**CRITICAL — Step 2 Scope:** Use STEP 2 to write self-contained implementation plans. Keep the COMPLETE rewritten todo list in mind, but do NOT force STEP 2 to predict every concrete agreement that might only become clear during implementation.
+If an important pre-execution coordination note is already obvious during planning, you MAY append it to the END of the relevant tasks' context using \`context_appends\` on the same \`write_todo_plan\` call.
+Any STEP 2 shared note must still be concrete and executable. Do NOT write vague guidance such as "use the shared interface", "keep the payload aligned", or "follow the backend contract". When a convention concerns an interface, type, DTO, function, event, route, schema, status, env key, or payload, write the exact name and the full required fields, values, signatures, or shape that affected tasks must match.
+The long agreement checklist is a thinking aid for identifying relevant conflict-prevention details, not a required output format. Do NOT force a rigid scaffold like always writing "接口 / 函数 / 重要方法 / 类" when the task does not need it.
+The detailed coordination checklist, plan format rules, and \`context_appends\` usage guidance live in the \`write_todo_plan\` tool description. Use that tool description as the detailed authority for STEP 2.
+If a shared detailed rule is only learned or confirmed while implementing a todo item, leave that discovery to the automatic STEP 3 agreement pass instead of forcing STEP 2 to guess it. Keep STEP 1 \`item_contexts\` architecture-focused.
 
 **What belongs in \`write_todo_plan\` (not in \`item_contexts\`):**
 1. **Background** from Phase 1 for this layer: file paths, line numbers, code patterns, snippets the implementer needs.
@@ -5914,22 +7639,24 @@ Goal: Use \`write_todo_plan\` for EACH todo item from the rewritten list.
 3. **Implementation intent**: create/modify/delete which files; patterns and libraries.
 4. **Verification**: tests, expected behavior, how to confirm correctness.
 
-**Shared supporting context** belongs in Phase 2 \`item_contexts\` only — do not duplicate it as a separate \`write_todo_plan\` parameter (there is none).
+**Shared supporting context** starts in STEP 1 as architecture context in \`item_contexts\`, may be optionally extended in STEP 2 via \`context_appends\` for obvious pre-execution notes, and may be further extended automatically in STEP 3 after individual subagents complete.
 
-For each todo item returned by Phase 2, call \`write_todo_plan\` **one or more times** to add or split plan entries. Each call ACCUMULATES — \`plans\` are appended.
+For each todo item returned by Phase 2, call \`write_todo_plan\` in sequential order. Each call may include multiple \`plans\` entries for that ONE todo item, but do not call \`write_todo_plan\` for the next todo until the previous call returns and STEP 3 has updated the contexts. Additional calls for the same todo item are allowed only if the returned sequential state still requires that same todo item.
 
 Rules:
-- Do NOT create a separate todo item for planning/specification-only work — supporting context belongs in \`item_contexts\` from Phase 2, not in the todo list text
+- Do NOT create a separate todo item for planning/specification-only work — supporting context belongs in \`item_contexts\` or \`context_appends\`, not in the todo list text
 - The \`plans\` array contains per-file or per-section implementation blueprints
 - Include only your recommended approach, not all alternatives
 - Keep plans detailed enough for fully autonomous execution
 
 ### Phase 4: Automatic Parallel Execution
-After all plans are recorded (i.e., \`write_todo_plan\` has been called for every todo item and refine mode exits), parallel subagent execution will be **automatically triggered**. You do NOT need to call any additional tool — the system will launch one subagent per todo item concurrently. Each subagent receives ONLY its own plan and task context. File ownership is enforced: each subagent may only edit files listed in its todo item.
+After all plans are recorded (i.e., \`write_todo_plan\` has been called for every todo item and refine mode exits), parallel subagent execution will be **automatically triggered**. You do NOT need to call any additional tool — the system will launch one subagent per todo item concurrently. Each subagent receives ONLY its own plan and task context and should focus implementation on that assigned package.
 
-After all subagents complete, you will see an aggregated results summary. Review the results and call \`attempt_completion\` if everything is satisfactory.
+### Phase 5: Automatic Agreement Completion (STEP 3)
+After each subagent finishes, the system will automatically run a dedicated API pass that reviews the completed todo item, its plan, and the subagent's final result. When that pass identifies concrete agreements, it merges them into task context under a structured file-owned agreement section grouped by code-file path.
+STEP 3 is automatic. You do NOT call a tool for it. Your responsibility is to make STEP 1 architecture context solid and STEP 2 plans self-contained; execution-time file-owned agreement harvesting is handled by the system after each completed subtask.
 
-**Important:** Do NOT attempt to implement items yourself after plans are written. The system handles execution automatically. Use \`ask_followup_question\` to clarify requirements/approach BEFORE writing plans.
+**Important:** Do NOT attempt to implement items yourself or complete/end the task from refine mode after plans are written. The system handles execution automatically. Use \`ask_followup_question\` to clarify requirements/approach BEFORE writing plans.
 
 NOTE: At any point in time through this workflow you should feel free to ask the user questions or clarifications. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins.
 </system-reminder>`
@@ -5943,8 +7670,260 @@ function buildRefinePrompt(fullTodoList: string): string {
 
 ${fullTodoList}
 
-STEP 1: First, use \`update_todo_list\` to REWRITE the entire list into architecture-based groups (e.g., Backend + Frontend). Include \`item_contexts\` (one string per checklist line, same order) with any essential task context each layer must independently honor. Do NOT keep the current per-file or per-step breakdown.
-STEP 2: Then, use \`write_todo_plan\` for each resulting todo item to record detailed implementation plans.
+STEP 1: Use \`update_todo_list\` to rewrite the list into architecture-based implementation groups, with required \`item_contexts\` that describe only each task's architecture role, task boundaries, and high-level dependencies.
+STEP 2: Use \`write_todo_plan\` sequentially for each resulting todo item, exactly one todo item per assistant response. After each call, wait for STEP 3 and the returned "Sequential refine state" before planning the next todo. Focus on self-contained implementation guidance; use \`context_appends\` only when an important coordination note is already obvious before execution starts.
+STEP 3: After each subagent finishes, the system will automatically run a dedicated API pass to merge concrete cross-task agreements into task contexts, grouped by the refined code file that owns each agreement.
 
 Follow the Plan Workflow defined in the system prompt. Start with Phase 1 (Initial Understanding).`
+}
+
+const AGREEMENT_OUTPUT_SCHEMA = `Return JSON ONLY. No prose. No markdown fences.
+
+Schema:
+{
+  "file_agreements": [
+    {
+      "file_path": "one exact path from Current refined code-file targets",
+      "agreements": [
+        {
+          "text": "one concrete cross-task agreement owned by this refine file",
+          "shared_with": [
+            "exact path from Available cross-task file targets that consumes or must honor this agreement"
+          ]
+        }
+      ]
+    }
+  ]
+}`
+
+const AGREEMENT_GENERAL_RULES = `General rules:
+- Extract ONLY cross-task agreements. A cross-task agreement is a concrete rule, contract, shape, identifier, route, event, storage key, env key, import boundary, ownership boundary, or behavior that at least one other todo item, refined file, or subagent must independently honor.
+- Do NOT record file-local implementation details that only affect the owning file.
+- Always use the EXACT identifier names and the full required shapes/signatures/values/keys/routes when relevant. Never write vague reminders such as "use the shared interface", "match the backend payload", or "follow the existing contract".
+  Bad:  "Use the shared user interface."
+  Good: "Use \`UserSummary\` with fields \`{ id: string; email: string; role: \\\"admin\\\" | \\\"member\\\" }\` in both the backend response and the frontend consumer."
+- Do NOT restate architecture context, plan prose, generic intent, status summaries, or background.
+- Do NOT invent agreements that are not actually committed to in the source material.
+- Every agreement must be owned by exactly one refine code file via \`file_path\`.
+- If there is nothing concrete worth recording, return {"file_agreements":[]}.`
+
+const AGREEMENT_CATEGORY_INSTRUCTIONS = `The checklist below is a relevance filter for finding cross-task agreements, not a mandatory output scaffold. Use only the categories that actually matter for the source material; ignore the rest. Do NOT force a rigid format like always writing "接口 / 函数 / 重要方法 / 类".
+
+Inspect the source material for concrete shared agreements, expectations, and integration constraints that other todo items or refined files must independently honor when relevant, including:
+${renderAgreementChecklistBullets()}`
+
+const AGREEMENT_FILE_BLOCK_INSTRUCTIONS = `File agreement rules:
+- Emit "file_agreements" entries only for paths listed under "Current refined code-file targets". Do NOT emit entries for GENERAL sections or any owner path not listed there.
+- Group agreements by owning refine code file. Each "file_path" must be an exact current refined target path, and each "agreements" item must belong to that file.
+- For each current refined code-file target, inspect its entire plan body and include only concrete cross-task agreements from task context, the plan, and completion details that apply to that file.
+- For each current refined code-file target, perform a coverage pass over API interfaces, routes, HTTP methods, request bodies, response bodies, error response shapes, auth/token headers, JWT payload/secret rules, storage keys, env keys, model/database field mappings, and frontend/backend consumer files. Record every concrete cross-task agreement owned by that file; if an agreement is consumed by another available cross-task file target, include that consuming file path in "shared_with".
+- For API agreements, distinguish producer files from consumer files: backend route files own "implements/accepts/returns" agreements, while frontend files own "calls/sends/handles/stores" agreements. Always include HTTP method, full route, request body shape, success response shape, error response shape, status code expectations, auth header/token requirements, and consuming/producing refined file paths when they exist.
+- Each agreement item must be an object with "text" and "shared_with". Put only exact paths from "Available cross-task file targets" in "shared_with"; use an empty array only when the agreement is cross-task but the consuming file is not listed there.
+- Do NOT output markdown headings, example implementations, boilerplate, or long prose. Output agreement objects only.
+- If the same agreement affects multiple files, repeat it under each owning file_path so the ownership is explicit.
+- Use "file_agreements": [] only when the active todo produced no concrete cross-task agreement worth recording.`
+
+function buildPostSubtaskAgreementPrompt({
+	completedTodo,
+	planFiles,
+	completionResult,
+	todos,
+}: {
+	completedTodo: TodoItem
+	planFiles: PlanFile[]
+	completionResult: string
+	todos: TodoItem[]
+}): string {
+	const todoListText = todos
+		.map((todo) => {
+			const context = todo.context?.trim() ? `\nContext:\n${todo.context.trim()}` : ""
+			const marker = todo.id === completedTodo.id ? " (just completed)" : ""
+			return `- [${todo.id}]${marker} ${todo.content}${context}`
+		})
+		.join("\n\n")
+
+	const planText =
+		planFiles.length > 0
+			? planFiles.map((plan) => `### ${plan.filePath}\n${plan.content.trim()}`).join("\n\n")
+			: "(no plan files)"
+	const refinedTargetsText =
+		collectCodePlanTargets(planFiles)
+			.map((target) => `- ${target}`)
+			.join("\n") || "(none)"
+	const availableTargetsText =
+		collectAvailableCodeTargets(todos, planFiles)
+			.map((target) => `- ${target}`)
+			.join("\n") || "(none)"
+
+	return `You are performing STEP 3 (post-execution agreement pass) in a task workflow.
+
+A subagent just finished implementing ONE todo item. Your only job is to read the listed refined code-file targets, that subagent's plan, and its \`attempt_completion\` result, then extract ONLY cross-task agreements grouped by the owning refine code file.
+
+${AGREEMENT_OUTPUT_SCHEMA}
+
+${AGREEMENT_GENERAL_RULES}
+- Anchor every append on something actually implemented, confirmed, or clearly committed to in the plan + completion result.
+
+${AGREEMENT_CATEGORY_INSTRUCTIONS}
+
+${AGREEMENT_FILE_BLOCK_INSTRUCTIONS}
+
+Current refined code-file targets:
+${refinedTargetsText}
+
+Available cross-task file targets:
+${availableTargetsText}
+
+Just-completed todo:
+- id: ${completedTodo.id}
+- content: ${completedTodo.content}
+
+Just-completed todo current context:
+${completedTodo.context?.trim() || "(empty)"}
+
+Plan for the completed todo:
+${planText}
+
+Subagent attempt_completion result:
+${completionResult}
+
+Current todo list and contexts:
+${todoListText}`
+}
+
+function buildPostRefineAgreementPrompt({
+	refinedTodo,
+	planFiles,
+	todos,
+}: {
+	refinedTodo: TodoItem
+	planFiles: PlanFile[]
+	todos: TodoItem[]
+}): string {
+	const todoListText = todos
+		.map((todo) => {
+			const context = todo.context?.trim() ? `\nContext:\n${todo.context.trim()}` : ""
+			const marker = todo.id === refinedTodo.id ? " (just refined)" : ""
+			return `- [${todo.id}]${marker} ${todo.content}${context}`
+		})
+		.join("\n\n")
+
+	const planText =
+		planFiles.length > 0
+			? planFiles.map((plan) => `### ${plan.filePath}\n${plan.content.trim()}`).join("\n\n")
+			: "(no plan files)"
+	const refinedTargetsText =
+		collectCodePlanTargets(planFiles)
+			.map((target) => `- ${target}`)
+			.join("\n") || "(none)"
+	const availableTargetsText =
+		collectAvailableCodeTargets(todos, planFiles)
+			.map((target) => `- ${target}`)
+			.join("\n") || "(none)"
+
+	return `You are performing STEP 3 (refine-time agreement pass) in a task workflow.
+
+A plan was just written for ONE todo item via \`write_todo_plan\`. Your only job is to inspect the listed refined code-file targets and that plan, then extract ONLY cross-task agreements grouped by the owning refined code file.
+
+
+${AGREEMENT_OUTPUT_SCHEMA}
+
+${AGREEMENT_GENERAL_RULES}
+- Anchor every append on something actually written in the plan body. If the plan does not yet commit to a concrete shape (e.g. it only says "decide later"), do not invent one.
+- Return {"file_agreements":[]} only when the plan contains no concrete cross-task agreement worth recording.
+
+${AGREEMENT_CATEGORY_INSTRUCTIONS}
+
+${AGREEMENT_FILE_BLOCK_INSTRUCTIONS}
+
+Current refined code-file targets:
+${refinedTargetsText}
+
+Available cross-task file targets:
+${availableTargetsText}
+
+Just-refined todo:
+- id: ${refinedTodo.id}
+- content: ${refinedTodo.content}
+
+Just-refined todo current context:
+${refinedTodo.context?.trim() || "(empty)"}
+
+Plan just written for the refined todo:
+${planText}
+
+Current todo list and contexts:
+${todoListText}`
+}
+
+function parsePostSubtaskAgreementResponse(rawResponse: string): PostSubtaskAgreementResponse {
+	const trimmed = rawResponse.trim()
+	const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)
+	const candidate =
+		fencedMatch?.[1]?.trim() ??
+		(() => {
+			const start = trimmed.indexOf("{")
+			const end = trimmed.lastIndexOf("}")
+			return start !== -1 && end !== -1 && end >= start ? trimmed.slice(start, end + 1) : trimmed
+		})()
+
+	const parsed = JSON.parse(candidate) as { file_agreements?: unknown }
+	const parseAgreementItem = (agreement: unknown): PostSubtaskAgreementItem | undefined => {
+		if (typeof agreement === "string") {
+			const text = agreement.trim()
+			return text ? { text, shared_with: [] } : undefined
+		}
+		if (!agreement || typeof agreement !== "object") {
+			return undefined
+		}
+
+		const entry = agreement as { text?: unknown; shared_with?: unknown }
+		const text = typeof entry.text === "string" ? entry.text.trim() : ""
+		if (!text) {
+			return undefined
+		}
+
+		const shared_with = Array.isArray(entry.shared_with)
+			? entry.shared_with
+					.map((target) => (typeof target === "string" ? target.trim() : ""))
+					.filter((target) => target.length > 0)
+			: typeof entry.shared_with === "string"
+				? parseSharedWithTargets(entry.shared_with)
+				: []
+
+		return { text, shared_with }
+	}
+	const rawFileAgreements = Array.isArray(parsed.file_agreements)
+		? parsed.file_agreements
+				.filter(
+					(entry): entry is { file_path?: unknown; agreements?: unknown } =>
+						!!entry && typeof entry === "object",
+				)
+				.map((entry) => ({
+					file_path: typeof entry.file_path === "string" ? entry.file_path.trim() : "",
+					agreements: Array.isArray(entry.agreements)
+						? entry.agreements
+								.map(parseAgreementItem)
+								.filter((agreement): agreement is PostSubtaskAgreementItem => !!agreement)
+						: [],
+				}))
+				.filter((entry) => entry.file_path.length > 0 && entry.agreements.length > 0)
+		: []
+
+	const fileAgreementsByTarget = new Map<string, PostSubtaskAgreementItem[]>()
+	for (const entry of rawFileAgreements) {
+		const existing = fileAgreementsByTarget.get(entry.file_path) ?? []
+		for (const agreement of entry.agreements) {
+			mergeAgreementItem(existing, agreement)
+		}
+		fileAgreementsByTarget.set(entry.file_path, existing)
+	}
+	const fileAgreements = Array.from(fileAgreementsByTarget.entries()).map(([file_path, agreements]) => ({
+		file_path,
+		agreements,
+	}))
+
+	return {
+		fileAgreements,
+	}
 }

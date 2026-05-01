@@ -45,12 +45,12 @@ export interface NativeToolsOptions {
 	supportsImages?: boolean
 }
 
-const subagentAttemptCompletion: OpenAI.Chat.ChatCompletionTool = {
+export const subagentAttemptCompletion: OpenAI.Chat.ChatCompletionTool = {
 	...attemptCompletion,
 	function: {
 		...attemptCompletion.function,
 		description:
-			"Use this when your assigned subtask is finished or cannot be completed further. The tool results returned in this conversation are the authoritative execution feedback for the subagent; you do not need extra user confirmation before calling attempt_completion. After you have finished the required reads/writes/searches for your assigned files and the latest tool results indicate success, call attempt_completion immediately with a concise summary. If the subtask is blocked by missing files, ownership limits, or tool limitations, call attempt_completion with a concise explanation of the blocker.",
+			"Use this when your assigned subtask is finished or cannot be completed further. The tool results returned in this conversation are the authoritative execution feedback for the subagent; you do not need extra user confirmation before calling attempt_completion. After you have finished the required reads/writes/searches for your assigned work and the latest tool results indicate success, call attempt_completion immediately with a concise summary. If the subtask is blocked by missing files, missing context, or tool limitations, call attempt_completion with a concise explanation of the blocker.",
 	},
 }
 
@@ -133,24 +133,16 @@ export function getRefineOnlyTools(options: NativeToolsOptions = {}): OpenAI.Cha
 	] satisfies OpenAI.Chat.ChatCompletionTool[]
 }
 
-/**
- * Tools available to parallel subagents during build phase.
- * A focused subset: read + write + search + completion. No browser, MCP, or command execution.
- */
 export function getSubagentTools(options: NativeToolsOptions = {}): OpenAI.Chat.ChatCompletionTool[] {
-	const { supportsImages = false } = options
-
-	const readFileOptions: ReadFileToolOptions = {
-		supportsImages,
-	}
-
-	return [
-		createReadFileTool(readFileOptions),
-		listFiles,
-		searchFiles,
-		writeToFile,
-		subagentAttemptCompletion,
-	] satisfies OpenAI.Chat.ChatCompletionTool[]
+	return getNativeTools(options)
+		.filter(
+			(tool) =>
+				!("function" in tool) ||
+				(tool.function.name !== "switch_mode" && tool.function.name !== "write_todo_plan"),
+		)
+		.map((tool) =>
+			"function" in tool && tool.function.name === "attempt_completion" ? subagentAttemptCompletion : tool,
+		)
 }
 
 // Backward compatibility: export default tools with line ranges enabled

@@ -607,11 +607,13 @@ export const ChatRowContent = ({
 	const isMcpServerResponding = isLast && lastModifiedMessage?.say === "mcp_server_request_started"
 
 	const type = message.type === "ask" ? message.ask : message.say
+	const isSubagentMessage = !!message.subagentId
 
 	const normalColor = "var(--vscode-foreground)"
 	const errorColor = "var(--vscode-errorForeground)"
 	const successColor = "var(--vscode-charts-green)"
 	const cancelledColor = "var(--vscode-descriptionForeground)"
+	const subagentColor = "var(--vscode-charts-green)"
 
 	const [icon, title] = useMemo(() => {
 		switch (type) {
@@ -660,6 +662,7 @@ export const ChatRowContent = ({
 			case "api_req_retry_delayed":
 				return []
 			case "api_req_started":
+				const apiReqColor = isSubagentMessage ? subagentColor : normalColor
 				const getIconSpan = (iconName: string, color: string) => (
 					<div
 						style={{
@@ -683,13 +686,13 @@ export const ChatRowContent = ({
 							getIconSpan("error", errorColor)
 						)
 					) : cost !== null && cost !== undefined ? (
-						getIconSpan("arrow-swap", normalColor)
+						getIconSpan("arrow-swap", apiReqColor)
 					) : apiRequestFailedMessage ? (
 						getIconSpan("error", errorColor)
 					) : isLast ? (
 						<ProgressIndicator />
 					) : (
-						getIconSpan("arrow-swap", normalColor)
+						getIconSpan("arrow-swap", apiReqColor)
 					),
 					apiReqCancelReason !== null && apiReqCancelReason !== undefined ? (
 						apiReqCancelReason === "user_cancelled" ? (
@@ -702,11 +705,15 @@ export const ChatRowContent = ({
 							</span>
 						)
 					) : cost !== null && cost !== undefined ? (
-						<span style={{ color: normalColor }}>{t("chat:apiRequest.title")}</span>
+						<span style={{ color: apiReqColor }}>
+							{isSubagentMessage ? "Subagent API Request" : t("chat:apiRequest.title")}
+						</span>
 					) : apiRequestFailedMessage ? (
 						<span style={{ color: errorColor }}>{t("chat:apiRequest.failed")}</span>
 					) : (
-						<span style={{ color: normalColor }}>{t("chat:apiRequest.streaming")}</span>
+						<span style={{ color: apiReqColor }}>
+							{isSubagentMessage ? "Subagent API Request..." : t("chat:apiRequest.streaming")}
+						</span>
 					),
 				]
 			case "followup":
@@ -722,11 +729,17 @@ export const ChatRowContent = ({
 		isCommandExecuting,
 		message,
 		isMcpServerResponding,
+		isSubagentMessage,
 		apiReqCancelReason,
 		cost,
 		apiRequestFailedMessage,
 		t,
 		isLast,
+		normalColor,
+		errorColor,
+		subagentColor,
+		cancelledColor,
+		successColor,
 	])
 
 	const headerStyle: React.CSSProperties = {

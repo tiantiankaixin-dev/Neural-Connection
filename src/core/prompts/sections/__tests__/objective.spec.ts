@@ -5,11 +5,12 @@ describe("getObjectiveSection", () => {
 		const objective = getObjectiveSection()
 
 		// Check that all numbered items are present
-		expect(objective).toContain("1. Analyze the user's task")
-		expect(objective).toContain("2. Work through these goals sequentially")
-		expect(objective).toContain("3. Remember, you have extensive capabilities")
-		expect(objective).toContain("4. Once you've completed the user's task")
-		expect(objective).toContain("5. The user may provide feedback")
+		expect(objective).toContain("1. **TASK FIRST**")
+		expect(objective).toContain("2. Analyze the user's request")
+		expect(objective).toContain("3. Work through these goals sequentially")
+		expect(objective).toContain("4. Remember, you have extensive capabilities")
+		expect(objective).toContain("5. Once you've completed the user's task")
+		expect(objective).toContain("6. The user may provide feedback")
 	})
 
 	it("should include analysis guidance", () => {
@@ -43,5 +44,12 @@ describe("getObjectiveSection", () => {
 
 		expect(objective).toContain("OBJECTIVE")
 		expect(objective).toContain("You accomplish a given task iteratively")
+	})
+
+	it("should suppress completion instructions when requested", () => {
+		const objective = getObjectiveSection({ suppressCompletionInstructions: true })
+
+		expect(objective).not.toContain("you must use the attempt_completion tool")
+		expect(objective).toContain("Do not complete or end the task yourself in this mode")
 	})
 })

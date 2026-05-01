@@ -150,6 +150,10 @@ export function isToolAllowedForMode(
 		return true
 	}
 
+	if (resolvedTool === "resume_subagents") {
+		return resolvedIncludedTools?.includes("resume_subagents") ?? false
+	}
+
 	// For now, allow all custom tools in any mode.
 	// As a follow-up we should expand the custom tool definition to include mode restrictions.
 	if (experiments?.customTools && customToolRegistry.has(tool)) {

@@ -80,6 +80,37 @@ describe("askFollowupQuestionTool", () => {
 		)
 	})
 
+	it("should strip mode attributes from suggestions while in refine mode", async () => {
+		mockCline.isRefineMode = true
+		const block: ToolUse = {
+			type: "tool_use",
+			name: "ask_followup_question",
+			params: {
+				question: "What would you like to do?",
+			},
+			nativeArgs: {
+				question: "What would you like to do?",
+				follow_up: [
+					{ text: "Write code", mode: "code" },
+					{ text: "Debug issue", mode: "debug" },
+				],
+			},
+			partial: false,
+		}
+
+		await askFollowupQuestionTool.handle(mockCline, block as ToolUse<"ask_followup_question">, {
+			askApproval: vi.fn(),
+			handleError: vi.fn(),
+			pushToolResult: mockPushToolResult,
+		})
+
+		expect(mockCline.ask).toHaveBeenCalledWith(
+			"followup",
+			expect.stringContaining('"suggest":[{"answer":"Write code"},{"answer":"Debug issue"}]'),
+			false,
+		)
+	})
+
 	it("should handle mixed suggestions with and without mode attributes", async () => {
 		const block: ToolUse = {
 			type: "tool_use",

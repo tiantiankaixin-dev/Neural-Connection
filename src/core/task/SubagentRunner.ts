@@ -12,11 +12,27 @@
  */
 
 import { Anthropic } from "@anthropic-ai/sdk"
+import * as fs from "fs/promises"
+import * as path from "path"
 import { buildApiHandler, type ApiHandler, type ApiHandlerCreateMessageMetadata } from "../../api"
-import type { ClineMessage, ClineSay, TodoItem, ToolName } from "@roo-code/types"
-import type { PlanFile } from "../task-persistence/plan-persistence"
+import type { ClineApiReqInfo, ClineMessage, ClineSay, TodoItem, ToolName } from "@roo-code/types"
+import { parsePlanTargetHeader, type PlanFile } from "../task-persistence/plan-persistence"
 import type { ToolUse } from "../../shared/tools"
 import type { Task } from "./Task"
+import { ContextInspectorPanel } from "../webview/ContextInspectorPanel"
+
+const MAX_CONSECUTIVE_SUBAGENT_API_ERRORS = 2
+const MAX_SUBAGENT_BROAD_EXPLORATION_TOOL_CALLS = 2
+const MAX_SUBAGENT_READ_INSPECTION_TOOL_CALLS = 8
+const ROOCODE_BASE_SYSTEM_PROMPT_MARKERS = [
+	"You are Roo,",
+	"TOOL USE",
+	"TOOL USE GUIDELINES",
+	"CAPABILITIES",
+	"SYSTEM INFORMATION",
+	"OBJECTIVE",
+	"You accomplish a given task iteratively",
+]
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,8 +49,6 @@ export interface SubagentConfig {
 	systemPrompt: string
 	/** The set of tools available to this subagent. */
 	tools: import("openai").default.Chat.ChatCompletionTool[]
-	/** Allowed file paths — only these files may be edited. */
-	ownedFiles: string[]
 }
 
 export interface SubagentResult {
@@ -44,6 +58,16 @@ export interface SubagentResult {
 	error?: string
 }
 
+type WorkspaceMemoryEntry = {
+	title?: string
+	content?: string
+	tags?: string[]
+}
+
+type WorkspaceMemoryStore = {
+	memories?: WorkspaceMemoryEntry[]
+}
+
 // ---------------------------------------------------------------------------
 // SubagentRunner
 // ---------------------------------------------------------------------------
@@ -51,13 +75,19 @@ export interface SubagentResult {
 export class SubagentRunner {
 	readonly subagentId: string
 	readonly todoItem: TodoItem
-	readonly ownedFiles: string[]
 
 	private parentTask: Task
 	private api: ApiHandler
 	private systemPrompt: string
 	private tools: import("openai").default.Chat.ChatCompletionTool[]
 	private planFiles: PlanFile[]
+	private memoryContext?: string
+	private completedWriteTargets = new Set<string>()
+	private repeatedReadToolCalls = new Map<string, number>()
+	private broadExplorationToolCallCount = 0
+	private readInspectionToolCallCount = 0
+	private generatedToolUseIdCounter = 0
+	private consecutiveApiErrors = 0
 
 	/** Isolated conversation history for this subagent. */
 	private apiConversationHistory: Anthropic.Messages.MessageParam[] = []
@@ -70,10 +100,19 @@ export class SubagentRunner {
 		this.todoItem = config.todoItem
 		this.parentTask = config.parentTask
 		this.api = buildApiHandler(config.parentTask.apiConfiguration)
+		this.assertDetachedSystemPrompt(config.systemPrompt)
 		this.systemPrompt = config.systemPrompt
 		this.tools = config.tools
 		this.planFiles = config.planFiles
-		this.ownedFiles = config.ownedFiles
+	}
+
+	private assertDetachedSystemPrompt(systemPrompt: string): void {
+		const matchedMarker = ROOCODE_BASE_SYSTEM_PROMPT_MARKERS.find((marker) => systemPrompt.includes(marker))
+		if (matchedMarker) {
+			throw new Error(
+				`Subagent system prompt must stay detached from RooCode base SYSTEM_PROMPT while detached mode is active. Matched marker: ${matchedMarker}`,
+			)
+		}
 	}
 
 	private logDebug(event: string, details: Record<string, unknown> = {}): void {
@@ -151,6 +190,249 @@ export class SubagentRunner {
 		}))
 	}
 
+	private normalizePathForProgress(filePath: string): string {
+		return filePath.trim().replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase()
+	}
+
+	private isPathMatchingRequiredTarget(filePath: string, target: string): boolean {
+		const normalizedPath = this.normalizePathForProgress(filePath)
+		const normalizedTarget = this.normalizePathForProgress(target)
+		return normalizedPath === normalizedTarget || normalizedPath.endsWith(`/${normalizedTarget}`)
+	}
+
+	private getRequiredWriteTargets(): string[] {
+		const targets: string[] = []
+		const seen = new Set<string>()
+		for (const plan of this.planFiles) {
+			const parsed = parsePlanTargetHeader(plan.content)
+			if (parsed?.action === "GENERAL" || parsed?.action === "DELETE") {
+				continue
+			}
+
+			const target = (parsed?.path ?? plan.filePath).trim().replace(/\\/g, "/")
+			const normalized = this.normalizePathForProgress(target)
+			if (target && !seen.has(normalized)) {
+				seen.add(normalized)
+				targets.push(target)
+			}
+		}
+		return targets
+	}
+
+	private markWriteTargetCompleted(filePath: string): boolean {
+		let didMatchTarget = false
+		for (const target of this.getRequiredWriteTargets()) {
+			if (this.isPathMatchingRequiredTarget(filePath, target)) {
+				didMatchTarget = true
+				const normalized = this.normalizePathForProgress(target)
+				if (!this.completedWriteTargets.has(normalized)) {
+					this.completedWriteTargets.add(normalized)
+				}
+			}
+		}
+		return didMatchTarget
+	}
+
+	private buildContinuationContent(lines: string[]): Anthropic.Messages.TextBlockParam[] {
+		const content = lines
+			.map((line) => line.trim())
+			.filter(Boolean)
+			.join("\n\n")
+		return content ? [{ type: "text" as const, text: content }] : []
+	}
+
+	private async prepareConversationForRequest(toolResults: Anthropic.Messages.ContentBlockParam[]): Promise<void> {
+		if (this.apiConversationHistory.length === 0) {
+			this.apiConversationHistory.push({ role: "user", content: await this.buildInitialMessage() })
+			return
+		}
+
+		if (toolResults.length > 0) {
+			this.apiConversationHistory.push({ role: "user", content: toolResults })
+		}
+	}
+
+	private appendAssistantMessage(assistantMessage: string, toolCalls: ToolUse[]): void {
+		const content: Anthropic.Messages.ContentBlockParam[] = []
+		const text = assistantMessage.trim()
+		if (text) {
+			content.push({ type: "text" as const, text })
+		}
+
+		for (const toolCall of toolCalls) {
+			const toolUseId = this.ensureToolUseId(toolCall)
+			content.push({
+				type: "tool_use",
+				id: toolUseId,
+				name: toolCall.name,
+				input: toolCall.params || {},
+			} as Anthropic.Messages.ToolUseBlockParam)
+		}
+
+		if (content.length > 0) {
+			this.apiConversationHistory.push({ role: "assistant", content })
+		}
+	}
+
+	private ensureToolUseId(toolCall: ToolUse): string {
+		const existingId = toolCall.id?.trim()
+		if (existingId) {
+			return existingId
+		}
+
+		const generatedId = `tool-${this.subagentId}-${++this.generatedToolUseIdCounter}`
+		toolCall.id = generatedId
+		return generatedId
+	}
+
+	private buildToolResultBlock(
+		toolUseId: string,
+		content: string,
+		isError = false,
+	): Anthropic.Messages.ToolResultBlockParam {
+		return {
+			type: "tool_result",
+			tool_use_id: toolUseId,
+			content,
+			is_error: isError,
+		}
+	}
+
+	private isReadInspectionTool(toolName: string): boolean {
+		return [
+			"list_files",
+			"find_by_name",
+			"search_files",
+			"codebase_search",
+			"read_file",
+			"read_notebook",
+			"read_command_output",
+		].includes(toolName)
+	}
+
+	private isBroadExplorationTool(toolName: string): boolean {
+		return ["list_files", "find_by_name", "search_files", "codebase_search"].includes(toolName)
+	}
+
+	private normalizeToolParams(value: unknown): unknown {
+		if (Array.isArray(value)) {
+			return value.map((item) => this.normalizeToolParams(item))
+		}
+		if (!value || typeof value !== "object") {
+			return value
+		}
+
+		return Object.fromEntries(
+			Object.entries(value as Record<string, unknown>)
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([key, nestedValue]) => [key, this.normalizeToolParams(nestedValue)]),
+		)
+	}
+
+	private recordReadInspectionToolCall(toolName: string, toolParams: Record<string, unknown>): number {
+		const signature = `${toolName}:${JSON.stringify(this.normalizeToolParams(toolParams))}`
+		const count = (this.repeatedReadToolCalls.get(signature) ?? 0) + 1
+		this.repeatedReadToolCalls.set(signature, count)
+		return count
+	}
+
+	private getReadInspectionBlockReason(toolName: string, toolParams: Record<string, unknown>): string | undefined {
+		if (!this.isReadInspectionTool(toolName)) {
+			return undefined
+		}
+
+		if (toolName === "list_files") {
+			return (
+				`Directory listing is disabled for subagent execution. ` +
+				`You are a child execution subagent; the parent agent already scoped the task. ` +
+				`Use the assigned refined todo item, relevant memories, and targeted read/search/edit tools to proceed directly.`
+			)
+		}
+
+		this.readInspectionToolCallCount++
+		if (this.isBroadExplorationTool(toolName)) {
+			this.broadExplorationToolCallCount++
+		}
+
+		const repeatedReadCount = this.recordReadInspectionToolCall(toolName, toolParams)
+		if (repeatedReadCount > 1) {
+			return (
+				`Repeated read/search tool call blocked for "${toolName}" with identical parameters. ` +
+				`Use the result already present in this subagent conversation history and proceed with the assigned refined todo item.`
+			)
+		}
+
+		if (this.broadExplorationToolCallCount > MAX_SUBAGENT_BROAD_EXPLORATION_TOOL_CALLS) {
+			return (
+				`Broad exploration budget exceeded after ${MAX_SUBAGENT_BROAD_EXPLORATION_TOOL_CALLS} directory/search calls. ` +
+				`Stop exploring folders and proceed with targeted file edits for the assigned refined todo item.`
+			)
+		}
+
+		if (this.readInspectionToolCallCount > MAX_SUBAGENT_READ_INSPECTION_TOOL_CALLS) {
+			return (
+				`Read/search budget exceeded after ${MAX_SUBAGENT_READ_INSPECTION_TOOL_CALLS} inspection calls. ` +
+				`Stop reading more context and proceed with implementation or attempt_completion.`
+			)
+		}
+
+		return undefined
+	}
+
+	private noteTurnWriteProgress(didWriteRequiredTarget: boolean, didAttemptWrite = false): void {
+		void didWriteRequiredTarget
+		void didAttemptWrite
+	}
+
+	private isEditTool(toolName: string): boolean {
+		return [
+			"write_to_file",
+			"apply_diff",
+			"apply_patch",
+			"edit",
+			"edit_notebook",
+			"search_and_replace",
+			"search_replace",
+			"insert_content",
+			"edit_file",
+			"multi_edit",
+		].includes(toolName)
+	}
+
+	private getEditToolPaths(toolName: string, toolParams: Record<string, unknown>): string[] {
+		if (toolName === "apply_patch" && typeof toolParams.patch === "string") {
+			const paths: string[] = []
+			const markers = ["*** Add File: ", "*** Delete File: ", "*** Update File: ", "*** Move to: "]
+			for (const rawLine of toolParams.patch.split("\n")) {
+				const line = rawLine.trim()
+				for (const marker of markers) {
+					if (line.startsWith(marker)) {
+						const filePath = line.substring(marker.length).trim()
+						if (filePath) {
+							paths.push(filePath)
+						}
+					}
+				}
+			}
+			return Array.from(new Set(paths))
+		}
+		if (toolName === "edit_notebook") {
+			return typeof toolParams.absolute_path === "string" ? [toolParams.absolute_path] : []
+		}
+		if (["search_replace", "edit_file", "multi_edit"].includes(toolName)) {
+			return typeof toolParams.file_path === "string" ? [toolParams.file_path] : []
+		}
+		return typeof toolParams.path === "string" ? [toolParams.path] : []
+	}
+
+	private getRequestTools(): import("openai").default.Chat.ChatCompletionTool[] {
+		return this.tools
+	}
+
+	private getRequestToolChoice(): ApiHandlerCreateMessageMetadata["tool_choice"] {
+		return "auto"
+	}
+
 	// ------------------------------------------------------------------
 	// Public API
 	// ------------------------------------------------------------------
@@ -158,10 +440,8 @@ export class SubagentRunner {
 	async run(): Promise<SubagentResult> {
 		try {
 			// 1. Build initial user message from plan
-			const initialMessage = this.buildInitialMessage()
-			this.apiConversationHistory.push({ role: "user", content: initialMessage })
+			const initialMessage = await this.buildInitialMessage()
 			this.logDebug("start", {
-				ownedFiles: this.ownedFiles,
 				planFiles: this.planFiles.map((file) => file.filePath),
 				systemPromptHasRefineMarkers: this.hasRefineMarkers(this.systemPrompt),
 				systemPromptPreview: this.systemPrompt.slice(0, 320),
@@ -184,10 +464,25 @@ export class SubagentRunner {
 			let userContent: Anthropic.Messages.ContentBlockParam[] = []
 			let maxIterations = 50 // Safety limit
 			let isFirstIteration = true
+			let lastAssistantText = ""
 
 			while (!this.abort && maxIterations-- > 0) {
 				const result = await this.makeApiRequestAndProcessResponse(isFirstIteration ? [] : userContent)
 				isFirstIteration = false
+				if (result.assistantText?.trim()) {
+					lastAssistantText = result.assistantText.trim()
+				}
+
+				if (result.error) {
+					return {
+						todoItemId: this.subagentId,
+						success: false,
+						completionResult: lastAssistantText
+							? `Subagent stopped after API errors. Last assistant response:\n\n${lastAssistantText}`
+							: undefined,
+						error: result.error,
+					}
+				}
 
 				if (result.done) {
 					await this.emitMessage("completion_result", result.completionText ?? "Subagent completed")
@@ -198,7 +493,6 @@ export class SubagentRunner {
 					}
 				}
 
-				// Prepare next iteration with accumulated tool results
 				userContent = result.nextUserContent
 				if (userContent.length === 0) {
 					// No tool results and no completion — done
@@ -206,10 +500,14 @@ export class SubagentRunner {
 				}
 			}
 
+			const fallbackCompletionResult = lastAssistantText
+				? `Subagent stopped without calling attempt_completion. Last assistant response:\n\n${lastAssistantText}`
+				: undefined
 			return {
 				todoItemId: this.subagentId,
 				success: false,
-				error: this.abort ? "Aborted" : "Max iterations reached",
+				completionResult: fallbackCompletionResult,
+				error: this.abort ? "Aborted" : "Max iterations reached without attempt_completion",
 			}
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err)
@@ -230,11 +528,10 @@ export class SubagentRunner {
 		done: boolean
 		completionText?: string
 		nextUserContent: Anthropic.Messages.ContentBlockParam[]
+		assistantText?: string
+		error?: string
 	}> {
-		// Add tool results to history if any
-		if (toolResults.length > 0) {
-			this.apiConversationHistory.push({ role: "user", content: toolResults })
-		}
+		await this.prepareConversationForRequest(toolResults)
 		this.logDebug("request_prepared", {
 			systemPromptHasRefineMarkers: this.hasRefineMarkers(this.systemPrompt),
 			historyLength: this.apiConversationHistory.length,
@@ -242,18 +539,25 @@ export class SubagentRunner {
 			incomingToolResults: this.summarizeMessageContent(toolResults),
 		})
 
-		// Emit api_req_started (partial so the post-stream token update finalizes this row in place)
-		await this.emitMessage("api_req_started", JSON.stringify({ apiProtocol: "openai" }), true)
+		await this.emitMessage(
+			"api_req_started",
+			JSON.stringify({ apiProtocol: "openai", subagentId: this.subagentId } satisfies ClineApiReqInfo),
+			true,
+		)
 
 		// Make API call
+		const requestTools = this.getRequestTools()
 		const metadata: ApiHandlerCreateMessageMetadata = {
 			mode: "code",
-			behaviorRole: "code",
+			behaviorRole: "subagent",
 			taskId: `${this.parentTask.taskId}:${this.subagentId}`,
-			tools: this.tools,
-			tool_choice: "auto",
+			subagentId: this.subagentId,
+			tools: requestTools,
+			tool_choice: this.getRequestToolChoice(),
 			parallelToolCalls: false,
 		}
+
+		this.captureRequestContext(metadata)
 
 		const stream = this.api.createMessage(this.systemPrompt, this.apiConversationHistory, metadata)
 
@@ -261,6 +565,7 @@ export class SubagentRunner {
 		let reasoningMessage = ""
 		let inputTokens = 0
 		let outputTokens = 0
+		let interruptedToolName = ""
 
 		// Collect tool calls for this turn
 		const toolCalls: ToolUse[] = []
@@ -358,10 +663,43 @@ export class SubagentRunner {
 			}
 		} catch (err) {
 			const errorMsg = err instanceof Error ? err.message : String(err)
+			this.consecutiveApiErrors++
 			this.logDebug("api_error", { error: errorMsg })
+			await this.emitMessage(
+				"api_req_started",
+				JSON.stringify({
+					apiProtocol: "openai",
+					subagentId: this.subagentId,
+					tokensIn: inputTokens,
+					tokensOut: outputTokens,
+					cost: 0,
+					streamingFailedMessage: errorMsg,
+				} satisfies ClineApiReqInfo),
+			)
 			await this.emitMessage("error", `API error: ${errorMsg}`)
-			// Don't throw — return as failed iteration
-			return { done: false, nextUserContent: [] }
+			this.noteTurnWriteProgress(false)
+			if (this.consecutiveApiErrors >= MAX_CONSECUTIVE_SUBAGENT_API_ERRORS) {
+				return {
+					done: false,
+					nextUserContent: [],
+					assistantText: assistantMessage,
+					error: `Subagent API request failed ${this.consecutiveApiErrors} time(s) in a row: ${errorMsg}`,
+				}
+			}
+			return {
+				done: false,
+				nextUserContent: this.buildContinuationContent([
+					`The previous API stream failed before this isolated subtask finished: ${errorMsg}`,
+					assistantMessage.trim() ? `Last partial assistant response:\n${assistantMessage.trim()}` : "",
+					"Continue the same subtask from the current execution state.",
+				]),
+				assistantText: assistantMessage,
+			}
+		}
+		this.consecutiveApiErrors = 0
+
+		if (currentToolUse) {
+			interruptedToolName = currentToolUse.name
 		}
 
 		// Finalize partial messages
@@ -377,28 +715,13 @@ export class SubagentRunner {
 			"api_req_started",
 			JSON.stringify({
 				apiProtocol: "openai",
+				subagentId: this.subagentId,
 				tokensIn: inputTokens,
 				tokensOut: outputTokens,
 				cost: 0,
-			}),
+			} satisfies ClineApiReqInfo),
 		)
 
-		// Save assistant message to conversation history
-		const assistantContent: Array<Anthropic.Messages.TextBlockParam | Anthropic.Messages.ToolUseBlockParam> = []
-		if (assistantMessage) {
-			assistantContent.push({ type: "text" as const, text: assistantMessage })
-		}
-		for (const tc of toolCalls) {
-			assistantContent.push({
-				type: "tool_use" as const,
-				id: tc.id || `tool-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-				name: tc.name || "",
-				input: tc.params || {},
-			})
-		}
-		if (assistantContent.length > 0) {
-			this.apiConversationHistory.push({ role: "assistant", content: assistantContent })
-		}
 		this.logDebug("response_received", {
 			reasoningPreview: reasoningMessage.slice(0, 320),
 			assistantPreview: assistantMessage.slice(0, 320),
@@ -407,51 +730,61 @@ export class SubagentRunner {
 			historySummaryAfterAssistantMessage: this.summarizeHistory(this.apiConversationHistory),
 		})
 
-		// Check for attempt_completion
-		for (const tc of toolCalls) {
-			if (tc.name === "attempt_completion") {
-				const completionText = ((tc.params as any)?.result as string) ?? "Task completed"
-				return { done: true, completionText, nextUserContent: [] }
+		if (interruptedToolName) {
+			this.appendAssistantMessage(assistantMessage, [])
+			this.noteTurnWriteProgress(false)
+			return {
+				done: false,
+				nextUserContent: this.buildContinuationContent([
+					`The previous API response ended while streaming tool "${interruptedToolName}", so that partial tool call was not executed.`,
+					assistantMessage.trim() ? `Last partial assistant response:\n${assistantMessage.trim()}` : "",
+					"Continue this same isolated subtask and issue a complete tool call if needed.",
+				]),
+				assistantText: assistantMessage,
 			}
 		}
 
+		const completionToolCall = toolCalls.find((tc) => tc.name === "attempt_completion")
+
 		// Execute tool calls and collect results
 		if (toolCalls.length === 0) {
-			return { done: false, nextUserContent: [] }
+			this.appendAssistantMessage(assistantMessage, [])
+			return { done: false, nextUserContent: [], assistantText: assistantMessage }
 		}
 
-		const toolResultContent: Anthropic.Messages.ToolResultBlockParam[] = []
+		this.appendAssistantMessage(assistantMessage, toolCalls)
+
+		const toolResultBlocks: Anthropic.Messages.ToolResultBlockParam[] = []
+		let didWriteRequiredTarget = false
+		let didAttemptWrite = false
 		for (const tc of toolCalls) {
+			if (tc.name === "attempt_completion") {
+				continue
+			}
+
 			const toolName = tc.name
 			const toolParams = (tc.params || {}) as Record<string, unknown>
-			const toolId = tc.id || `tool-${Date.now()}`
+			const toolId = this.ensureToolUseId(tc)
+			const readInspectionBlockReason = this.getReadInspectionBlockReason(toolName, toolParams)
 
-			// File ownership check for edit tools
-			const editTools = new Set([
-				"write_to_file",
-				"apply_diff",
-				"edit",
-				"search_and_replace",
-				"search_replace",
-				"insert_content",
-				"edit_file",
-			])
-			if (editTools.has(toolName)) {
-				const filePath = toolParams.path as string
-				if (filePath && this.ownedFiles.length > 0) {
-					const isOwned = this.ownedFiles.some(
-						(owned) => filePath.includes(owned) || owned.includes(filePath),
-					)
-					if (!isOwned) {
-						const errResult = `[ERROR] File "${filePath}" is not owned by this subagent. Owned files: ${this.ownedFiles.join(", ")}`
-						toolResultContent.push({ type: "tool_result", tool_use_id: toolId, content: errResult })
-						await this.emitMessage(
-							"tool",
-							JSON.stringify({ tool: toolName, path: filePath, error: "file ownership denied" }),
-						)
-						continue
-					}
-				}
+			if (readInspectionBlockReason) {
+				toolResultBlocks.push(this.buildToolResultBlock(toolId, readInspectionBlockReason, true))
+				await this.emitMessage(
+					"tool",
+					JSON.stringify({
+						tool: toolName,
+						path: String(toolParams.path || toolParams.file_path || ""),
+						status: "blocked read loop",
+					}),
+				)
+				continue
+			}
+
+			const isEditTool = this.isEditTool(toolName)
+			const editToolPaths = isEditTool ? this.getEditToolPaths(toolName, toolParams) : []
+
+			if (isEditTool) {
+				didAttemptWrite = true
 			}
 
 			// Execute via parent Task
@@ -462,31 +795,62 @@ export class SubagentRunner {
 					toolId,
 					this.subagentId,
 				)
-				toolResultContent.push({ type: "tool_result", tool_use_id: toolId, content: result })
+				if (isEditTool && !result.startsWith("[ERROR]")) {
+					for (const editToolPath of editToolPaths) {
+						didWriteRequiredTarget = this.markWriteTargetCompleted(editToolPath) || didWriteRequiredTarget
+					}
+				}
+				const displayPath = editToolPaths.join(", ") || String(toolParams.path || "")
+				toolResultBlocks.push(
+					this.buildToolResultBlock(toolId, `Tool "${toolName}" completed for "${displayPath}".\n${result}`),
+				)
 
 				// Emit tool result to UI
 				await this.emitMessage(
 					"tool",
 					JSON.stringify({
 						tool: toolName,
-						path: toolParams.path || "",
+						path: displayPath,
 						status: "done",
 					}),
 				)
 			} catch (err) {
 				const errorMsg = err instanceof Error ? err.message : String(err)
-				toolResultContent.push({
-					type: "tool_result",
-					tool_use_id: toolId,
-					content: `[ERROR] ${errorMsg}`,
-				})
+				toolResultBlocks.push(this.buildToolResultBlock(toolId, `[ERROR] ${errorMsg}`, true))
 			}
 		}
 		this.logDebug("tool_results_prepared", {
-			toolResults: this.summarizeMessageContent(toolResultContent),
+			toolResults: this.summarizeMessageContent(toolResultBlocks),
 		})
+		this.noteTurnWriteProgress(didWriteRequiredTarget, didAttemptWrite)
 
-		return { done: false, nextUserContent: toolResultContent }
+		if (completionToolCall) {
+			const completionText =
+				typeof (completionToolCall.params as any)?.result === "string"
+					? ((completionToolCall.params as any).result as string).trim()
+					: ""
+			if (!completionText) {
+				const toolId = this.ensureToolUseId(completionToolCall)
+				return {
+					done: false,
+					nextUserContent: [
+						this.buildToolResultBlock(
+							toolId,
+							"attempt_completion result was empty. Continue the assigned plan work, or call attempt_completion again with a non-empty result that summarizes completed work or concrete blockers.",
+							true,
+						),
+					],
+					assistantText: assistantMessage,
+				}
+			}
+			return { done: true, completionText, nextUserContent: [], assistantText: assistantMessage }
+		}
+
+		return {
+			done: false,
+			nextUserContent: toolResultBlocks,
+			assistantText: assistantMessage,
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -505,33 +869,120 @@ export class SubagentRunner {
 		await this.parentTask.pushSubagentMessage(msg)
 	}
 
+	private captureRequestContext(metadata: ApiHandlerCreateMessageMetadata): void {
+		const inspector = ContextInspectorPanel.getInstance()
+		inspector.show()
+		inspector.logCapturedContext({
+			systemPrompt: this.systemPrompt,
+			messages: this.apiConversationHistory as any[],
+			metadata,
+			modelId: this.api.getModel().id,
+			provider: this.parentTask.apiConfiguration?.apiProvider,
+		})
+	}
+
 	// ------------------------------------------------------------------
 	// Initial message builder
 	// ------------------------------------------------------------------
 
-	private buildInitialMessage(): Anthropic.Messages.TextBlockParam[] {
-		// Mirrors opencode's TaskTool pass-through semantics.
-		// See sst/opencode packages/opencode/src/tool/task.ts:
-		//   const parts = yield* ops.resolvePromptParts(params.prompt)
-		// i.e. the parent's prompt is forwarded to the subagent with zero wrapping.
-		// We concatenate the refine-phase artifacts verbatim so the subagent sees
-		// exactly what the planning agent wrote, without extra framing.
+	private async loadMemoryContext(): Promise<string> {
+		if (this.memoryContext !== undefined) {
+			return this.memoryContext
+		}
+
+		try {
+			const memoryFilePath = path.join(this.parentTask.cwd, ".roo-memories.json")
+			const rawMemoryStore = await fs.readFile(memoryFilePath, "utf8")
+			const memoryStore = JSON.parse(rawMemoryStore) as WorkspaceMemoryStore
+			const memories = Array.isArray(memoryStore.memories) ? memoryStore.memories : []
+			this.memoryContext = memories
+				.map((memory, index) => {
+					const title = memory.title?.trim() || `Memory ${index + 1}`
+					const content = memory.content?.trim()
+					const tags = Array.isArray(memory.tags)
+						? memory.tags
+								.map((tag) => tag.trim())
+								.filter(Boolean)
+								.join(", ")
+						: ""
+
+					if (!content) {
+						return ""
+					}
+
+					return tags ? `- ${title} [${tags}]\n${content}` : `- ${title}\n${content}`
+				})
+				.filter(Boolean)
+				.join("\n\n")
+		} catch {
+			this.memoryContext = ""
+		}
+
+		return this.memoryContext
+	}
+
+	private buildPlanFilesContext(): string {
+		if (this.planFiles.length === 0) {
+			return "No plan files were loaded for this todo item. Report this as a blocker instead of inventing work."
+		}
+
+		return this.planFiles
+			.map((plan, index) => {
+				const parsed = parsePlanTargetHeader(plan.content)
+				const targetLines = parsed ? [`Action: ${parsed.action}`, `Target: ${parsed.path}`] : []
+				return [
+					`### Plan ${index + 1}: ${plan.filePath}`,
+					...targetLines,
+					"",
+					"```md",
+					plan.content.trim() || "(empty plan file)",
+					"```",
+				].join("\n")
+			})
+			.join("\n\n")
+	}
+
+	private buildRequiredWriteTargetsContext(): string {
+		const targets = this.getRequiredWriteTargets()
+		return targets.length > 0
+			? targets.map((target) => `- ${target}`).join("\n")
+			: "(none; follow GENERAL/DELETE plans only)"
+	}
+
+	private async buildInitialMessage(): Promise<Anthropic.Messages.TextBlockParam[]> {
 		const parts: string[] = []
 
-		const taskText = this.todoItem.content?.trim() ?? ""
-		if (taskText) parts.push(taskText)
+		parts.push(
+			[
+				"Subagent execution directive:",
+				"You are an isolated child execution subagent for exactly one refined todo item.",
+				"The parent agent has already decomposed and scoped the work.",
+				"The assigned todo context and plan files are your primary source of truth.",
+				"You must implement or report blockers for the loaded plan files below.",
+				"Do not call attempt_completion with an empty result.",
+				"Do not list workspace directories or inspect the project tree just to orient yourself.",
+				"If the plan names concrete target files, symbols, routes, types, or components, do not start by reading files just to re-confirm the plan.",
+				"Start from the assigned refined todo item and act directly on the named files, symbols, routes, types, or components.",
+				"Only read a target file when the edit requires current surrounding text that is not already present in the plan.",
+				"If the assigned item lacks an exact target, use one precise file/symbol/content search to locate it, then implement immediately.",
+			].join("\n"),
+		)
 
-		const taskContext = this.todoItem.context?.trim() ?? ""
-		if (taskContext) parts.push(taskContext)
-
-		const planText = this.planFiles.map((f) => `${f.filePath}:\n${f.content.trim()}`).join("\n\n")
-		if (planText) parts.push(planText)
-
-		// File-scope guard has no opencode equivalent but is required by this
-		// project's ownership model. Kept terse so it does not re-introduce a wrapper.
-		if (this.ownedFiles.length > 0) {
-			parts.push(`Files you may modify:\n${this.ownedFiles.map((f) => `- ${f}`).join("\n")}`)
+		const assignedTodo: Record<string, string> = {
+			id: this.todoItem.id,
+			status: this.todoItem.status,
+			content: this.todoItem.content,
 		}
+		if (this.todoItem.context?.trim()) {
+			assignedTodo.context = this.todoItem.context.trim()
+		}
+
+		parts.push(`Assigned refined todo item:\n${JSON.stringify(assignedTodo, null, 2)}`)
+		parts.push(`Required write targets:\n${this.buildRequiredWriteTargetsContext()}`)
+		parts.push(`Loaded plan files:\n${this.buildPlanFilesContext()}`)
+
+		const memoryContext = await this.loadMemoryContext()
+		parts.push(`Relevant memories:\n${memoryContext || "None."}`)
 
 		return [{ type: "text" as const, text: parts.join("\n\n") }]
 	}

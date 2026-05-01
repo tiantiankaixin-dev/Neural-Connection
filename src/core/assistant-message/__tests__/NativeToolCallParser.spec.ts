@@ -291,6 +291,68 @@ describe("NativeToolCallParser", () => {
 				})
 			})
 		})
+
+		describe("list_files tool", () => {
+			it("should default missing path to current directory", () => {
+				const toolCall = {
+					id: "toolu_list_files_empty",
+					name: "list_files" as const,
+					arguments: JSON.stringify({}),
+				}
+
+				const result = NativeToolCallParser.parseToolCall(toolCall)
+
+				expect(result).not.toBeNull()
+				expect(result?.type).toBe("tool_use")
+				if (result?.type === "tool_use") {
+					const nativeArgs = result.nativeArgs as { path: string; recursive?: boolean }
+					expect(nativeArgs.path).toBe(".")
+					expect(nativeArgs.recursive).toBeUndefined()
+				}
+			})
+
+			it("should default missing path when only recursive is provided", () => {
+				const toolCall = {
+					id: "toolu_list_files_recursive",
+					name: "list_files" as const,
+					arguments: JSON.stringify({ recursive: true }),
+				}
+
+				const result = NativeToolCallParser.parseToolCall(toolCall)
+
+				expect(result).not.toBeNull()
+				expect(result?.type).toBe("tool_use")
+				if (result?.type === "tool_use") {
+					const nativeArgs = result.nativeArgs as { path: string; recursive?: boolean }
+					expect(nativeArgs.path).toBe(".")
+					expect(nativeArgs.recursive).toBe(true)
+				}
+			})
+		})
+
+		describe("update_todo_list tool", () => {
+			it("should preserve item_contexts in native args and params", () => {
+				const itemContexts = ["backend context", "frontend context"]
+				const toolCall = {
+					id: "toolu_update_todo_list_contexts",
+					name: "update_todo_list" as const,
+					arguments: JSON.stringify({
+						todos: "[-] Backend\n[ ] Frontend",
+						item_contexts: itemContexts,
+					}),
+				}
+
+				const result = NativeToolCallParser.parseToolCall(toolCall)
+
+				expect(result).not.toBeNull()
+				expect(result?.type).toBe("tool_use")
+				if (result?.type === "tool_use") {
+					const nativeArgs = result.nativeArgs as { todos: string; item_contexts?: string[] }
+					expect(nativeArgs.item_contexts).toEqual(itemContexts)
+					expect(result.params.item_contexts).toBe(JSON.stringify(itemContexts))
+				}
+			})
+		})
 	})
 
 	describe("processStreamingChunk", () => {

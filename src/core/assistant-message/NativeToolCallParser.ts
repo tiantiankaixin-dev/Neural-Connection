@@ -644,9 +644,9 @@ export class NativeToolCallParser {
 				break
 
 			case "list_files":
-				if (partialArgs.path !== undefined) {
+				if (partialArgs.path !== undefined || partialArgs.recursive !== undefined) {
 					nativeArgs = {
-						path: partialArgs.path,
+						path: partialArgs.path ?? ".",
 						recursive: this.coerceOptionalBoolean(partialArgs.recursive),
 					}
 				}
@@ -1019,12 +1019,10 @@ export class NativeToolCallParser {
 					break
 
 				case "list_files":
-					if (args.path !== undefined) {
-						nativeArgs = {
-							path: args.path,
-							recursive: this.coerceOptionalBoolean(args.recursive),
-						} as NativeArgsFor<TName>
-					}
+					nativeArgs = {
+						path: args.path ?? ".",
+						recursive: this.coerceOptionalBoolean(args.recursive),
+					} as NativeArgsFor<TName>
 					break
 
 				default:

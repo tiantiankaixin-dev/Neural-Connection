@@ -219,12 +219,15 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 					: parsed.savedPath
 						? [parsed.savedPath]
 						: []
-				const newContext = parsed.context ? [parsed.context] : []
+				const newContext =
+					typeof parsed.context === "string" && parsed.context.trim() ? parsed.context.trim() : ""
 
 				if (existing) {
 					// Accumulate: multiple write_todo_plan calls for same todo
 					existing.savedPaths = [...(existing.savedPaths || []), ...newPaths]
-					existing.contexts = [...existing.contexts, ...newContext]
+					if (newContext) {
+						existing.contexts = [newContext]
+					}
 					existing.plans = [...existing.plans, ...parsed.plans]
 				} else {
 					result[parsed.todoItemId] = {
@@ -232,7 +235,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						savedPaths: newPaths,
 						planType: parsed.planType,
 						todoContent: parsed.todoContent,
-						contexts: newContext,
+						contexts: newContext ? [newContext] : [],
 						plans: parsed.plans,
 					}
 				}
@@ -256,9 +259,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			}
 			const existing = result[id]
 			if (existing) {
-				if (!existing.contexts.includes(ctx)) {
-					existing.contexts = [ctx, ...existing.contexts]
-				}
+				existing.contexts = [ctx]
 			} else {
 				result[id] = {
 					contexts: [ctx],

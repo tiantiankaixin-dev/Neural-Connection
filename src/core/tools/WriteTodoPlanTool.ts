@@ -66,6 +66,20 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				return
 			}
 
+			if (!task.isRefineMode && !task.activeRefineTodoItemIds) {
+				const restored = await task.restoreRefineModeFromResumeState()
+				if (!restored) {
+					task.consecutiveMistakeCount++
+					task.recordToolError("write_todo_plan")
+					task.didToolFailInCurrentTurn = true
+					await task.clearRefineResumeState()
+					pushToolResult(
+						formatResponse.toolError("write_todo_plan is only available while refine mode is active"),
+					)
+					return
+				}
+			}
+
 			const normalizedStructuredEntries = plans.map((entry) => normalizeStructuredPlanEntry(planType, entry))
 
 			for (const [i, entry] of normalizedStructuredEntries.entries()) {
@@ -119,6 +133,7 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				const remainingTodoItemIds = task.activeRefineTodoItemIds.filter((id) => id !== todo_item_id)
 				task.activeRefineTodoItemIds = remainingTodoItemIds.length > 0 ? remainingTodoItemIds : null
 				task.isRefineMode = remainingTodoItemIds.length > 0
+				await task.persistRefineResumeState(remainingTodoItemIds)
 				if (remainingTodoItemIds.length === 0) {
 					task.postRefineDividerPending = true
 				}
@@ -126,19 +141,28 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				// Fallback for unexpected single-item refine flows
 				task.isRefineMode = false
 				task.postRefineDividerPending = true
+				await task.persistRefineResumeState([])
 			}
+
+			const allPlansWritten = !task.isRefineMode
+			await task.enqueuePostRefineAgreementPass(todoItem, normalizedPlanEntries)
+			const latestTodoItem = task.todoList?.find((todo) => todo.id === todo_item_id) ?? todoItem
+			const plansForDisplay = task.applyTaskContextAgreementsToPlanEntries(
+				normalizedPlanEntries,
+				latestTodoItem.context,
+			).plans
 
 			// Emit refine_result say message so the UI can show a collapsible plan block
 			await task.say(
 				"refine_result",
 				JSON.stringify({
 					todoItemId: todo_item_id,
-					todoContent: todoItem.content,
+					todoContent: latestTodoItem.content,
 					savedPath: savedPaths[0],
 					savedPaths,
 					planType,
-					context: taskContext || "",
-					plans: normalizedPlanEntries.map((e, index) => ({
+					context: latestTodoItem.context?.trim() || "",
+					plans: plansForDisplay.map((e, index) => ({
 						filePath: e.filePath,
 						content: e.content,
 						target: normalizedStructuredEntries[index]?.target,
@@ -157,8 +181,6 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 			const fileList = normalizedPlanEntries.map((e) => `  - ${e.filePath}`).join("\n")
 			const savedPathList = savedPaths.map((p) => `  - ${p}`).join("\n")
 
-			const allPlansWritten = !task.isRefineMode
-
 			pushToolResult(
 				formatResponse.toolResult(
 					`Successfully wrote ${normalizedPlanEntries.length} ${label} for todo item "${todoItem.content}":\n${fileList}\n\nSaved plan files:\n${savedPathList}\n\nThese plans will be automatically injected into context when working on this todo item.${allPlansWritten ? "\n\n[ALL PLANS RECORDED — Launching parallel execution...]" : ""}`,
@@ -168,6 +190,11 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 			// When all plans are written (refine mode exited), signal the main loop to exit
 			// so that initiateTaskLoop can launch parallel subagents without interference.
 			if (allPlansWritten) {
+				await task.clearSubagentResumeState()
+				await task.persistSubagentResumeState(
+					(task.todoList ?? []).map((todo) => todo.id),
+					[],
+				)
 				task.subagentsPending = true
 			}
 		} catch (error) {

@@ -63,6 +63,7 @@ export const toolParamNames = [
 	"start_line",
 	"end_line",
 	"todos",
+	"item_contexts",
 	"prompt",
 	"image",
 	// read_file parameters (native protocol)
@@ -98,6 +99,7 @@ export const toolParamNames = [
 	"todo_item_id",
 	"plan_type",
 	"plans",
+	"summary",
 ] as const
 
 export type ToolParamName = (typeof toolParamNames)[number]
@@ -141,6 +143,7 @@ export type NativeToolArgs = {
 			body: string
 		}>
 	}
+	resume_subagents: { summary?: string | null }
 	use_mcp_tool: { server_name: string; tool_name: string; arguments?: Record<string, unknown> }
 	write_to_file: { path: string; content: string }
 	find_by_name: {
@@ -398,6 +401,7 @@ export const TOOL_DISPLAY_NAMES: Record<ToolName, string> = {
 	view_content_chunk: "view content chunks",
 	create_memory: "manage memories",
 	recall_memory: "recall deep memories",
+	resume_subagents: "resume subagents",
 } as const
 
 // Define available tool groups.
