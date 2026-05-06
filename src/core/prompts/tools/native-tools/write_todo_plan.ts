@@ -8,6 +8,12 @@ const WRITE_TODO_PLAN_DESCRIPTION = [
 	"",
 	"Todo-level task context for each architecture layer is supplied in refine via `update_todo_list` (`item_contexts`, stored on each todo item). You do not pass a separate context here — the system injects that todo-level context for the build agent.",
 	"",
+	"STEP 2 Target Boundary:",
+	"- STEP 2 does NOT discover, create, rename, split, or reclassify plan targets. That was already done in STEP 1 via `item_plan_targets`.",
+	"- For file-based refine todos, every `plans[].target` MUST exactly match one existing STEP 1 `item_plan_targets` file for the current todo item, and `plans[].action` MUST match the STEP 1 action.",
+	"- Treat each STEP 1 file target as the responsibility boundary. All required modifications, routes, exports, dependencies, tests, functions, and notes for that file must stay inside that file target's `body`.",
+	"- Do NOT create separate plan entries for subtopics such as file purpose, referenced_by_files, references_files, routes, exports, functions, tests, dependencies, or Task Context.",
+	"",
 	"plan_type determines the kind of plan:",
 	'- "file": Use this ONLY when the todo item requires modifying or creating real project files. This includes source files, config files, docs, scripts, tests, workflows, JSON/YAML/MD files, and any other real workspace files. Each entry targets a real relative project file path.',
 	'- "general": Use this when the todo item does NOT require modifying or creating project files. This includes project review plans, project planning plans, debug plans, investigation plans, architecture comparison/evaluation plans, repro plans, migration strategy planning, and research/design guidance. Each entry must use a descriptive section title as target, not a real file path.',
@@ -30,8 +36,10 @@ const WRITE_TODO_PLAN_DESCRIPTION = [
 	"",
 	"Batching:",
 	"- If the current todo item feels too large to plan clearly in one response, you may split the plan into multiple `write_todo_plan` calls for the SAME `todo_item_id`.",
+	"- You do NOT need to cover every remaining STEP 1 target in a single call. Choose a coherent subset of remaining targets, write complete self-contained bodies for only that subset, then wait for the tool result.",
 	"- Each call records one natural plan batch. After any call, wait for the tool result and STEP 3 before making the next `write_todo_plan` call.",
 	"- The system infers whether the current todo item's required plan targets are complete from the recorded plan entries; do not add any separate completion flag.",
+	"- If the tool result reports remaining expected plan targets, continue the SAME todo_item_id with another `write_todo_plan` call for those remaining targets before moving to the next todo.",
 	"",
 	"CRITICAL — Context Isolation:",
 	"Each plan is the SOLE initial context the build agent will see when implementing that todo item, aside from the todo-level task context from `update_todo_list`. The build agent has NO access to prior exploration, conversation history, or other items' plans.",
@@ -41,7 +49,7 @@ const WRITE_TODO_PLAN_DESCRIPTION = [
 	"- Implementation intent: whether to write code, research, or debug; which files to create/modify/delete; which patterns and libraries to follow",
 	"- Verification: specific test commands, expected behavior, and how to confirm correctness",
 	"",
-	"Multi-call pattern: You may call this tool MULTIPLE TIMES for the same todo_item_id. Each call ACCUMULATES — plans are appended.",
+	"Multi-call pattern: You may call this tool MULTIPLE TIMES for the same todo_item_id. Each call ACCUMULATES — plans are appended and the UI shows the cumulative plan set.",
 	"",
 	"When to Use:",
 	'- When the user clicks the "Refine" button and you have already rewritten the todo list into the decomposition you want to keep',
@@ -78,7 +86,7 @@ export default {
 				plans: {
 					type: "array",
 					description:
-						'Array of structured plan entries. Each entry: { "target": "relative/path/to/file.ext or descriptive title", "action": "CREATE|MODIFY|DELETE|GENERAL", "body": "markdown plan body only" }. For file plans, the body must document the full file blueprint, include `referenced_by_files` and `references_files`, and list every function/method with `referenced_by`, `references`, and `responsibility`.',
+						'Array of structured plan entries. Each entry: { "target": "relative/path/to/file.ext or descriptive title", "action": "CREATE|MODIFY|DELETE|GENERAL", "body": "markdown plan body only" }. In STEP 2 file plans, target/action must exactly match an existing STEP 1 item_plan_targets entry for the current todo item. Put subtopics such as file purpose, routes, exports, dependencies, functions, tests, and Task Context inside the owning file target body, not as separate plan entries.',
 					items: {
 						type: "object",
 						properties: {
@@ -95,7 +103,7 @@ export default {
 							body: {
 								type: "string",
 								description:
-									"Markdown plan body only. Do not include PLAN_TARGET header markup. For file plans, this body must include the complete target-file blueprint, specify `referenced_by_files` and `references_files`, and list every function/method with its callers, dependencies, and concrete responsibility.",
+									"Markdown plan body only. Do not include PLAN_TARGET header markup. For file plans, include the complete target-file blueprint and keep all subtopics for that file inside this body.",
 							},
 						},
 						required: ["target", "action", "body"],

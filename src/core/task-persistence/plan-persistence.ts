@@ -353,6 +353,32 @@ function buildPlanMarkdown(
 	return lines.join("\n")
 }
 
+function parsePlanSections(raw: string): PlanFile[] {
+	const sectionStartRegex =
+		/^## ([^\r\n]+)\r?\n(?:\r?\n)*<<<PLAN_TARGET>>>\r?\nACTION: (CREATE|MODIFY|DELETE|GENERAL)\r?\nPATH: ([^\r\n]+)\r?\n<<<END_PLAN_TARGET>>>(?:\r?\n|$)/gm
+	const starts: Array<{ index: number; contentStart: number; filePath: string }> = []
+	let match: RegExpExecArray | null
+
+	while ((match = sectionStartRegex.exec(raw)) !== null) {
+		const markerOffset = match[0].indexOf("<<<PLAN_TARGET>>>")
+		if (markerOffset === -1) {
+			continue
+		}
+		starts.push({
+			index: match.index,
+			contentStart: match.index + markerOffset,
+			filePath: match[3].trim() || match[1].trim(),
+		})
+	}
+
+	return starts.map((start, index) => {
+		const nextStart = starts[index + 1]?.index ?? raw.length
+		let content = raw.slice(start.contentStart, nextStart).trim()
+		content = content.replace(/\r?\n---\s*$/, "").trim()
+		return { filePath: start.filePath, content }
+	})
+}
+
 async function deleteExistingPlanFilesForTodo(
 	globalStoragePath: string,
 	taskId: string,
@@ -745,14 +771,7 @@ export async function readPlanFiles(
 				}
 			}
 
-			const sections = raw.split(/^## /m).slice(1)
-			for (const section of sections) {
-				const newlineIdx = section.indexOf("\n")
-				if (newlineIdx === -1) continue
-				const sectionPath = section.substring(0, newlineIdx).trim()
-				let sectionContent = section.substring(newlineIdx + 1).trim()
-				sectionContent = sectionContent.replace(/\n---\s*$/, "").trim()
-				const planFile = { filePath: sectionPath, content: sectionContent }
+			for (const planFile of parsePlanSections(raw)) {
 				const target = isPlanTargetStub(planFile)
 					? matchesId
 						? stubResultsById

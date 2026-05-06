@@ -55,6 +55,18 @@ import { formatResponse } from "../prompts/responses"
 import { sanitizeToolUseId } from "../../utils/tool-id"
 import { isStrippedTool, getFullToolSchemaText } from "../prompts/tools/progressive-disclosure"
 
+function isErrorToolResponseContent(content: string): boolean {
+	try {
+		const parsed = JSON.parse(content) as { status?: unknown }
+		if (parsed?.status === "error") {
+			return true
+		}
+	} catch {
+		return /"status"\s*:\s*"error"/.test(content)
+	}
+	return false
+}
+
 /**
  * Processes and presents assistant message content to the user interface.
  *
@@ -184,11 +196,15 @@ export async function presentAssistantMessage(cline: Task) {
 				}
 
 				if (toolCallId) {
-					cline.pushToolResultToUserContent({
+					const toolResult: Anthropic.ToolResultBlockParam = {
 						type: "tool_result",
 						tool_use_id: sanitizeToolUseId(toolCallId),
 						content: resultContent,
-					})
+					}
+					if (isErrorToolResponseContent(resultContent)) {
+						toolResult.is_error = true
+					}
+					cline.pushToolResultToUserContent(toolResult)
 
 					if (imageBlocks.length > 0) {
 						cline.userMessageContent.push(...imageBlocks)
@@ -500,11 +516,15 @@ export async function presentAssistantMessage(cline: Task) {
 					}
 				}
 
-				cline.pushToolResultToUserContent({
+				const toolResult: Anthropic.ToolResultBlockParam = {
 					type: "tool_result",
 					tool_use_id: sanitizeToolUseId(toolCallId),
 					content: resultContent,
-				})
+				}
+				if (isErrorToolResponseContent(resultContent)) {
+					toolResult.is_error = true
+				}
+				cline.pushToolResultToUserContent(toolResult)
 
 				if (imageBlocks.length > 0) {
 					cline.userMessageContent.push(...imageBlocks)
@@ -633,6 +653,7 @@ export async function presentAssistantMessage(cline: Task) {
 				const includedTools = rawIncludedTools?.map((tool) => resolveToolAlias(tool)) ?? []
 				if (
 					!cline.isRefineMode &&
+					typeof cline.shouldReviewSubagentResumeState === "function" &&
 					(await cline.shouldReviewSubagentResumeState()) &&
 					!includedTools.includes("resume_subagents")
 				) {
@@ -737,8 +758,9 @@ export async function presentAssistantMessage(cline: Task) {
 			// disclosure checks, since the schema cache and PRIORITIZED_TOOLS use schema names
 			// (e.g., "codebase_search_broad"), not canonical names (e.g., "codebase_search").
 			const disclosureName = block.originalName ?? block.name
-			if (disclosureName && isStrippedTool(disclosureName, cline.discoveredTools)) {
-				cline.discoveredTools.add(disclosureName)
+			const discoveredTools = cline.discoveredTools instanceof Set ? cline.discoveredTools : undefined
+			if (disclosureName && discoveredTools && isStrippedTool(disclosureName, discoveredTools)) {
+				discoveredTools.add(disclosureName)
 				const schemaText = getFullToolSchemaText(disclosureName)
 				pushToolResult(schemaText)
 				break

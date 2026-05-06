@@ -230,7 +230,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 				if (existing) {
 					// Accumulate: multiple write_todo_plan calls for same todo
-					existing.savedPaths = [...(existing.savedPaths || []), ...newPaths]
+					existing.savedPaths = [...new Set([...(existing.savedPaths || []), ...newPaths])]
 					if (newContext) {
 						existing.contexts = [newContext]
 					}
@@ -398,15 +398,22 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	const lastPlayedRef = useRef<Record<string, number>>({})
 
-	const handleRefineTodoItems = useCallback((todoItemIds: string[]) => {
-		setIsRefining(true)
-		// Use __global__ sentinel so the indicator shows at bottom of list (global phase).
-		// The backend sends refineItemIdsUpdate with real IDs after update_todo_list rewrites the list.
-		setRefiningTodoItemIds(["__global__"])
-		setRefineStatusLabel("subagent...")
-		setRefineReasoningContent("")
-		vscode.postMessage({ type: "refineTodoItems", payload: { todoItemIds } })
-	}, [])
+	const handleRefineTodoItems = useCallback(
+		(todoItemIds: string[]) => {
+			const hasActiveRefineItems =
+				isRefining && refiningTodoItemIds.length > 0 && !refiningTodoItemIds.includes("__global__")
+			setIsRefining(true)
+			// Use __global__ sentinel so the indicator shows at bottom of list (global phase).
+			// The backend sends refineItemIdsUpdate with real IDs after update_todo_list rewrites the list.
+			if (!hasActiveRefineItems) {
+				setRefiningTodoItemIds(["__global__"])
+				setRefineStatusLabel("subagent...")
+				setRefineReasoningContent("")
+			}
+			vscode.postMessage({ type: "refineTodoItems", payload: { todoItemIds } })
+		},
+		[isRefining, refiningTodoItemIds],
+	)
 	const activeRefiningTodoItemId = refiningTodoItemIds[0]
 
 	useEffect(() => {

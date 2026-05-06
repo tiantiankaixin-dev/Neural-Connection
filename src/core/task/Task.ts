@@ -166,7 +166,7 @@ import {
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
-const STEP3_AGREEMENT_PASS_TIMEOUT_MS = 60_000
+const STEP3_AGREEMENT_PASS_TIMEOUT_MS = 180_000
 const STEP3_REFINE_PLAN_BATCH_SIZE = 5
 const REFINE_RESUME_STATE_FILE = "refine_state.json"
 const SUBAGENT_RESUME_STATE_FILE = "subagent_state.json"
@@ -217,6 +217,13 @@ type PostSubtaskAgreementPassOutcome = {
 	error?: string
 }
 
+type AgreementPassExtractionOutcome = {
+	executed: boolean
+	fileAgreements: PostSubtaskFileAgreement[]
+	skippedReason?: string
+	error?: string
+}
+
 type RefineResumeState = {
 	status: "in_progress"
 	activeTodoItemIds: string[]
@@ -234,6 +241,8 @@ type SubagentResumeState = {
 
 type AgreementPassOptions = {
 	updateAllTodoContexts?: boolean
+	progressLabel?: string
+	emitExtractionResult?: boolean
 }
 
 const STEP3_FILE_AGREEMENTS_BEGIN = "<!-- BEGIN_STEP3_FILE_AGREEMENTS -->"
@@ -266,7 +275,7 @@ function formatStep3ApiFailureMessage(message: string): string {
 		return `${message}. STEP 3 did not finish, so no shared agreements were merged into task context or plan sections. This agreement pass is treated as failed.`
 	}
 	if (lowerMessage.includes("invalid json response")) {
-		return `${message}. The API provider returned a malformed/non-JSON response before STEP 3 could parse the agreement JSON. No shared agreements were merged into task context or plan sections. This agreement pass is treated as failed; retry only after the provider/API is stable.`
+		return `${message}. The API provider returned a malformed/non-JSON response before STEP 3 could parse the agreement JSON. No shared agreements were merged into task context or plan sections. This agreement pass is treated as failed and the current refine todo item must retry STEP 3 before any later todo item can proceed.`
 	}
 	if (
 		lowerMessage.includes("quota") ||
@@ -274,7 +283,7 @@ function formatStep3ApiFailureMessage(message: string): string {
 		lowerMessage.includes("too quickly") ||
 		lowerMessage.includes("token-limit")
 	) {
-		return `${message}. STEP 3 could not complete because the API provider rejected or throttled the request. No shared agreements were merged into task context or plan sections. This agreement pass is treated as failed; retry after quota/rate limits recover.`
+		return `${message}. STEP 3 could not complete because the API provider rejected or throttled the request. No shared agreements were merged into task context or plan sections. This agreement pass is treated as failed and the current refine todo item must retry STEP 3 before any later todo item can proceed.`
 	}
 	return message
 }
@@ -509,6 +518,24 @@ function normalizeFileAgreements(
 		}
 	}
 
+	return Array.from(grouped.entries()).map(([file_path, agreements]) => ({ file_path, agreements }))
+}
+
+function mergePostSubtaskFileAgreements(fileAgreements: PostSubtaskFileAgreement[]): PostSubtaskFileAgreement[] {
+	const grouped = new Map<string, PostSubtaskAgreementItem[]>()
+	for (const entry of fileAgreements) {
+		const filePath = normalizeCodeTargetPath(entry.file_path)
+		if (!filePath) {
+			continue
+		}
+		const existing = grouped.get(filePath) ?? []
+		for (const agreement of entry.agreements) {
+			mergeAgreementItem(existing, agreement)
+		}
+		if (existing.length > 0) {
+			grouped.set(filePath, existing)
+		}
+	}
 	return Array.from(grouped.entries()).map(([file_path, agreements]) => ({ file_path, agreements }))
 }
 
@@ -1119,6 +1146,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	pendingTodoEdit: { oldTodos: TodoItem[]; newTodos: TodoItem[] } | null = null
 	pendingRefineRequest: { todoItemIds: string[] } | null = null
 	activeRefineTodoItemIds: string[] | null = null
+	pendingRefineStep3RetryTodoItemId: string | null = null
 	refineStep1Complete = false
 	isRefineMode = false
 	postRefineDividerPending = false
@@ -2177,15 +2205,28 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const writeTodoPlanFormatReminder = [
 			"Do not copy compact previous_context placeholders such as plans=[object Object]; they are lossy summaries, not valid tool arguments.",
 			"Every write_todo_plan plans entry must include target, action, and body.",
+			"STEP 2 does not create or reclassify targets; every file plan target/action must exactly match one STEP 1 item_plan_targets entry for the current todo item.",
+			"Put subtopics such as file purpose, dependencies, routes, exports, functions, tests, and Task Context inside the owning file target's body, never as separate plan entries.",
 			'For plan_type="general", target must be a descriptive section title and action must be "GENERAL".',
 			"If the current todo feels too large to plan clearly in one response, you may split it across multiple write_todo_plan calls for the same todo_item_id.",
+			"Each write_todo_plan call may cover only a coherent subset of the remaining STEP 1 file targets; continue the same todo_item_id until the tool result reports no missing targets.",
 		].join("\n")
+		const step3RetryReminder = this.pendingRefineStep3RetryTodoItemId
+			? [
+					"[STEP 3 RETRY REQUIRED]",
+					`The previous STEP 3 agreement pass failed for todo_item_id "${this.pendingRefineStep3RetryTodoItemId}".`,
+					"Do not continue to another todo item and do not create additional plan content.",
+					`The next action must be a write_todo_plan call for the same todo_item_id "${this.pendingRefineStep3RetryTodoItemId}" so the tool can reuse the saved plans and retry STEP 3.`,
+					"Only after STEP 3 succeeds may you proceed to remaining plan targets or the next todo item.",
+				].join("\n")
+			: undefined
 		if (this.isRefineMode) {
 			return [
 				"[REFINE IN PROGRESS]",
 				"A refine operation is currently active. Keep working in refine mode until all required todo plans are recorded with write_todo_plan.",
 				"This temporary marker is injected while refine is active and will be removed when parallel subagents start.",
 				"",
+				...(step3RetryReminder ? [step3RetryReminder, ""] : []),
 				writeTodoPlanFormatReminder,
 				"",
 				`Recorded active refine todo item ids: ${activeIds}`,
@@ -2360,6 +2401,69 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			{ isNonInteractive: true },
 		)
 		return refinePrompt
+	}
+
+	private async prepareRefinePromptForRequest(todos: TodoItem[], todoItemIds: string[]): Promise<string | undefined> {
+		if (todos.length === 0) {
+			return undefined
+		}
+		if (!this.isRefineMode) {
+			const restored = await this.restoreRefineModeFromResumeState()
+			if (!restored) {
+				return this.prepareRefinePromptForTodos(todos)
+			}
+		}
+		const hasRecordedRefineProgress =
+			this.refineStep1Complete ||
+			!!this.activeRefineTodoItemIds?.length ||
+			!!this.pendingRefineStep3RetryTodoItemId
+		if (!hasRecordedRefineProgress) {
+			return this.prepareRefinePromptForTodos(todos)
+		}
+
+		const todoById = new Map(todos.map((todo) => [todo.id, todo]))
+		const selectedTodoList =
+			todoItemIds
+				.map((id) => {
+					const todo = todoById.get(id)
+					return todo
+						? `- ${id}: [${todo.status}] ${todo.content}`
+						: `- ${id}: (not found in current todo list)`
+				})
+				.join("\n") || "(none)"
+		const activeIds = this.activeRefineTodoItemIds?.length
+			? this.activeRefineTodoItemIds.join(", ")
+			: "(none recorded)"
+		const currentTodoId = this.pendingRefineStep3RetryTodoItemId ?? this.activeRefineTodoItemIds?.[0]
+		const currentTodo = currentTodoId ? todoById.get(currentTodoId) : undefined
+		const nextAction = this.pendingRefineStep3RetryTodoItemId
+			? `A STEP 3 retry is pending. The next tool call must be write_todo_plan for todo_item_id "${this.pendingRefineStep3RetryTodoItemId}" so the saved plans are reused and STEP 3 is retried before any other todo proceeds.`
+			: this.refineStep1Complete
+				? currentTodoId
+					? `Continue the existing refine sequence from todo_item_id "${currentTodoId}"${currentTodo ? ` (${currentTodo.content})` : ""}. Do not restart STEP 1.`
+					: "Continue the existing refine sequence from the latest active refine todo id. Do not restart STEP 1."
+				: "STEP 1 is still incomplete. Continue STEP 1 once with update_todo_list; do not reset any completed refine state."
+
+		return [
+			"[REFINE REQUEST DURING ACTIVE REFINE]",
+			"The user added or adjusted requirements while refine is already in progress.",
+			"Preserve the current refine workflow state. Do not restart refine and do not discard recorded STEP 1 targets, saved STEP 2 plans, or STEP 3 retry state.",
+			"Only call update_todo_list again if the user's new requirement explicitly requires changing the refined todo breakdown or file ownership; otherwise continue the current STEP 2/STEP 3 sequence and incorporate the requirement into the current or remaining plans.",
+			"",
+			"Selected todo item ids from the user action:",
+			selectedTodoList,
+			"",
+			"Current refine state:",
+			`- STEP 1 complete: ${this.refineStep1Complete ? "yes" : "no"}`,
+			`- Active refine todo item ids: ${activeIds}`,
+			`- Pending STEP 3 retry todo item id: ${this.pendingRefineStep3RetryTodoItemId ?? "(none)"}`,
+			"",
+			"Next required action:",
+			nextAction,
+			"",
+			"Current todo list:",
+			this.formatTodoListForPrompt(todos),
+		].join("\n")
 	}
 
 	// NOTE: We intentionally do NOT mutate stored messages to merge consecutive user turns.
@@ -4298,16 +4402,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			batches.push(planFiles.slice(i, i + STEP3_REFINE_PLAN_BATCH_SIZE))
 		}
 
-		let aggregate: PostSubtaskAgreementPassOutcome = {
-			executed: true,
-			appendedCount: 0,
-			fileAgreementCount: 0,
-			planAgreementCount: 0,
-			planAgreements: [],
-		}
-
-		for (const batch of batches) {
-			const outcome = await this.enqueueAgreementPass(
+		const extractedFileAgreements: PostSubtaskFileAgreement[] = []
+		for (let i = 0; i < batches.length; i++) {
+			const batch = batches[i]
+			const extraction = await this.enqueueAgreementExtractionPass(
 				refinedTodo,
 				(todos) =>
 					buildPostRefineAgreementPrompt({
@@ -4316,25 +4414,32 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						todos,
 					}),
 				batch,
-				{ updateAllTodoContexts: true },
+				{
+					progressLabel: `(batch ${i + 1}/${batches.length})`,
+					updateAllTodoContexts: true,
+				},
 			)
 
-			aggregate = {
-				executed: aggregate.executed && outcome.executed,
-				appendedCount: aggregate.appendedCount + outcome.appendedCount,
-				fileAgreementCount: aggregate.fileAgreementCount + outcome.fileAgreementCount,
-				planAgreementCount: (aggregate.planAgreementCount ?? 0) + (outcome.planAgreementCount ?? 0),
-				planAgreements: [...(aggregate.planAgreements ?? []), ...(outcome.planAgreements ?? [])],
-				skippedReason: outcome.skippedReason ?? aggregate.skippedReason,
-				error: outcome.error ?? aggregate.error,
+			if (!extraction.executed || extraction.error) {
+				return {
+					executed: extraction.executed,
+					appendedCount: 0,
+					fileAgreementCount: 0,
+					planAgreementCount: 0,
+					planAgreements: [],
+					skippedReason: extraction.skippedReason,
+					error: extraction.error,
+				}
 			}
 
-			if (!outcome.executed || outcome.error) {
-				return aggregate
-			}
+			extractedFileAgreements.push(...extraction.fileAgreements)
 		}
 
-		return aggregate
+		return this.mergeAgreementPassFileAgreements(
+			refinedTodo,
+			mergePostSubtaskFileAgreements(extractedFileAgreements),
+			{ updateAllTodoContexts: true },
+		)
 	}
 
 	private enqueuePostSubtaskAgreementPass(
@@ -4388,28 +4493,70 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			})
 	}
 
+	private enqueueAgreementExtractionPass(
+		focusTodo: TodoItem,
+		buildPrompt: (todos: TodoItem[]) => string,
+		planFiles: PlanFile[] = [],
+		options: AgreementPassOptions = {},
+	): Promise<AgreementPassExtractionOutcome> {
+		let release: (() => void) | undefined
+		const previous = this.subtaskAgreementPassChain
+		this.subtaskAgreementPassChain = new Promise<void>((resolve) => {
+			release = resolve
+		})
+
+		return previous
+			.catch(() => undefined)
+			.then(async () => {
+				try {
+					return await this.extractAgreementPass(focusTodo, buildPrompt, planFiles, options)
+				} finally {
+					release?.()
+				}
+			})
+	}
+
 	private async runAgreementPass(
 		focusTodo: TodoItem,
 		buildPrompt: (todos: TodoItem[]) => string,
 		planFiles: PlanFile[] = [],
 		options: AgreementPassOptions = {},
 	): Promise<PostSubtaskAgreementPassOutcome> {
+		const extraction = await this.extractAgreementPass(focusTodo, buildPrompt, planFiles, options)
+		if (!extraction.executed || extraction.error) {
+			return {
+				executed: extraction.executed,
+				appendedCount: 0,
+				fileAgreementCount: 0,
+				skippedReason: extraction.skippedReason,
+				error: extraction.error,
+			}
+		}
+		return this.mergeAgreementPassFileAgreements(focusTodo, extraction.fileAgreements, options)
+	}
+
+	private async extractAgreementPass(
+		focusTodo: TodoItem,
+		buildPrompt: (todos: TodoItem[]) => string,
+		planFiles: PlanFile[] = [],
+		options: AgreementPassOptions = {},
+	): Promise<AgreementPassExtractionOutcome> {
 		const currentTodos = (this.todoList ?? []).map((todo) => ({ ...todo }))
 		if (currentTodos.length === 0) {
 			return {
 				executed: false,
-				appendedCount: 0,
-				fileAgreementCount: 0,
+				fileAgreements: [],
 				skippedReason: "todo list unavailable",
 			}
 		}
 		const agreementPrompt = buildPrompt(currentTodos)
+		const progressLabel = options.progressLabel ? ` ${options.progressLabel}` : ""
 
 		// Visible signal that Step 3 is running — so the user can see it in chat
 		// even when no agreements end up being appended.
 		await this.say(
 			"text",
-			`\u2699\ufe0f STEP 3 agreement pass running for "${focusTodo.content}"...`,
+			`\u2699\ufe0f STEP 3 agreement pass${progressLabel} running for "${focusTodo.content}"...`,
 			undefined,
 			undefined,
 			undefined,
@@ -4456,14 +4603,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.error(`[STEP 3] agreement pass API call failed for "${focusTodo.content}":`, error)
 			await this.say(
 				"text",
-				`\u26a0\ufe0f STEP 3 error for "${focusTodo.content}": ${failureMessage}`,
+				`\u26a0\ufe0f STEP 3${progressLabel} error for "${focusTodo.content}": ${failureMessage}`,
 				undefined,
 				undefined,
 				undefined,
 				undefined,
 				{ isNonInteractive: true },
 			)
-			return { executed: true, appendedCount: 0, fileAgreementCount: 0, error: failureMessage }
+			return { executed: true, fileAgreements: [], error: failureMessage }
 		}
 
 		let agreementResponse: PostSubtaskAgreementResponse
@@ -4474,14 +4621,14 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			console.error(`[STEP 3] failed to parse agreement response for "${focusTodo.content}":`, error, rawResponse)
 			await this.say(
 				"text",
-				`\u26a0\ufe0f STEP 3 parse error for "${focusTodo.content}": ${message}`,
+				`\u26a0\ufe0f STEP 3${progressLabel} parse error for "${focusTodo.content}": ${message}`,
 				undefined,
 				undefined,
 				undefined,
 				undefined,
 				{ isNonInteractive: true },
 			)
-			return { executed: true, appendedCount: 0, fileAgreementCount: 0, error: message }
+			return { executed: true, fileAgreements: [], error: message }
 		}
 
 		const availableSharedTargets = collectAvailableCodeTargets(currentTodos, planFiles)
@@ -4490,6 +4637,50 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			planFiles,
 			availableSharedTargets,
 		)
+		if (fileAgreements.length === 0) {
+			if (options.emitExtractionResult !== false) {
+				await this.say(
+					"text",
+					`\u2705 STEP 3${progressLabel} for "${focusTodo.content}": no new agreements`,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					{ isNonInteractive: true },
+				)
+			}
+			return { executed: true, fileAgreements: [] }
+		}
+
+		if (options.emitExtractionResult === false) {
+			return { executed: true, fileAgreements }
+		}
+		await this.say(
+			"text",
+			`\u2705 STEP 3${progressLabel} for "${focusTodo.content}": extracted ${fileAgreements.reduce((count, entry) => count + entry.agreements.length, 0)} file-owned agreement${fileAgreements.reduce((count, entry) => count + entry.agreements.length, 0) === 1 ? "" : "s"}`,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			{ isNonInteractive: true },
+		)
+		return { executed: true, fileAgreements }
+	}
+
+	private async mergeAgreementPassFileAgreements(
+		focusTodo: TodoItem,
+		fileAgreements: PostSubtaskFileAgreement[],
+		options: AgreementPassOptions = {},
+	): Promise<PostSubtaskAgreementPassOutcome> {
+		const currentTodos = (this.todoList ?? []).map((todo) => ({ ...todo }))
+		if (currentTodos.length === 0) {
+			return {
+				executed: false,
+				appendedCount: 0,
+				fileAgreementCount: 0,
+				skippedReason: "todo list unavailable",
+			}
+		}
 		if (fileAgreements.length === 0) {
 			await this.say(
 				"text",
@@ -6091,6 +6282,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						if (this.pendingRefineRequest) {
 							// Stream was intentionally aborted for a refine request.
 							// Consume it here and push refine prompt onto the stack.
+							const refineRequest = this.pendingRefineRequest
 							this.pendingRefineRequest = null
 							console.log(
 								`[Task#${this.taskId}.${this.instanceId}] Stream aborted for refine request, injecting refine prompt`,
@@ -6099,7 +6291,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							const allTodos = this.todoList ?? []
 							// Emit a refine divider so exploration messages are grouped
 							// below the entire old todo list, not under the first old item.
-							const refinePrompt = await this.prepareRefinePromptForTodos(allTodos)
+							const refinePrompt = await this.prepareRefinePromptForRequest(
+								allTodos,
+								refineRequest.todoItemIds,
+							)
 							if (refinePrompt) {
 								stack.push({
 									userContent: [{ type: "text", text: refinePrompt }],
@@ -6210,6 +6405,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				if (this.pendingRefineRequest) {
 					await abortStream("user_cancelled")
 
+					const refineRequest = this.pendingRefineRequest
 					this.pendingRefineRequest = null
 					console.log(
 						`[Task#${this.taskId}.${this.instanceId}] Stream interrupted for refine request, injecting refine prompt`,
@@ -6218,7 +6414,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					const allTodos = this.todoList ?? []
 					// Emit a refine divider so exploration messages are grouped
 					// below the entire old todo list, not under the first old item.
-					const refinePrompt = await this.prepareRefinePromptForTodos(allTodos)
+					const refinePrompt = await this.prepareRefinePromptForRequest(allTodos, refineRequest.todoItemIds)
 					if (refinePrompt) {
 						stack.push({
 							userContent: [{ type: "text", text: refinePrompt }],
@@ -6614,12 +6810,16 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 					// If user requested todo item refinement, inject a prompt asking AI to create plans
 					if (this.pendingRefineRequest) {
+						const refineRequest = this.pendingRefineRequest
 						this.pendingRefineRequest = null
 
 						const allTodos = this.todoList ?? []
 						// Emit a refine divider so exploration messages are grouped
 						// below the entire old todo list, not under the first old item.
-						const refinePrompt = await this.prepareRefinePromptForTodos(allTodos)
+						const refinePrompt = await this.prepareRefinePromptForRequest(
+							allTodos,
+							refineRequest.todoItemIds,
+						)
 						if (refinePrompt) {
 							this.userMessageContent.push({
 								type: "text",
@@ -8065,6 +8265,20 @@ seeded file targets with detailed implementation plans. The next tool call after
 a successful STEP 1 should be \`write_todo_plan\` for the first unfinished/current
 refine todo id. Call \`write_todo_plan\` for exactly one todo item at a time and
 wait for the returned sequential refine state before moving on.
+
+STEP 2 does NOT discover, create, rename, split, or reclassify targets. Every
+\`write_todo_plan\` \`plans[].target\` for file plans MUST exactly match one remaining
+STEP 1 \`item_plan_targets\` file for the current todo item, and \`plans[].action\`
+MUST match the STEP 1 action. Treat each STEP 1 file target as the responsibility
+boundary: all required modifications, file purpose notes, dependencies, routes,
+exports, functions, tests, and Task Context references for that file must stay
+inside that file target's \`body\`, never as separate plan entries.
+
+If the current todo has many seeded file targets, you may fill only a coherent
+subset of the remaining targets in one \`write_todo_plan\` call; the plan entries
+accumulate. Continue the same todo id with additional \`write_todo_plan\` calls
+until the tool result reports no remaining missing targets, then move to the next
+todo.
 
 ## STEP 3 — Agreement Pass And Automatic Execution
 
