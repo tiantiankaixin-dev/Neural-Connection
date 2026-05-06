@@ -604,6 +604,14 @@ export class NativeToolCallParser {
 				}
 				break
 
+			case "resume_subagents":
+				if (partialArgs.summary !== undefined) {
+					nativeArgs = {
+						summary: partialArgs.summary,
+					}
+				}
+				break
+
 			case "use_mcp_tool":
 				if (partialArgs.server_name !== undefined || partialArgs.tool_name !== undefined) {
 					nativeArgs = {
@@ -966,6 +974,14 @@ export class NativeToolCallParser {
 								plans: parsedPlans,
 							} as NativeArgsFor<TName>
 						}
+					}
+					break
+
+				case "resume_subagents":
+					if (args.summary === undefined || typeof args.summary === "string" || args.summary === null) {
+						nativeArgs = {
+							...(args.summary !== undefined ? { summary: args.summary } : {}),
+						} as NativeArgsFor<TName>
 					}
 					break
 

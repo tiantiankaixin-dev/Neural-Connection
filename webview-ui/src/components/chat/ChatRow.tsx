@@ -97,6 +97,26 @@ interface TodoPlanData {
 	targetStubs?: TodoPlanTarget[]
 }
 
+interface Step3ModelTransferDiagnostic {
+	stage?: string
+	todoItemId?: string
+	todoContent?: string
+	progressLabel?: string
+	provider?: string
+	modelId?: string
+	errorMessage?: string
+	errorData?: unknown
+	promptText?: string
+	rawResponse?: string
+	parsedResponse?: unknown
+	fileAgreements?: unknown
+	agreementCount?: number
+	planFiles?: Array<{
+		filePath?: string
+		content?: string
+	}>
+}
+
 interface DividerTurn {
 	turnNumber: number
 	todoItemContent?: string
@@ -128,6 +148,85 @@ function parseDividerText(text?: string): {
 		// not JSON, plain string
 	}
 	return { content: text }
+}
+
+function Step3ModelTransferDetails({ details }: { details: Step3ModelTransferDiagnostic }) {
+	const [expanded, setExpanded] = useState(false)
+	const detailText = JSON.stringify(
+		{
+			stage: details.stage,
+			todoItemId: details.todoItemId,
+			todoContent: details.todoContent,
+			progressLabel: details.progressLabel,
+			provider: details.provider,
+			modelId: details.modelId,
+			errorMessage: details.errorMessage,
+			errorData: details.errorData,
+			agreementCount: details.agreementCount,
+			parsedResponse: details.parsedResponse,
+			fileAgreements: details.fileAgreements,
+			rawResponse: details.rawResponse,
+			promptText: details.promptText,
+			planFiles: details.planFiles,
+		},
+		null,
+		2,
+	)
+
+	return (
+		<div
+			className="mt-2 rounded border border-vscode-panel-border bg-vscode-textBlockQuote-background"
+			style={{ overflow: "hidden" }}>
+			<button
+				type="button"
+				className="w-full cursor-pointer px-2 py-1.5 text-left text-xs text-vscode-descriptionForeground hover:bg-vscode-list-hoverBackground"
+				style={{ display: "flex", alignItems: "center", gap: 6 }}
+				onClick={(event) => {
+					event.stopPropagation()
+					setExpanded(!expanded)
+				}}>
+				<span className={`codicon codicon-chevron-${expanded ? "down" : "right"}`} style={{ fontSize: 11 }} />
+				<span style={{ fontWeight: 600 }}>STEP 3 模型传输数据</span>
+				{details.stage && <span style={{ opacity: 0.7 }}>({details.stage})</span>}
+			</button>
+			{expanded && (
+				<pre
+					className="m-0 max-h-[45vh] overflow-auto whitespace-pre-wrap break-words px-3 py-2 text-xs text-vscode-editor-foreground"
+					style={{ background: "var(--vscode-editor-background)" }}>
+					{detailText}
+				</pre>
+			)}
+		</div>
+	)
+}
+
+const STEP3_MODEL_TRANSFER_DETAILS_REGEX =
+	/<!-- STEP3_MODEL_TRANSFER_DETAILS_BEGIN ([A-Za-z0-9+/=]+) STEP3_MODEL_TRANSFER_DETAILS_END -->/
+
+function parseStep3ModelTransferDetails(text?: string): {
+	cleanText: string | undefined
+	details?: Step3ModelTransferDiagnostic
+} {
+	if (!text) {
+		return { cleanText: text }
+	}
+
+	const match = text.match(STEP3_MODEL_TRANSFER_DETAILS_REGEX)
+	if (!match?.[1]) {
+		return { cleanText: text }
+	}
+
+	try {
+		const binary = atob(match[1])
+		const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
+		const details = JSON.parse(new TextDecoder().decode(bytes)) as Step3ModelTransferDiagnostic
+		return {
+			cleanText: text.replace(STEP3_MODEL_TRANSFER_DETAILS_REGEX, "").trimEnd(),
+			details,
+		}
+	} catch {
+		return { cleanText: text }
+	}
 }
 
 function isLeakedWriteTodoPlanPayload(text?: string) {
@@ -1654,8 +1753,9 @@ export const ChatRowContent = ({
 				}
 				case "api_req_finished":
 					return null // we should never see this message type
-				case "text":
-					if (isLeakedWriteTodoPlanPayload(message.text)) {
+				case "text": {
+					const step3Message = parseStep3ModelTransferDetails(message.text)
+					if (isLeakedWriteTodoPlanPayload(step3Message.cleanText)) {
 						return null
 					}
 
@@ -1665,10 +1765,11 @@ export const ChatRowContent = ({
 								<MessageCircle className="w-4 shrink-0" aria-label="Speech bubble icon" />
 								<span style={{ fontWeight: "bold" }}>{t("chat:text.rooSaid")}</span>
 								<div style={{ flexGrow: 1 }} />
-								<OpenMarkdownPreviewButton markdown={message.text} />
+								<OpenMarkdownPreviewButton markdown={step3Message.cleanText} />
 							</div>
 							<div className="pl-6">
-								<Markdown markdown={message.text} partial={message.partial} />
+								<Markdown markdown={step3Message.cleanText} partial={message.partial} />
+								{step3Message.details && <Step3ModelTransferDetails details={step3Message.details} />}
 								{message.images && message.images.length > 0 && (
 									<div style={{ marginTop: "10px" }}>
 										{message.images.map((image, index) => (
@@ -1679,6 +1780,7 @@ export const ChatRowContent = ({
 							</div>
 						</div>
 					)
+				}
 				case "user_feedback":
 					return (
 						<div className="group">

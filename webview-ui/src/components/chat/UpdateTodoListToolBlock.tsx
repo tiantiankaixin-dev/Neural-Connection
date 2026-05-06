@@ -135,6 +135,15 @@ function normalizePlanTargetsForDisplay(value: unknown): TodoPlanTarget[] {
 		.filter((entry): entry is TodoPlanTarget => !!entry)
 }
 
+function normalizeTargetKey(value: string): string {
+	return value
+		.trim()
+		.replace(/\\/g, "/")
+		.replace(/^\.\/+/, "")
+		.replace(/\/+/g, "/")
+		.toLowerCase()
+}
+
 function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }) {
 	const [isExpanded, setIsExpanded] = React.useState(false)
 	const [expandedSections, setExpandedSections] = React.useState<Set<number>>(new Set())
@@ -143,6 +152,10 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 	const hasTargetStubs = targetStubs.length > 0
 	const hasPlan = !!plan && (plan.plans.length > 0 || plan.contexts.length > 0 || hasTargetStubs)
 	const hasContexts = !!plan && plan.contexts.length > 0
+	const plannedTargetKeys = new Set((plan?.plans ?? []).map((entry) => normalizeTargetKey(entry.filePath)))
+	const plannedTargetCount = hasTargetStubs
+		? targetStubs.filter((target) => plannedTargetKeys.has(normalizeTargetKey(target.target))).length
+		: (plan?.plans.length ?? 0)
 
 	const toggleContext = (idx: number) => {
 		setExpandedContexts((prev) => {
@@ -217,10 +230,10 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 					</div>
 					<div style={{ color: "var(--vscode-descriptionForeground)", fontSize: 12 }}>
 						{hasPlan
-							? plan.plans.length > 0
-								? `${plan.plans.length} ${plan.planType === "general" ? "section(s)" : "file(s)"}`
-								: hasTargetStubs
-									? `${targetStubs.length} STEP 1 target(s) seeded`
+							? hasTargetStubs
+								? `${plannedTargetCount}/${targetStubs.length} STEP 2 target(s) planned`
+								: plan.plans.length > 0
+									? `${plan.plans.length} ${plan.planType === "general" ? "section(s)" : "file(s)"}`
 									: plan.contexts.length > 0
 										? `${plan.contexts.length} task context block(s)`
 										: "No refine details"
@@ -267,7 +280,7 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 								/>
 								<span style={{ fontWeight: 500, opacity: 0.9 }}>STEP 1 File Targets</span>
 								<span style={{ color: "var(--vscode-descriptionForeground)", fontSize: 11 }}>
-									{targetStubs.length} seeded
+									{plannedTargetCount}/{targetStubs.length} planned
 								</span>
 							</div>
 							<div
@@ -278,7 +291,23 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 									color: "var(--vscode-descriptionForeground)",
 								}}>
 								{targetStubs.map((target, index) => (
-									<div key={`${target.action}-${target.target}-${index}`}>
+									<div
+										key={`${target.action}-${target.target}-${index}`}
+										style={{
+											display: "flex",
+											alignItems: "center",
+											gap: 6,
+										}}>
+										<span
+											className={`codicon codicon-${plannedTargetKeys.has(normalizeTargetKey(target.target)) ? "check" : "circle-large-outline"}`}
+											style={{
+												color: plannedTargetKeys.has(normalizeTargetKey(target.target))
+													? "var(--vscode-charts-green)"
+													: "var(--vscode-descriptionForeground)",
+												fontSize: 11,
+												flexShrink: 0,
+											}}
+										/>
 										<span style={{ color: "var(--vscode-charts-blue)", marginRight: 6 }}>
 											{target.action}
 										</span>

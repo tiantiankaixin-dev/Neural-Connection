@@ -17,7 +17,6 @@ import { serializeError } from "serialize-error"
 import { Package } from "../../shared/package"
 import { formatToolInvocation } from "../tools/helpers/toolResultFormatting"
 import {
-	appendFileAgreementsToPlanFiles,
 	parsePlanTargetHeader,
 	readPlanFiles,
 	type PlanFileAgreement,
@@ -167,7 +166,7 @@ import {
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
 const STEP3_AGREEMENT_PASS_TIMEOUT_MS = 180_000
-const STEP3_REFINE_PLAN_BATCH_SIZE = 5
+const STEP3_REFINE_PLAN_BATCH_SIZE = 1
 const REFINE_RESUME_STATE_FILE = "refine_state.json"
 const SUBAGENT_RESUME_STATE_FILE = "subagent_state.json"
 
@@ -224,6 +223,26 @@ type AgreementPassExtractionOutcome = {
 	error?: string
 }
 
+type Step3ModelTransferDiagnostic = {
+	stage: "api_call" | "parse_response" | "success"
+	todoItemId: string
+	todoContent: string
+	progressLabel?: string
+	provider?: string
+	modelId?: string
+	errorMessage?: string
+	errorData?: unknown
+	promptText?: string
+	rawResponse?: string
+	parsedResponse?: PostSubtaskAgreementResponse
+	fileAgreements?: PostSubtaskFileAgreement[]
+	agreementCount?: number
+	planFiles: Array<{
+		filePath: string
+		content: string
+	}>
+}
+
 type RefineResumeState = {
 	status: "in_progress"
 	activeTodoItemIds: string[]
@@ -245,10 +264,15 @@ type AgreementPassOptions = {
 	emitExtractionResult?: boolean
 }
 
+type AgreementPassPromptBuilder = (todos: TodoItem[], availableTargets: string[]) => string
+
 const STEP3_FILE_AGREEMENTS_BEGIN = "<!-- BEGIN_STEP3_FILE_AGREEMENTS -->"
 const STEP3_FILE_AGREEMENTS_END = "<!-- END_STEP3_FILE_AGREEMENTS -->"
+const STEP3_MODEL_TRANSFER_DETAILS_BEGIN = "<!-- STEP3_MODEL_TRANSFER_DETAILS_BEGIN "
+const STEP3_MODEL_TRANSFER_DETAILS_END = " STEP3_MODEL_TRANSFER_DETAILS_END -->"
 const STEP3_FILE_AGREEMENTS_TITLE = "## Step 3 Cross-Task Agreements By Refine File"
 const PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE = "### Cross-Task Agreements Owned By This File"
+const STEP3_DIAGNOSTIC_MAX_DEPTH = 20
 
 function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
 	let timeout: ReturnType<typeof setTimeout> | undefined
@@ -269,13 +293,124 @@ function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string)
 	])
 }
 
+function formatStep3MessageWithModelTransferDetails(message: string, details: Step3ModelTransferDiagnostic): string {
+	try {
+		return `${message}\n${STEP3_MODEL_TRANSFER_DETAILS_BEGIN}${Buffer.from(JSON.stringify(sanitizeStep3DiagnosticData(details)), "utf8").toString("base64")}${STEP3_MODEL_TRANSFER_DETAILS_END}`
+	} catch {
+		return message
+	}
+}
+
+function shouldFallbackStep3Completion(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error)
+	return /invalid json response|unexpected end of json input|unexpected token/i.test(message)
+}
+
+async function completeStep3AgreementPromptViaStream(
+	apiConfiguration: ProviderSettings,
+	promptText: string,
+): Promise<string> {
+	const handler = buildApiHandler({ ...apiConfiguration, openAiStreamingEnabled: true })
+	let text = ""
+	const messages: Anthropic.Messages.MessageParam[] = [{ role: "user", content: promptText }]
+	for await (const chunk of handler.createMessage("", messages, {
+		taskId: "step3-agreement-pass",
+		suppressPreviousResponseId: true,
+		store: false,
+		tool_choice: "none",
+		parallelToolCalls: false,
+		behaviorRole: "step3-agreement-pass",
+	})) {
+		if (chunk.type === "text") {
+			text += chunk.text
+		} else if (chunk.type === "error") {
+			throw new Error(chunk.message || chunk.error)
+		}
+	}
+	if (!text.trim()) {
+		throw new Error("STEP 3 agreement pass fallback returned an empty response")
+	}
+	return text
+}
+
+async function completeStep3AgreementPrompt(apiConfiguration: ProviderSettings, promptText: string): Promise<string> {
+	try {
+		return await singleCompletionHandler(apiConfiguration, promptText)
+	} catch (error) {
+		if (!shouldFallbackStep3Completion(error)) {
+			throw error
+		}
+		try {
+			return await completeStep3AgreementPromptViaStream(apiConfiguration, promptText)
+		} catch (fallbackError) {
+			const primaryMessage = error instanceof Error ? error.message : String(error)
+			const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+			throw new Error(`${primaryMessage}; streaming fallback also failed: ${fallbackMessage}`)
+		}
+	}
+}
+
+function sanitizeStep3DiagnosticData(value: unknown, depth = 0, seen?: WeakSet<object>): unknown {
+	if (depth > STEP3_DIAGNOSTIC_MAX_DEPTH) {
+		return "[Max depth reached]"
+	}
+	if (typeof value === "bigint") {
+		return value.toString()
+	}
+	if (typeof value === "function" || typeof value === "symbol") {
+		return String(value)
+	}
+	if (value instanceof Error) {
+		const errorRecord = value as Error & { cause?: unknown } & Record<string, unknown>
+		return sanitizeStep3DiagnosticData(
+			{
+				name: value.name,
+				message: value.message,
+				stack: value.stack,
+				cause: errorRecord.cause,
+				...Object.fromEntries(Object.entries(errorRecord)),
+			},
+			depth + 1,
+			seen,
+		)
+	}
+	if (Array.isArray(value)) {
+		const seenObjects = seen ?? new WeakSet<object>()
+		if (seenObjects.has(value)) {
+			return "[Circular]"
+		}
+		seenObjects.add(value)
+		const result = value.map((item) => sanitizeStep3DiagnosticData(item, depth + 1, seenObjects))
+		seenObjects.delete(value)
+		return result
+	}
+	if (value && typeof value === "object") {
+		const seenObjects = seen ?? new WeakSet<object>()
+		if (seenObjects.has(value)) {
+			return "[Circular]"
+		}
+		seenObjects.add(value)
+		const result = Object.fromEntries(
+			Object.entries(value as Record<string, unknown>).map(([key, nestedValue]) => [
+				key,
+				/(api[-_]?key|token|authorization|auth|secret|password|credential)/i.test(key)
+					? "[redacted]"
+					: sanitizeStep3DiagnosticData(nestedValue, depth + 1, seenObjects),
+			]),
+		)
+		seenObjects.delete(value)
+		return result
+	}
+	return value
+}
+
 function formatStep3ApiFailureMessage(message: string): string {
 	const lowerMessage = message.toLowerCase()
+	if (/invalid json response/i.test(message)) {
+		return `${message}. The API provider returned a malformed/non-JSON response before STEP 3 could parse the agreement JSON. No shared agreements were merged into task context or plan sections. This agreement pass is treated as failed and the current refine todo item must retry STEP 3 before any later todo item can proceed.`
+	}
 	if (message.includes("timed out after")) {
 		return `${message}. STEP 3 did not finish, so no shared agreements were merged into task context or plan sections. This agreement pass is treated as failed.`
-	}
-	if (lowerMessage.includes("invalid json response")) {
-		return `${message}. The API provider returned a malformed/non-JSON response before STEP 3 could parse the agreement JSON. No shared agreements were merged into task context or plan sections. This agreement pass is treated as failed and the current refine todo item must retry STEP 3 before any later todo item can proceed.`
 	}
 	if (
 		lowerMessage.includes("quota") ||
@@ -655,15 +790,6 @@ function stripPlanSectionAgreementContent(content: string): string {
 	return content.replace(sectionRegex, "").trimEnd()
 }
 
-function buildPlanAgreementsFromFileAgreements(fileAgreements: PostSubtaskFileAgreement[]): PlanFileAgreement[] {
-	return fileAgreements
-		.map((entry) => ({
-			plan_target_path: entry.file_path,
-			content: buildPlanSectionAgreementContent(entry.agreements),
-		}))
-		.filter((entry) => entry.plan_target_path.trim().length > 0 && entry.content.trim().length > 0)
-}
-
 function getTaskContextPlanAgreements(context: string | undefined, planFiles: PlanFile[]): PlanFileAgreement[] {
 	const agreementsByFile = parseStep3FileAgreementSection(context?.trim() ?? "")
 	const planTargets = collectCodePlanTargets(planFiles)
@@ -691,17 +817,19 @@ function applyPlanAgreementsToPlanEntries(
 	let appliedCount = 0
 	const plans = planFiles.map((plan) => {
 		const parsedHeader = parsePlanTargetHeader(plan.content)
+		const baseContent = stripPlanSectionAgreementContent(plan.content)
 		if (parsedHeader?.action === "GENERAL") {
-			return plan
+			return baseContent === plan.content ? plan : { ...plan, content: baseContent }
 		}
 
 		const target = normalizeCodeTargetPath(parsedHeader?.path ?? plan.filePath)
 		const content = agreementsByTarget.get(target)
-		if (!content || plan.content.includes(content)) {
-			return plan
+		if (!content) {
+			return baseContent === plan.content ? plan : { ...plan, content: baseContent }
 		}
-
-		const baseContent = stripPlanSectionAgreementContent(plan.content)
+		if (baseContent.includes(content)) {
+			return baseContent === plan.content ? plan : { ...plan, content: baseContent }
+		}
 		appliedCount++
 		return {
 			...plan,
@@ -4379,6 +4507,42 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return applyPlanAgreementsToPlanEntries(planFiles, agreements)
 	}
 
+	private async collectAvailableAgreementTargets(currentTodos: TodoItem[], planFiles: PlanFile[]): Promise<string[]> {
+		const targets: string[] = []
+		const seen = new Set<string>()
+		const addTargets = (nextTargets: string[]) => {
+			for (const target of nextTargets) {
+				const normalized = normalizeCodeTargetPath(target)
+				if (normalized && !seen.has(normalized)) {
+					seen.add(normalized)
+					targets.push(normalized)
+				}
+			}
+		}
+
+		addTargets(collectAvailableCodeTargets(currentTodos, planFiles))
+
+		for (const todo of currentTodos) {
+			if (!todo.id) {
+				continue
+			}
+			try {
+				const readResult = await readPlanFiles(
+					this.globalStoragePath,
+					this.taskId,
+					this.taskTimestamp,
+					todo.id,
+					todo.content,
+				)
+				addTargets(collectCodePlanTargets([...readResult.plans, ...readResult.stubPlans]))
+			} catch (error) {
+				console.warn(`[STEP 3] failed to collect available plan targets for "${todo.content}":`, error)
+			}
+		}
+
+		return targets
+	}
+
 	/**
 	 * Public entry used by WriteTodoPlanTool to run STEP 3 immediately after
 	 * a refine item's plan is recorded. Uses a refine-specific prompt that
@@ -4407,11 +4571,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const batch = batches[i]
 			const extraction = await this.enqueueAgreementExtractionPass(
 				refinedTodo,
-				(todos) =>
+				(todos, availableTargets) =>
 					buildPostRefineAgreementPrompt({
 						refinedTodo,
 						planFiles: batch,
 						todos,
+						availableTargets,
 					}),
 				batch,
 				{
@@ -4458,12 +4623,13 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 		return this.enqueueAgreementPass(
 			completedTodo,
-			(todos) =>
+			(todos, availableTargets) =>
 				buildPostSubtaskAgreementPrompt({
 					completedTodo,
 					planFiles,
 					completionResult: trimmedCompletionResult,
 					todos,
+					availableTargets,
 				}),
 			planFiles,
 			{ updateAllTodoContexts: true },
@@ -4472,7 +4638,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	private enqueueAgreementPass(
 		focusTodo: TodoItem,
-		buildPrompt: (todos: TodoItem[]) => string,
+		buildPrompt: AgreementPassPromptBuilder,
 		planFiles: PlanFile[] = [],
 		options: AgreementPassOptions = {},
 	): Promise<PostSubtaskAgreementPassOutcome> {
@@ -4495,7 +4661,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	private enqueueAgreementExtractionPass(
 		focusTodo: TodoItem,
-		buildPrompt: (todos: TodoItem[]) => string,
+		buildPrompt: AgreementPassPromptBuilder,
 		planFiles: PlanFile[] = [],
 		options: AgreementPassOptions = {},
 	): Promise<AgreementPassExtractionOutcome> {
@@ -4518,7 +4684,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	private async runAgreementPass(
 		focusTodo: TodoItem,
-		buildPrompt: (todos: TodoItem[]) => string,
+		buildPrompt: AgreementPassPromptBuilder,
 		planFiles: PlanFile[] = [],
 		options: AgreementPassOptions = {},
 	): Promise<PostSubtaskAgreementPassOutcome> {
@@ -4537,7 +4703,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 	private async extractAgreementPass(
 		focusTodo: TodoItem,
-		buildPrompt: (todos: TodoItem[]) => string,
+		buildPrompt: AgreementPassPromptBuilder,
 		planFiles: PlanFile[] = [],
 		options: AgreementPassOptions = {},
 	): Promise<AgreementPassExtractionOutcome> {
@@ -4549,7 +4715,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				skippedReason: "todo list unavailable",
 			}
 		}
-		const agreementPrompt = buildPrompt(currentTodos)
+		const availableSharedTargets = await this.collectAvailableAgreementTargets(currentTodos, planFiles)
+		const agreementPrompt = buildPrompt(currentTodos, availableSharedTargets)
 		const progressLabel = options.progressLabel ? ` ${options.progressLabel}` : ""
 
 		// Visible signal that Step 3 is running — so the user can see it in chat
@@ -4593,7 +4760,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				},
 			})
 			rawResponse = await withTimeout(
-				singleCompletionHandler(this.apiConfiguration, agreementPrompt),
+				completeStep3AgreementPrompt(this.apiConfiguration, agreementPrompt),
 				STEP3_AGREEMENT_PASS_TIMEOUT_MS,
 				`STEP 3 agreement pass for "${focusTodo.content}"`,
 			)
@@ -4601,9 +4768,27 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			const message = error instanceof Error ? error.message : String(error)
 			const failureMessage = formatStep3ApiFailureMessage(message)
 			console.error(`[STEP 3] agreement pass API call failed for "${focusTodo.content}":`, error)
+			const details: Step3ModelTransferDiagnostic = {
+				stage: "api_call",
+				todoItemId: focusTodo.id,
+				todoContent: focusTodo.content,
+				progressLabel: options.progressLabel,
+				provider: this.apiConfiguration?.apiProvider,
+				modelId: this.api.getModel().id,
+				errorMessage: message,
+				errorData: sanitizeStep3DiagnosticData(error),
+				promptText: agreementPrompt,
+				planFiles: planFiles.map((plan) => ({
+					filePath: plan.filePath,
+					content: plan.content,
+				})),
+			}
 			await this.say(
 				"text",
-				`\u26a0\ufe0f STEP 3${progressLabel} error for "${focusTodo.content}": ${failureMessage}`,
+				formatStep3MessageWithModelTransferDetails(
+					`\u26a0\ufe0f STEP 3${progressLabel} error for "${focusTodo.content}": ${failureMessage}`,
+					details,
+				),
 				undefined,
 				undefined,
 				undefined,
@@ -4619,9 +4804,28 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
 			console.error(`[STEP 3] failed to parse agreement response for "${focusTodo.content}":`, error, rawResponse)
+			const details: Step3ModelTransferDiagnostic = {
+				stage: "parse_response",
+				todoItemId: focusTodo.id,
+				todoContent: focusTodo.content,
+				progressLabel: options.progressLabel,
+				provider: this.apiConfiguration?.apiProvider,
+				modelId: this.api.getModel().id,
+				errorMessage: message,
+				errorData: sanitizeStep3DiagnosticData(error),
+				promptText: agreementPrompt,
+				rawResponse,
+				planFiles: planFiles.map((plan) => ({
+					filePath: plan.filePath,
+					content: plan.content,
+				})),
+			}
 			await this.say(
 				"text",
-				`\u26a0\ufe0f STEP 3${progressLabel} parse error for "${focusTodo.content}": ${message}`,
+				formatStep3MessageWithModelTransferDetails(
+					`\u26a0\ufe0f STEP 3${progressLabel} parse error for "${focusTodo.content}": ${message}`,
+					details,
+				),
 				undefined,
 				undefined,
 				undefined,
@@ -4631,17 +4835,36 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			return { executed: true, fileAgreements: [], error: message }
 		}
 
-		const availableSharedTargets = collectAvailableCodeTargets(currentTodos, planFiles)
 		const fileAgreements = normalizeFileAgreements(
 			agreementResponse.fileAgreements,
 			planFiles,
 			availableSharedTargets,
 		)
+		const successDetails: Step3ModelTransferDiagnostic = {
+			stage: "success",
+			todoItemId: focusTodo.id,
+			todoContent: focusTodo.content,
+			progressLabel: options.progressLabel,
+			provider: this.apiConfiguration?.apiProvider,
+			modelId: this.api.getModel().id,
+			promptText: agreementPrompt,
+			rawResponse,
+			parsedResponse: agreementResponse,
+			fileAgreements,
+			agreementCount: fileAgreements.reduce((count, entry) => count + entry.agreements.length, 0),
+			planFiles: planFiles.map((plan) => ({
+				filePath: plan.filePath,
+				content: plan.content,
+			})),
+		}
 		if (fileAgreements.length === 0) {
 			if (options.emitExtractionResult !== false) {
 				await this.say(
 					"text",
-					`\u2705 STEP 3${progressLabel} for "${focusTodo.content}": no new agreements`,
+					formatStep3MessageWithModelTransferDetails(
+						`\u2705 STEP 3${progressLabel} for "${focusTodo.content}": no new agreements`,
+						successDetails,
+					),
 					undefined,
 					undefined,
 					undefined,
@@ -4657,7 +4880,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 		await this.say(
 			"text",
-			`\u2705 STEP 3${progressLabel} for "${focusTodo.content}": extracted ${fileAgreements.reduce((count, entry) => count + entry.agreements.length, 0)} file-owned agreement${fileAgreements.reduce((count, entry) => count + entry.agreements.length, 0) === 1 ? "" : "s"}`,
+			formatStep3MessageWithModelTransferDetails(
+				`\u2705 STEP 3${progressLabel} extraction for "${focusTodo.content}": extracted ${successDetails.agreementCount} file-owned agreement${successDetails.agreementCount === 1 ? "" : "s"}; pending merge after all STEP 3 batches finish`,
+				successDetails,
+			),
 			undefined,
 			undefined,
 			undefined,
@@ -4724,53 +4950,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				`merged ${fileAgreementCount} file-owned agreement${fileAgreementCount === 1 ? "" : "s"} into task context`,
 			)
 		}
-		let planAgreementCount = 0
-		let planAgreementError: string | undefined
-		const planAgreements = buildPlanAgreementsFromFileAgreements(fileAgreements)
-		if (planAgreements.length > 0) {
-			try {
-				planAgreementCount = await appendFileAgreementsToPlanFiles(
-					this.globalStoragePath,
-					this.taskId,
-					this.taskTimestamp,
-					focusTodo.id,
-					planAgreements,
-					focusTodo.content,
-				)
-				if (planAgreementCount > 0) {
-					successParts.push(
-						`distributed ${planAgreementCount} agreement block${planAgreementCount === 1 ? "" : "s"} into refine plan section${planAgreementCount === 1 ? "" : "s"}`,
-					)
-				}
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error)
-				console.error(
-					`[STEP 3] failed to distribute agreements into refine plan sections for "${focusTodo.content}":`,
-					error,
-				)
-				planAgreementError = message
-				await this.say(
-					"text",
-					`\u26a0\ufe0f STEP 3 plan agreement distribution error for "${focusTodo.content}": ${message}`,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					{ isNonInteractive: true },
-				)
-			}
-		}
-
-		if (planAgreementError) {
-			return {
-				executed: true,
-				appendedCount,
-				fileAgreementCount,
-				planAgreementCount,
-				planAgreements,
-				error: `plan agreement distribution failed: ${planAgreementError}`,
-			}
-		}
 
 		if (successParts.length === 0) {
 			await this.say(
@@ -4794,7 +4973,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			)
 		}
 
-		return { executed: true, appendedCount, fileAgreementCount, planAgreementCount, planAgreements }
+		return { executed: true, appendedCount, fileAgreementCount, planAgreementCount: 0, planAgreements: [] }
 	}
 
 	private async recordStep3TodoContextUpdate(
@@ -5599,10 +5778,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						await this.runParallelSubagents()
 					} catch (err) {
 						console.error(`[initiateTaskLoop] runParallelSubagents failed:`, err)
-						await this.say(
-							"error",
-							`Parallel subagent execution failed: ${err instanceof Error ? err.message : String(err)}`,
-						)
+						if (!this.abort) {
+							await this.say(
+								"error",
+								`Parallel subagent execution failed: ${err instanceof Error ? err.message : String(err)}`,
+							)
+						}
 					}
 				}
 				break
@@ -8366,11 +8547,13 @@ function buildPostSubtaskAgreementPrompt({
 	planFiles,
 	completionResult,
 	todos,
+	availableTargets,
 }: {
 	completedTodo: TodoItem
 	planFiles: PlanFile[]
 	completionResult: string
 	todos: TodoItem[]
+	availableTargets?: string[]
 }): string {
 	const todoListText = todos
 		.map((todo) => {
@@ -8389,7 +8572,7 @@ function buildPostSubtaskAgreementPrompt({
 			.map((target) => `- ${target}`)
 			.join("\n") || "(none)"
 	const availableTargetsText =
-		collectAvailableCodeTargets(todos, planFiles)
+		(availableTargets?.length ? availableTargets : collectAvailableCodeTargets(todos, planFiles))
 			.map((target) => `- ${target}`)
 			.join("\n") || "(none)"
 
@@ -8433,10 +8616,12 @@ function buildPostRefineAgreementPrompt({
 	refinedTodo,
 	planFiles,
 	todos,
+	availableTargets,
 }: {
 	refinedTodo: TodoItem
 	planFiles: PlanFile[]
 	todos: TodoItem[]
+	availableTargets?: string[]
 }): string {
 	const todoListText = todos
 		.map((todo) => {
@@ -8455,7 +8640,7 @@ function buildPostRefineAgreementPrompt({
 			.map((target) => `- ${target}`)
 			.join("\n") || "(none)"
 	const availableTargetsText =
-		collectAvailableCodeTargets(todos, planFiles)
+		(availableTargets?.length ? availableTargets : collectAvailableCodeTargets(todos, planFiles))
 			.map((target) => `- ${target}`)
 			.join("\n") || "(none)"
 

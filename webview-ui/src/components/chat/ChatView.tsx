@@ -126,6 +126,37 @@ function isLeakedWriteTodoPlanMessage(message: ClineMessage) {
 	}
 }
 
+function normalizeTodoPlanTargets(value: unknown): TodoPlanTarget[] {
+	if (!Array.isArray(value)) {
+		return []
+	}
+	return value
+		.map((entry) => {
+			if (!entry || typeof entry !== "object") {
+				return undefined
+			}
+			const record = entry as Record<string, unknown>
+			return typeof record.target === "string" && typeof record.action === "string"
+				? { target: record.target, action: record.action }
+				: undefined
+		})
+		.filter((entry): entry is TodoPlanTarget => !!entry)
+}
+
+function mergeTodoPlanTargets(existing: TodoPlanTarget[] | undefined, incoming: TodoPlanTarget[]): TodoPlanTarget[] {
+	const merged: TodoPlanTarget[] = []
+	const seen = new Set<string>()
+	for (const target of [...(existing ?? []), ...incoming]) {
+		const key = `${target.action}:${target.target.replace(/\\/g, "/").toLowerCase()}`
+		if (seen.has(key)) {
+			continue
+		}
+		seen.add(key)
+		merged.push(target)
+	}
+	return merged
+}
+
 export interface ChatViewRef {
 	acceptInput: () => void
 }
@@ -227,6 +258,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						: []
 				const newContext =
 					typeof parsed.context === "string" && parsed.context.trim() ? parsed.context.trim() : ""
+				const newTargetStubs = normalizeTodoPlanTargets(parsed.targetStubs)
 
 				if (existing) {
 					// Accumulate: multiple write_todo_plan calls for same todo
@@ -235,6 +267,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						existing.contexts = [newContext]
 					}
 					existing.plans = parsed.replacePlans ? parsed.plans : [...existing.plans, ...parsed.plans]
+					existing.targetStubs = mergeTodoPlanTargets(existing.targetStubs, newTargetStubs)
 				} else {
 					result[parsed.todoItemId] = {
 						savedPath: parsed.savedPath,
@@ -243,6 +276,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 						todoContent: parsed.todoContent,
 						contexts: newContext ? [newContext] : [],
 						plans: parsed.plans,
+						targetStubs: newTargetStubs,
 					}
 				}
 			} catch {

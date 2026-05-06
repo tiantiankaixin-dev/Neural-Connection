@@ -58,6 +58,16 @@ function formatPlanForDisplay(plan: PlanFile) {
 	}
 }
 
+function formatTargetStubForDisplay(plan: PlanFile) {
+	const parsedHeader = parsePlanTargetHeader(plan.content)
+	const target = parsedHeader?.path ?? plan.filePath
+
+	return {
+		target,
+		action: parsedHeader?.action,
+	}
+}
+
 function collectExpectedFileTargets(todoItem: TodoItem): string[] {
 	const targets = new Set<string>()
 	const text = todoItem.content ?? ""
@@ -132,6 +142,7 @@ async function emitRefineResultForPlanRead(
 			missingTargets,
 			context: latestTodoItem.context?.trim() || "",
 			plans: plansForDisplay.map(formatPlanForDisplay),
+			targetStubs: readResult.stubPlans.map(formatTargetStubForDisplay),
 		}),
 		undefined,
 		undefined,
@@ -510,6 +521,7 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 						missingTargets: completion.missingTargets,
 						context: latestTodoItem.context?.trim() || "",
 						plans: plansForDisplay.map(formatPlanForDisplay),
+						targetStubs: readResult.stubPlans.map(formatTargetStubForDisplay),
 					}),
 					undefined,
 					undefined,
@@ -625,16 +637,8 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 		}
 	}
 
-	override async handlePartial(task: Task, block: ToolUse<"write_todo_plan">): Promise<void> {
-		const todoItemId = block.params.todo_item_id
-		const plansPreview = Array.isArray(block.params.plans) ? block.params.plans : []
-
-		const previewMsg = JSON.stringify({
-			tool: "writeTodoPlan",
-			todoItemId,
-			files: plansPreview.map((e: StructuredPlanEntry) => e.target).filter(Boolean),
-		})
-		await task.say("tool", previewMsg, undefined, block.partial).catch(() => {})
+	override async handlePartial(_task: Task, _block: ToolUse<"write_todo_plan">): Promise<void> {
+		return
 	}
 }
 
