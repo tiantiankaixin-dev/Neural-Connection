@@ -28,6 +28,11 @@ const WRITE_TODO_PLAN_DESCRIPTION = [
 	"",
 	"The plans are stored internally and automatically injected into context when working on the corresponding todo item.",
 	"",
+	"Batching:",
+	"- If the current todo item feels too large to plan clearly in one response, you may split the plan into multiple `write_todo_plan` calls for the SAME `todo_item_id`.",
+	"- Each call records one natural plan batch. After any call, wait for the tool result and STEP 3 before making the next `write_todo_plan` call.",
+	"- The system infers whether the current todo item's required plan targets are complete from the recorded plan entries; do not add any separate completion flag.",
+	"",
 	"CRITICAL — Context Isolation:",
 	"Each plan is the SOLE initial context the build agent will see when implementing that todo item, aside from the todo-level task context from `update_todo_list`. The build agent has NO access to prior exploration, conversation history, or other items' plans.",
 	"Therefore, each plan MUST be self-contained for implementation details and include:",
@@ -47,6 +52,7 @@ const WRITE_TODO_PLAN_DESCRIPTION = [
 	"",
 	"Examples:",
 	'  { "todo_item_id": "abc123", "plan_type": "file", "plans": [{"target":"src/config.ts","action":"CREATE","body":"..."},{"target":"src/server.ts","action":"MODIFY","body":"..."}] }',
+	'  { "todo_item_id": "abc123", "plan_type": "file", "plans": [{"target":"src/config.ts","action":"CREATE","body":"..."}] }',
 	'  { "todo_item_id": "abc123", "plan_type": "general", "plans": [{"target":"Architecture Overview","action":"GENERAL","body":"## Design\\n- Compare current and target architecture"}] }',
 ].join("\n")
 

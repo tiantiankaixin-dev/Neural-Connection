@@ -63,6 +63,11 @@ interface TodoPlanEntry {
 	content: string
 }
 
+interface TodoPlanTarget {
+	target: string
+	action: string
+}
+
 interface TodoPlanData {
 	savedPath?: string
 	savedPaths?: string[]
@@ -70,6 +75,7 @@ interface TodoPlanData {
 	todoContent?: string
 	contexts: string[]
 	plans: TodoPlanEntry[]
+	targetStubs?: TodoPlanTarget[]
 }
 
 function parseTodoGroupDividerText(text?: string): { todoItemId?: string } {
@@ -228,7 +234,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 					if (newContext) {
 						existing.contexts = [newContext]
 					}
-					existing.plans = [...existing.plans, ...parsed.plans]
+					existing.plans = parsed.replacePlans ? parsed.plans : [...existing.plans, ...parsed.plans]
 				} else {
 					result[parsed.todoItemId] = {
 						savedPath: parsed.savedPath,
@@ -433,7 +439,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 		const remainingTodoItemIds = refiningTodoItemIds.filter((todoItemId) => {
 			const p = todoPlansById[todoItemId]
-			return !p?.plans?.length && !p?.contexts?.length
+			return !p?.plans?.length
 		})
 
 		if (remainingTodoItemIds.length !== refiningTodoItemIds.length) {

@@ -15,6 +15,7 @@ export interface PlanFile {
 
 export interface PlanReadResult {
 	plans: PlanFile[]
+	stubPlans: PlanFile[]
 	contexts: string[]
 }
 
@@ -24,6 +25,11 @@ export interface StructuredPlanEntry {
 	target: string
 	action: PlanTargetAction
 	body: string
+}
+
+export interface PlanTargetStubEntry {
+	target: string
+	action: Exclude<PlanTargetAction, "GENERAL">
 }
 
 export interface PlanSaveResult {
@@ -36,6 +42,7 @@ export interface PlanFileAgreement {
 }
 
 const PLAN_SECTION_CONTEXT_AGREEMENTS_TITLE = "### Cross-Task Agreements Owned By This File"
+const STEP1_PLAN_TARGET_STUB_MARKER = "<!-- STEP1_PLAN_TARGET_STUB -->"
 
 interface ParsedPlanTargetHeader {
 	action: PlanTargetAction
@@ -110,6 +117,10 @@ function looksLikeProjectFilePath(value: string): boolean {
 		return true
 	}
 
+	if (/^\.[A-Za-z0-9][A-Za-z0-9._-]*$/.test(trimmed)) {
+		return true
+	}
+
 	return /^[^\s]+\.[A-Za-z0-9_-]{1,12}$/.test(trimmed)
 }
 
@@ -145,6 +156,33 @@ export function normalizeStructuredPlanEntry(
 		action: normalizePlanAction(planType, entry?.action),
 		body,
 	}
+}
+
+export function normalizePlanTargetStubEntry(entry: Partial<PlanTargetStubEntry>): PlanTargetStubEntry {
+	return {
+		target: normalizePlanTarget("file", entry?.target, ""),
+		action: normalizePlanAction("file", entry?.action) as Exclude<PlanTargetAction, "GENERAL">,
+	}
+}
+
+export function validatePlanTargetStubEntry(entry: PlanTargetStubEntry): string | null {
+	if (!entry.target) {
+		return "Each plan target entry must include a non-empty target"
+	}
+
+	if (!["CREATE", "MODIFY", "DELETE"].includes(entry.action)) {
+		return `Plan target entry for \"${entry.target}\" must use ACTION: CREATE, MODIFY, or DELETE`
+	}
+
+	if (/^[A-Za-z]:\//.test(entry.target) || entry.target.startsWith("/") || entry.target.startsWith("../")) {
+		return `Plan target entry for \"${entry.target}\" must use a relative project file path`
+	}
+
+	if (!looksLikeProjectFilePath(entry.target)) {
+		return `Plan target entry for \"${entry.target}\" must use a real relative project file path`
+	}
+
+	return null
 }
 
 export function validateStructuredPlanEntry(entry: StructuredPlanEntry, planType: PlanType): string | null {
@@ -193,6 +231,18 @@ export function buildPlanEntryContent(entry: StructuredPlanEntry): string {
 	]
 		.join("\n")
 		.trim()
+}
+
+export function buildPlanTargetStubContent(entry: PlanTargetStubEntry): string {
+	return buildPlanEntryContent({
+		target: entry.target,
+		action: entry.action,
+		body: STEP1_PLAN_TARGET_STUB_MARKER,
+	})
+}
+
+export function isPlanTargetStub(plan: PlanFile): boolean {
+	return plan.content.includes(STEP1_PLAN_TARGET_STUB_MARKER)
 }
 
 export function parsePlanTargetHeader(content: string): ParsedPlanTargetHeader | null {
@@ -651,6 +701,8 @@ export async function readPlanFiles(
 ): Promise<PlanReadResult> {
 	const resultsById: PlanFile[] = []
 	const fallbackResultsByContent: PlanFile[] = []
+	const stubResultsById: PlanFile[] = []
+	const fallbackStubResultsByContent: PlanFile[] = []
 	const contextsById: string[] = []
 	const contextsByContent: string[] = []
 	const directoriesToScan: string[] = []
@@ -700,16 +752,27 @@ export async function readPlanFiles(
 				const sectionPath = section.substring(0, newlineIdx).trim()
 				let sectionContent = section.substring(newlineIdx + 1).trim()
 				sectionContent = sectionContent.replace(/\n---\s*$/, "").trim()
-				const target = matchesId ? resultsById : fallbackResultsByContent
-				target.push({ filePath: sectionPath, content: sectionContent })
+				const planFile = { filePath: sectionPath, content: sectionContent }
+				const target = isPlanTargetStub(planFile)
+					? matchesId
+						? stubResultsById
+						: fallbackStubResultsByContent
+					: matchesId
+						? resultsById
+						: fallbackResultsByContent
+				target.push(planFile)
 			}
 		}
 	}
 
-	if (resultsById.length > 0) {
-		return { plans: resultsById, contexts: contextsById }
+	if (resultsById.length > 0 || stubResultsById.length > 0) {
+		return { plans: resultsById, stubPlans: stubResultsById, contexts: contextsById }
 	}
-	return { plans: fallbackResultsByContent, contexts: contextsByContent }
+	return {
+		plans: fallbackResultsByContent,
+		stubPlans: fallbackStubResultsByContent,
+		contexts: contextsByContent,
+	}
 }
 
 export async function appendFileAgreementsToPlanFiles(
@@ -748,6 +811,9 @@ export async function appendFileAgreementsToPlanFiles(
 	for (const agreement of normalizedAgreements) {
 		for (const planFilePath of planFilePaths) {
 			const raw = fileCache.get(planFilePath) ?? (await fs.readFile(planFilePath, "utf8"))
+			if (raw.includes(STEP1_PLAN_TARGET_STUB_MARKER)) {
+				continue
+			}
 			const result = appendFileAgreementToPlanMarkdown(raw, agreement.plan_target_path, agreement.content)
 			fileCache.set(planFilePath, result.updated)
 			if (!result.matchedSection) {

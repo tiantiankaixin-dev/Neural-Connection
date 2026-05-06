@@ -97,6 +97,7 @@ export const toolParamNames = [
 	"full_path",
 	// write_todo_plan parameters
 	"todo_item_id",
+	"item_plan_targets",
 	"plan_type",
 	"plans",
 	"summary",
@@ -133,7 +134,11 @@ export type NativeToolArgs = {
 	skill: { skill: string; args?: string | null }
 	search_files: { path: string; regex: string; file_pattern?: string | null }
 	switch_mode: { mode_slug: string; reason: string }
-	update_todo_list: { todos: string; item_contexts?: string[] }
+	update_todo_list: {
+		todos: string
+		item_contexts?: string[]
+		item_plan_targets?: Array<Array<{ target: string; action: "CREATE" | "MODIFY" | "DELETE" }>>
+	}
 	write_todo_plan: {
 		todo_item_id: string
 		plan_type: "file" | "general"

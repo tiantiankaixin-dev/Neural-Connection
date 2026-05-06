@@ -82,6 +82,11 @@ interface TodoPlanEntry {
 	content: string
 }
 
+interface TodoPlanTarget {
+	target: string
+	action: string
+}
+
 interface TodoPlanData {
 	savedPath?: string
 	savedPaths?: string[]
@@ -89,6 +94,7 @@ interface TodoPlanData {
 	todoContent?: string
 	contexts: string[]
 	plans: TodoPlanEntry[]
+	targetStubs?: TodoPlanTarget[]
 }
 
 interface DividerTurn {
@@ -920,15 +926,24 @@ export const ChatRowContent = ({
 			}
 			case "updateTodoList" as any: {
 				const todos = (tool as any).todos || []
+				const planTargets = Array.isArray((tool as any).planTargets) ? (tool as any).planTargets : undefined
 				const groupedTodos = todoGroupTodoItemId
 					? todos.filter((todo: any) => todo?.id === todoGroupTodoItemId)
 					: []
 				const displayedTodos = groupedTodos.length > 0 ? groupedTodos : todos
+				const groupedPlanTargets =
+					groupedTodos.length > 0 && Array.isArray(planTargets)
+						? groupedTodos.map((todo: any) => {
+								const index = todos.findIndex((candidate: any) => candidate?.id === todo?.id)
+								return index >= 0 ? planTargets[index] : []
+							})
+						: undefined
 				const shouldUseSingleTodoExecutionView = groupedTodos.length > 0
 				return (
 					<>
 						<UpdateTodoListToolBlock
 							todos={displayedTodos}
+							planTargets={groupedPlanTargets ?? planTargets}
 							todoPlansById={todoPlansById}
 							refiningTodoItemIds={refiningTodoItemIds}
 							activeRefiningTodoItemId={activeRefiningTodoItemId}
@@ -1882,25 +1897,39 @@ export const ChatRowContent = ({
 				case "user_edit_todos": {
 					let editedTodos: any[] = []
 					let prevTodos: any[] | undefined
+					let planTargets: any[][] | undefined
 					try {
 						const parsed = JSON.parse(message.text || "{}")
 						editedTodos = parsed.todos || []
 						prevTodos = parsed.previousTodos
+						planTargets = Array.isArray(parsed.planTargets) ? parsed.planTargets : undefined
 					} catch {
 						// ignore parse errors
 					}
+					const displayedTodos = todoGroupTodoItemId
+						? (() => {
+								const groupedTodos = editedTodos.filter((todo) => todo?.id === todoGroupTodoItemId)
+								return groupedTodos.length > 0 ? groupedTodos : editedTodos
+							})()
+						: editedTodos
+					const displayedPlanTargets =
+						todoGroupTodoItemId && Array.isArray(planTargets)
+							? (() => {
+									const groupedPlanTargets = displayedTodos
+										.map((todo) => {
+											const index = editedTodos.findIndex(
+												(candidate) => candidate?.id === todo?.id,
+											)
+											return index >= 0 ? planTargets?.[index] : []
+										})
+										.filter(Boolean)
+									return groupedPlanTargets.length > 0 ? groupedPlanTargets : planTargets
+								})()
+							: planTargets
 					return (
 						<UpdateTodoListToolBlock
-							todos={
-								todoGroupTodoItemId
-									? (() => {
-											const groupedTodos = editedTodos.filter(
-												(todo) => todo?.id === todoGroupTodoItemId,
-											)
-											return groupedTodos.length > 0 ? groupedTodos : editedTodos
-										})()
-									: editedTodos
-							}
+							todos={displayedTodos}
+							planTargets={displayedPlanTargets}
 							previousTodos={
 								todoGroupTodoItemId
 									? (() => {

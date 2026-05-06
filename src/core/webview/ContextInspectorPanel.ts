@@ -8,7 +8,7 @@ export interface InspectorLogEntry {
 	type: string
 	summary: string
 	data: any
-	marker?: "subagent"
+	marker?: "subagent" | "refine"
 }
 
 /**
@@ -29,7 +29,9 @@ export class ContextInspectorPanel {
 	private enabled = true
 	private _captureNextContext = false
 	private subagentNetworkRequestIds = new Set<number>()
+	private refineNetworkRequestIds = new Set<number>()
 	private pendingSubagentNetworkMarkers: Array<{ subagentId?: string; expiresAt: number }> = []
+	private pendingRefineNetworkMarkers: Array<{ expiresAt: number }> = []
 
 	private constructor() {}
 
@@ -128,10 +130,13 @@ export class ContextInspectorPanel {
 		provider?: string
 	}): void {
 		const isSubagent = data.metadata?.behaviorRole === "subagent" || !!data.metadata?.subagentId
+		const isRefine = !isSubagent && data.metadata?.behaviorRole === "refining"
 		const behaviorRole = data.metadata?.behaviorRole ? ` role=${data.metadata.behaviorRole}` : ""
 		const subagent = data.metadata?.subagentId ? ` subagent=${data.metadata.subagentId}` : ""
 		if (isSubagent) {
 			this.queueSubagentNetworkMarker(data.metadata?.subagentId)
+		} else if (isRefine) {
+			this.queueRefineNetworkMarker()
 		}
 		this.addEntry({
 			id: ++this.entryCounter,
@@ -140,11 +145,40 @@ export class ContextInspectorPanel {
 			type: isSubagent ? "SUBAGENT CONTEXT" : "CAPTURED CONTEXT",
 			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"}${behaviorRole}${subagent} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
 			data,
-			marker: isSubagent ? "subagent" : undefined,
+			marker: isSubagent ? "subagent" : isRefine ? "refine" : undefined,
 		})
 		if (this.panel) {
 			this.panel.webview.postMessage({ type: "contextCaptured" })
 		}
+	}
+
+	public logRefinePayloadDiagnostic(data: {
+		step: "STEP 1" | "STEP 2" | "STEP 3"
+		stage: string
+		taskId?: string
+		modelId?: string
+		provider?: string
+		stepState?: any
+		promptChecks?: any
+		historyChecks?: any
+		toolChecks?: any
+		systemPrompt?: string
+		messages?: any[]
+		metadata?: any
+		promptText?: string
+		extra?: any
+	}): void {
+		if (!this.enabled) return
+		this.queueRefineNetworkMarker()
+		this.addEntry({
+			id: ++this.entryCounter,
+			timestamp: new Date().toISOString(),
+			direction: "ext→api",
+			type: "REFINE PAYLOAD",
+			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"} ${data.step} ${data.stage} task=${data.taskId ?? "?"} msgs=${data.messages?.length ?? 0}`,
+			data,
+			marker: "refine",
+		})
 	}
 
 	// ── Network-level logging (HTTP/HTTPS interceptor) ──
@@ -162,8 +196,11 @@ export class ContextInspectorPanel {
 	}): void {
 		if (!this.enabled) return
 		const isSubagent = this.isSubagentNetworkRequest(entry) || !!this.consumeSubagentNetworkMarker()
+		const isRefine = !isSubagent && (this.isRefineNetworkRequest(entry) || !!this.consumeRefineNetworkMarker())
 		if (isSubagent) {
 			this.subagentNetworkRequestIds.add(entry.requestId)
+		} else if (isRefine) {
+			this.refineNetworkRequestIds.add(entry.requestId)
 		}
 		const bodyLen = entry.requestBody?.length ?? 0
 		let bodyPreview = ""
@@ -189,7 +226,7 @@ export class ContextInspectorPanel {
 				headers: entry.headers,
 				requestBody: this.safeParseJson(entry.requestBody),
 			},
-			marker: isSubagent ? "subagent" : undefined,
+			marker: isSubagent ? "subagent" : isRefine ? "refine" : undefined,
 		})
 	}
 
@@ -208,7 +245,9 @@ export class ContextInspectorPanel {
 	}): void {
 		if (!this.enabled) return
 		const isSubagent = this.subagentNetworkRequestIds.has(entry.requestId)
+		const isRefine = this.refineNetworkRequestIds.has(entry.requestId)
 		this.subagentNetworkRequestIds.delete(entry.requestId)
+		this.refineNetworkRequestIds.delete(entry.requestId)
 		const duration = entry.endTime ? entry.endTime - entry.startTime : 0
 		const bodyLen = entry.responseBody?.length ?? 0
 		this.addEntry({
@@ -225,7 +264,7 @@ export class ContextInspectorPanel {
 				responseHeaders: entry.responseHeaders,
 				responseBody: this.safeParseJson(entry.responseBody ?? ""),
 			},
-			marker: isSubagent ? "subagent" : undefined,
+			marker: isSubagent ? "subagent" : isRefine ? "refine" : undefined,
 		})
 	}
 
@@ -242,7 +281,9 @@ export class ContextInspectorPanel {
 	}): void {
 		if (!this.enabled) return
 		const isSubagent = this.subagentNetworkRequestIds.has(entry.requestId)
+		const isRefine = this.refineNetworkRequestIds.has(entry.requestId)
 		this.subagentNetworkRequestIds.delete(entry.requestId)
+		this.refineNetworkRequestIds.delete(entry.requestId)
 		this.addEntry({
 			id: ++this.entryCounter,
 			timestamp: new Date().toISOString(),
@@ -250,7 +291,7 @@ export class ContextInspectorPanel {
 			type: "ERROR",
 			summary: `${entry.method} ${entry.url} — ${entry.error ?? "unknown error"}`,
 			data: entry,
-			marker: isSubagent ? "subagent" : undefined,
+			marker: isSubagent ? "subagent" : isRefine ? "refine" : undefined,
 		})
 	}
 
@@ -289,10 +330,13 @@ export class ContextInspectorPanel {
 	}): void {
 		if (!this.enabled) return
 		const isSubagent = data.metadata?.behaviorRole === "subagent" || !!data.metadata?.subagentId
+		const isRefine = !isSubagent && data.metadata?.behaviorRole === "refining"
 		const behaviorRole = data.metadata?.behaviorRole ? ` role=${data.metadata.behaviorRole}` : ""
 		const subagent = data.metadata?.subagentId ? ` subagent=${data.metadata.subagentId}` : ""
 		if (isSubagent) {
 			this.queueSubagentNetworkMarker(data.metadata?.subagentId)
+		} else if (isRefine) {
+			this.queueRefineNetworkMarker()
 		}
 		this.addEntry({
 			id: ++this.entryCounter,
@@ -301,7 +345,7 @@ export class ContextInspectorPanel {
 			type: isSubagent ? "subagent.createMessage" : "createMessage",
 			summary: `[${data.provider ?? "?"}] model=${data.modelId ?? "?"}${behaviorRole}${subagent} msgs=${data.messages?.length ?? 0} sysPromptLen=${data.systemPrompt?.length ?? 0}`,
 			data,
-			marker: isSubagent ? "subagent" : undefined,
+			marker: isSubagent ? "subagent" : isRefine ? "refine" : undefined,
 		})
 	}
 
@@ -350,6 +394,20 @@ export class ContextInspectorPanel {
 		}
 	}
 
+	private isRefineNetworkRequest(entry: { requestBody?: string }): boolean {
+		const requestBody = entry.requestBody ?? ""
+		if (requestBody.includes('"behaviorRole":"refining"') || requestBody.includes("Refine Planning Reminder")) {
+			return true
+		}
+		try {
+			const parsed = JSON.parse(requestBody)
+			const metadata = parsed?.metadata ?? parsed?.extra_body?.metadata ?? parsed?.extraBody?.metadata
+			return metadata?.behaviorRole === "refining"
+		} catch {
+			return false
+		}
+	}
+
 	private queueSubagentNetworkMarker(subagentId?: string): void {
 		const now = Date.now()
 		this.pendingSubagentNetworkMarkers = this.pendingSubagentNetworkMarkers.filter(
@@ -364,6 +422,18 @@ export class ContextInspectorPanel {
 			(marker) => marker.expiresAt > now,
 		)
 		return this.pendingSubagentNetworkMarkers.shift()
+	}
+
+	private queueRefineNetworkMarker(): void {
+		const now = Date.now()
+		this.pendingRefineNetworkMarkers = this.pendingRefineNetworkMarkers.filter((marker) => marker.expiresAt > now)
+		this.pendingRefineNetworkMarkers.push({ expiresAt: now + 10_000 })
+	}
+
+	private consumeRefineNetworkMarker(): { expiresAt: number } | undefined {
+		const now = Date.now()
+		this.pendingRefineNetworkMarkers = this.pendingRefineNetworkMarkers.filter((marker) => marker.expiresAt > now)
+		return this.pendingRefineNetworkMarkers.shift()
 	}
 
 	private addEntry(entry: InspectorLogEntry): void {
@@ -449,6 +519,7 @@ export class ContextInspectorPanel {
 			--c-ext-api: #569cd6;
 			--c-api-ext: #c586c0;
 			--c-subagent: #4ec9b0;
+			--c-refine: #dcdcaa;
 		}
 		* { box-sizing: border-box; margin: 0; padding: 0; }
 		body {
@@ -545,6 +616,14 @@ export class ContextInspectorPanel {
 		.log-entry.subagent .summary {
 			color: var(--c-subagent);
 		}
+		.log-entry.refine {
+			border-left: 3px solid var(--c-refine);
+			background: rgba(220,220,170,0.06);
+		}
+		.log-entry.refine .msg-type,
+		.log-entry.refine .summary {
+			color: var(--c-refine);
+		}
 		.log-entry .copy-btn {
 			background: transparent; border: 1px solid #555; color: #aaa; font-size: 10px;
 			padding: 1px 5px; border-radius: 3px; cursor: pointer; flex-shrink: 0; margin-right: 2px;
@@ -569,6 +648,7 @@ export class ContextInspectorPanel {
 		.badge.ext-api  { background: rgba(86,156,214,0.15);  color: var(--c-ext-api); }
 		.badge.api-ext  { background: rgba(197,134,192,0.15); color: var(--c-api-ext); }
 		.badge.subagent { background: rgba(78,201,176,0.18); color: var(--c-subagent); }
+		.badge.refine { background: rgba(220,220,170,0.18); color: var(--c-refine); }
 		.log-entry .msg-type { color: var(--accent); min-width: 60px; flex-shrink: 0; }
 		.log-entry .summary { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 		.detail-pane {
@@ -687,7 +767,8 @@ export class ContextInspectorPanel {
 		}
 
 		function markerClass(entry) {
-			return entry && entry.marker === 'subagent' ? ' subagent' : '';
+			if (!entry || !entry.marker) return '';
+			return ' ' + entry.marker;
 		}
 
 		function matchesFilter(entry) {
@@ -724,12 +805,12 @@ export class ContextInspectorPanel {
 			const row = document.createElement('div');
 			row.className = 'log-entry' + markerClass(entry);
 			row.setAttribute('data-id', entry.id);
-			const badgeClassName = entry.marker === 'subagent' ? 'subagent' : badgeClass(entry.direction);
+			const badgeClassName = entry.marker === 'subagent' ? 'subagent' : entry.marker === 'refine' ? 'refine' : badgeClass(entry.direction);
 			row.innerHTML =
 				'<button class="copy-btn" title="Copy JSON">Copy</button>' +
 				'<span class="seq">#' + entry.id + '</span>' +
 				'<span class="time">' + formatTime(entry.timestamp) + '</span>' +
-				'<span class="badge ' + badgeClassName + '">' + escapeHtml(entry.marker === 'subagent' ? 'SUBAGENT' : entry.direction) + '</span>' +
+				'<span class="badge ' + badgeClassName + '">' + escapeHtml(entry.marker === 'subagent' ? 'SUBAGENT' : entry.marker === 'refine' ? 'REFINE' : entry.direction) + '</span>' +
 				'<span class="msg-type">' + escapeHtml(entry.type) + '</span>' +
 				'<span class="summary">' + escapeHtml(entry.summary) + '</span>';
 

@@ -81,6 +81,7 @@ import { defaultModeSlug, getModeBySlug, getGroupName } from "../../shared/modes
 import { DiffStrategy, type ToolUse, type ToolParamName, type ToolResponse, toolParamNames } from "../../shared/tools"
 import { getModelMaxOutputTokens } from "../../shared/api"
 import { renderAgreementChecklistBullets } from "../../shared/agreement-checklist"
+import { formatLanguage } from "../../shared/language"
 
 // services
 import { UrlContentFetcher } from "../../services/browser/UrlContentFetcher"
@@ -107,6 +108,7 @@ import { getTaskDirectoryPath, getTaskOptimizePlanPath } from "../../utils/stora
 // prompts
 import { formatResponse } from "../prompts/responses"
 import { SYSTEM_PROMPT } from "../prompts/system"
+import { addCustomInstructions, getSystemInfoSection } from "../prompts/sections"
 import { buildNativeToolsArrayWithRestrictions } from "./build-tools"
 
 // core modules
@@ -164,7 +166,8 @@ import {
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
-const STEP3_AGREEMENT_PASS_TIMEOUT_MS = 30_000
+const STEP3_AGREEMENT_PASS_TIMEOUT_MS = 60_000
+const STEP3_REFINE_PLAN_BATCH_SIZE = 5
 const REFINE_RESUME_STATE_FILE = "refine_state.json"
 const SUBAGENT_RESUME_STATE_FILE = "subagent_state.json"
 
@@ -217,6 +220,7 @@ type PostSubtaskAgreementPassOutcome = {
 type RefineResumeState = {
 	status: "in_progress"
 	activeTodoItemIds: string[]
+	step1Complete: boolean
 	updatedAt: number
 }
 
@@ -254,6 +258,113 @@ function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string)
 		}),
 		timeoutPromise,
 	])
+}
+
+function formatStep3ApiFailureMessage(message: string): string {
+	const lowerMessage = message.toLowerCase()
+	if (message.includes("timed out after")) {
+		return `${message}. STEP 3 did not finish, so no shared agreements were merged into task context or plan sections. This agreement pass is treated as failed.`
+	}
+	if (lowerMessage.includes("invalid json response")) {
+		return `${message}. The API provider returned a malformed/non-JSON response before STEP 3 could parse the agreement JSON. No shared agreements were merged into task context or plan sections. This agreement pass is treated as failed; retry only after the provider/API is stable.`
+	}
+	if (
+		lowerMessage.includes("quota") ||
+		lowerMessage.includes("rate") ||
+		lowerMessage.includes("too quickly") ||
+		lowerMessage.includes("token-limit")
+	) {
+		return `${message}. STEP 3 could not complete because the API provider rejected or throttled the request. No shared agreements were merged into task context or plan sections. This agreement pass is treated as failed; retry after quota/rate limits recover.`
+	}
+	return message
+}
+
+type RefinePayloadStep = "STEP 1" | "STEP 2" | "STEP 3"
+
+function getRefinePayloadStep(refineStep1Complete: boolean): RefinePayloadStep {
+	return refineStep1Complete ? "STEP 2" : "STEP 1"
+}
+
+function apiMessageContentToText(content: unknown): string {
+	if (typeof content === "string") {
+		return content
+	}
+	if (Array.isArray(content)) {
+		return content.map((item) => apiMessageContentToText(item)).join("\n")
+	}
+	if (content && typeof content === "object") {
+		const record = content as Record<string, unknown>
+		if (typeof record.text === "string") {
+			return record.text
+		}
+		if (typeof record.content === "string") {
+			return record.content
+		}
+		try {
+			return JSON.stringify(record)
+		} catch {
+			return ""
+		}
+	}
+	return ""
+}
+
+function buildRefineHistoryDiagnostics(messages: ApiMessage[]): Record<string, unknown> {
+	const recentMessages = messages.slice(-8).map((message) => {
+		const text = apiMessageContentToText((message as any).content)
+		return {
+			role: (message as any).role,
+			textPreview: text.slice(0, 1200),
+			hasToolResult: text.includes("tool_result") || text.includes("Tool") || text.includes("[ERROR]"),
+			hasItemPlanTargets: text.includes("item_plan_targets"),
+			hasTargetsRetry: text.includes("RETRY REFINE STEP 1") || text.includes("Retry `update_todo_list`"),
+		}
+	})
+	const recentText = recentMessages.map((message) => message.textPreview).join("\n")
+	return {
+		messageCount: messages.length,
+		recentRoles: recentMessages.map((message) => message.role),
+		recentContainsItemPlanTargets: recentText.includes("item_plan_targets"),
+		recentContainsTargetsRequiredError: recentText.includes("item_plan_targets is required"),
+		recentContainsTargetsRetry:
+			recentText.includes("RETRY REFINE STEP 1") || recentText.includes("Retry `update_todo_list`"),
+		recentMessages,
+	}
+}
+
+function buildRefineToolDiagnostics(tools: OpenAI.Chat.ChatCompletionTool[]): Record<string, unknown> {
+	const toolNames = tools.map((tool) => ("function" in tool ? tool.function.name : "unknown"))
+	const updateTodoListTool = tools.find((tool) => "function" in tool && tool.function.name === "update_todo_list")
+	const writeTodoPlanTool = tools.find((tool) => "function" in tool && tool.function.name === "write_todo_plan")
+	const updateFunction =
+		updateTodoListTool && "function" in updateTodoListTool ? updateTodoListTool.function : undefined
+	const parameters = updateFunction?.parameters as any
+	const required = Array.isArray(parameters?.required) ? parameters.required : []
+	const itemPlanTargets = parameters?.properties?.item_plan_targets
+	return {
+		toolNames,
+		hasUpdateTodoList: !!updateTodoListTool,
+		hasWriteTodoPlan: !!writeTodoPlanTool,
+		updateTodoListStrict: updateFunction?.strict === true,
+		updateTodoListRequired: required,
+		itemPlanTargetsRequired: required.includes("item_plan_targets"),
+		itemPlanTargetsSchemaPresent: !!itemPlanTargets,
+		itemPlanTargetsDescriptionHasRequired:
+			typeof itemPlanTargets?.description === "string" && itemPlanTargets.description.includes("Required"),
+	}
+}
+
+function buildRefinePromptDiagnostics(systemPrompt: string): Record<string, boolean> {
+	return {
+		hasRefinePlanningReminder: systemPrompt.includes("Refine Planning Reminder"),
+		hasStep1: systemPrompt.includes("STEP 1"),
+		hasStep2: systemPrompt.includes("STEP 2"),
+		hasStep3: systemPrompt.includes("STEP 3"),
+		hasItemPlanTargets: systemPrompt.includes("item_plan_targets"),
+		hasFileTargetExtraction: systemPrompt.includes("file-target extraction"),
+		hasNonEmptyTargetsRequirement: systemPrompt.includes("non-empty inner array"),
+		hasWriteTodoPlan: systemPrompt.includes("write_todo_plan"),
+	}
 }
 
 function escapeRegExp(value: string): string {
@@ -1008,6 +1119,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	pendingTodoEdit: { oldTodos: TodoItem[]; newTodos: TodoItem[] } | null = null
 	pendingRefineRequest: { todoItemIds: string[] } | null = null
 	activeRefineTodoItemIds: string[] | null = null
+	refineStep1Complete = false
 	isRefineMode = false
 	postRefineDividerPending = false
 	/**
@@ -1868,10 +1980,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	public async persistRefineResumeState(activeTodoItemIds?: string[] | null): Promise<void> {
 		try {
 			const statePath = await this.getRefineResumeStatePath()
-			const ids = activeTodoItemIds ?? this.activeRefineTodoItemIds ?? []
+			const ids = this.refineStep1Complete ? (activeTodoItemIds ?? this.activeRefineTodoItemIds ?? []) : []
 			const state: RefineResumeState = {
 				status: "in_progress",
 				activeTodoItemIds: ids,
+				step1Complete: this.refineStep1Complete,
 				updatedAt: Date.now(),
 			}
 			await fs.mkdir(path.dirname(statePath), { recursive: true })
@@ -1899,6 +2012,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			return {
 				status: "in_progress",
 				activeTodoItemIds: Array.isArray(parsed.activeTodoItemIds) ? parsed.activeTodoItemIds : [],
+				step1Complete: parsed.step1Complete === true,
 				updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
 			}
 		} catch {
@@ -2038,7 +2152,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		if (!state) {
 			return undefined
 		}
-		if (!this.isRefineMode && state.activeTodoItemIds.length === 0) {
+		if (!this.isRefineMode && state.step1Complete && state.activeTodoItemIds.length === 0) {
 			await this.clearRefineResumeState()
 			return undefined
 		}
@@ -2046,10 +2160,25 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const todoList =
 			this.todoList && this.todoList.length > 0 ? this.formatTodoListForPrompt(this.todoList) : "(not available)"
 		const updatedAt = state.updatedAt > 0 ? new Date(state.updatedAt).toISOString() : "unknown"
+		if (!state.step1Complete) {
+			return [
+				this.isRefineMode ? "[REFINE IN PROGRESS]" : "[REFINE IN PROGRESS - RESUME CHECK]",
+				"STEP 1 has not succeeded yet. The next refine mutation must be exactly one `update_todo_list` call.",
+				"The `update_todo_list` call MUST include `todos`, `item_contexts`, and non-empty aligned `item_plan_targets` for every active or pending todo item.",
+				"Any earlier successful `update_todo_list` call without `item_plan_targets` was only the pre-refine task list update. It does NOT count as refine STEP 1 and must not be copied.",
+				"Do NOT call `write_todo_plan` until STEP 1 succeeds and returns the new refined todo ids.",
+				"",
+				`Refine state last updated: ${updatedAt}`,
+				"",
+				"Current todo list:",
+				todoList,
+			].join("\n")
+		}
 		const writeTodoPlanFormatReminder = [
 			"Do not copy compact previous_context placeholders such as plans=[object Object]; they are lossy summaries, not valid tool arguments.",
 			"Every write_todo_plan plans entry must include target, action, and body.",
 			'For plan_type="general", target must be a descriptive section title and action must be "GENERAL".',
+			"If the current todo feels too large to plan clearly in one response, you may split it across multiple write_todo_plan calls for the same todo_item_id.",
 		].join("\n")
 		if (this.isRefineMode) {
 			return [
@@ -2166,6 +2295,21 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		if (!state) {
 			return false
 		}
+		if (!state.step1Complete) {
+			return true
+		}
+		if (state.activeTodoItemIds.length === 0) {
+			await this.clearRefineResumeState()
+			return false
+		}
+		return true
+	}
+
+	private async hasCompletedRefineStep1ResumeState(): Promise<boolean> {
+		const state = await this.readRefineResumeState()
+		if (!state?.step1Complete) {
+			return false
+		}
 		if (state.activeTodoItemIds.length === 0) {
 			await this.clearRefineResumeState()
 			return false
@@ -2178,12 +2322,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		if (!state) {
 			return false
 		}
+		if (!state.step1Complete) {
+			this.activeRefineTodoItemIds = null
+			this.refineStep1Complete = false
+			this.isRefineMode = true
+			await this.persistRefineResumeState([])
+			return true
+		}
 		const existingTodoIds = new Set((this.todoList ?? []).map((todo) => todo.id))
 		const activeTodoItemIds = state.activeTodoItemIds.filter((id) => existingTodoIds.has(id))
 		if (activeTodoItemIds.length === 0) {
 			return false
 		}
 		this.activeRefineTodoItemIds = activeTodoItemIds
+		this.refineStep1Complete = state.step1Complete
 		this.isRefineMode = true
 		await this.persistRefineResumeState(activeTodoItemIds)
 		return true
@@ -2194,9 +2346,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			return undefined
 		}
 		const refinePrompt = buildRefinePrompt(this.formatTodoListForPrompt(todos))
-		this.activeRefineTodoItemIds = todos.map((todo) => todo.id)
+		this.activeRefineTodoItemIds = null
+		this.refineStep1Complete = false
 		this.isRefineMode = true
-		await this.persistRefineResumeState(this.activeRefineTodoItemIds)
+		await this.persistRefineResumeState([])
 		await this.say(
 			"todo_item_divider",
 			JSON.stringify({ content: "Refine", todoItemId: "__refine__" }),
@@ -4039,24 +4192,31 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							fileAgreementCount: 0,
 							skippedReason: "missing attempt_completion result",
 						}
-				if (subagentResult.success) {
+				const agreementPassSucceeded = agreementPass.executed && !agreementPass.error
+				const overallSuccess = subagentResult.success && agreementPassSucceeded
+				if (overallSuccess) {
 					await this.markSubagentResumeTodoCompleted(todo.id)
 				}
 
 				return {
 					subagentResult,
 					agreementPass,
+					overallSuccess,
 				}
 			}),
 		)
 
 		// Collect results
 		const summaryParts: string[] = []
+		let allSucceeded = true
 		for (let i = 0; i < results.length; i++) {
 			const result = results[i]
 			const todo = runnerEntries[i]?.todo ?? todosToRun[i]
 			if (result.status === "fulfilled") {
-				const { subagentResult, agreementPass } = result.value
+				const { subagentResult, agreementPass, overallSuccess } = result.value
+				if (!overallSuccess) {
+					allSucceeded = false
+				}
 				const agreementActions: string[] = []
 				if (agreementPass.appendedCount > 0) {
 					agreementActions.push(
@@ -4069,25 +4229,36 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					)
 				}
 				const agreementSummary = agreementPass.error
-					? ` (STEP 3 error: ${agreementPass.error})`
+					? ` (STEP 3 failed: ${agreementPass.error}; subtask not marked complete)`
 					: !agreementPass.executed
-						? ` (STEP 3 skipped: ${agreementPass.skippedReason ?? "not triggered"})`
+						? ` (STEP 3 skipped: ${agreementPass.skippedReason ?? "not triggered"}; subtask not marked complete)`
 						: agreementActions.length > 0
 							? ` (STEP 3 ${agreementActions.join(" and ")})`
 							: ` (STEP 3 checked: no new agreements)`
 				summaryParts.push(
-					`- **${todo.content}**: ${subagentResult.success ? "✅ " + (subagentResult.completionResult ?? "Done") : "❌ " + (subagentResult.error ?? "Failed")}${agreementSummary}`,
+					`- **${todo.content}**: ${overallSuccess ? "✅ " + (subagentResult.completionResult ?? "Done") : "❌ " + (subagentResult.success ? (subagentResult.completionResult ?? "Subagent completed") : (subagentResult.error ?? "Failed"))}${agreementSummary}`,
 				)
 			} else {
+				allSucceeded = false
 				summaryParts.push(`- **${todo.content}**: ❌ Error: ${result.reason}`)
 			}
 		}
 
 		// Emit aggregated results summary
-		await this.say("text", `\n\n---\n**Parallel execution complete:**\n${summaryParts.join("\n")}\n---`)
+		await this.say(
+			"text",
+			`\n\n---\n**Parallel execution ${allSucceeded ? "complete" : "incomplete"}:**\n${summaryParts.join("\n")}\n---`,
+		)
 
-		await this.clearSubagentResumeState()
-		console.log(`[runParallelSubagents] All ${runnerEntries.length} subagents finished for task ${taskId}`)
+		if (allSucceeded) {
+			await this.clearSubagentResumeState()
+			console.log(`[runParallelSubagents] All ${runnerEntries.length} subagents finished for task ${taskId}`)
+		} else {
+			this.subagentResumeReviewPending = true
+			console.warn(
+				`[runParallelSubagents] Parallel execution incomplete for task ${taskId}; unfinished subagent state preserved.`,
+			)
+		}
 	}
 
 	public applyTaskContextAgreementsToPlanEntries(
@@ -4110,7 +4281,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	 * mines the just-written plan for concrete cross-task agreements, then
 	 * appends them to OTHER refine items' contexts before they are refined.
 	 */
-	public enqueuePostRefineAgreementPass(
+	public async enqueuePostRefineAgreementPass(
 		refinedTodo: TodoItem,
 		planFiles: PlanFile[],
 	): Promise<PostSubtaskAgreementPassOutcome> {
@@ -4122,17 +4293,48 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				skippedReason: "no plan files for refine-time agreement pass",
 			})
 		}
-		return this.enqueueAgreementPass(
-			refinedTodo,
-			(todos) =>
-				buildPostRefineAgreementPrompt({
-					refinedTodo,
-					planFiles,
-					todos,
-				}),
-			planFiles,
-			{ updateAllTodoContexts: true },
-		)
+		const batches: PlanFile[][] = []
+		for (let i = 0; i < planFiles.length; i += STEP3_REFINE_PLAN_BATCH_SIZE) {
+			batches.push(planFiles.slice(i, i + STEP3_REFINE_PLAN_BATCH_SIZE))
+		}
+
+		let aggregate: PostSubtaskAgreementPassOutcome = {
+			executed: true,
+			appendedCount: 0,
+			fileAgreementCount: 0,
+			planAgreementCount: 0,
+			planAgreements: [],
+		}
+
+		for (const batch of batches) {
+			const outcome = await this.enqueueAgreementPass(
+				refinedTodo,
+				(todos) =>
+					buildPostRefineAgreementPrompt({
+						refinedTodo,
+						planFiles: batch,
+						todos,
+					}),
+				batch,
+				{ updateAllTodoContexts: true },
+			)
+
+			aggregate = {
+				executed: aggregate.executed && outcome.executed,
+				appendedCount: aggregate.appendedCount + outcome.appendedCount,
+				fileAgreementCount: aggregate.fileAgreementCount + outcome.fileAgreementCount,
+				planAgreementCount: (aggregate.planAgreementCount ?? 0) + (outcome.planAgreementCount ?? 0),
+				planAgreements: [...(aggregate.planAgreements ?? []), ...(outcome.planAgreements ?? [])],
+				skippedReason: outcome.skippedReason ?? aggregate.skippedReason,
+				error: outcome.error ?? aggregate.error,
+			}
+
+			if (!outcome.executed || outcome.error) {
+				return aggregate
+			}
+		}
+
+		return aggregate
 	}
 
 	private enqueuePostSubtaskAgreementPass(
@@ -4201,6 +4403,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				skippedReason: "todo list unavailable",
 			}
 		}
+		const agreementPrompt = buildPrompt(currentTodos)
 
 		// Visible signal that Step 3 is running — so the user can see it in chat
 		// even when no agreements end up being appended.
@@ -4216,24 +4419,51 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		let rawResponse: string
 		try {
+			ContextInspectorPanel.getInstance().logRefinePayloadDiagnostic({
+				step: "STEP 3",
+				stage: "singleCompletion",
+				taskId: this.taskId,
+				modelId: this.api.getModel().id,
+				provider: this.apiConfiguration?.apiProvider,
+				stepState: {
+					refineStep1Complete: this.refineStep1Complete,
+					activeRefineTodoItemIds: this.activeRefineTodoItemIds,
+					focusTodoId: focusTodo.id,
+					focusTodoContent: focusTodo.content,
+					planFileCount: planFiles.length,
+				},
+				promptChecks: {
+					hasStep3: agreementPrompt.includes("STEP 3"),
+					hasAgreementSchema: agreementPrompt.includes("file_agreements"),
+					hasPlanTargets: agreementPrompt.includes("target"),
+				},
+				promptText: agreementPrompt,
+				extra: {
+					planFiles: planFiles.map((plan) => ({
+						filePath: plan.filePath,
+						contentPreview: plan.content.slice(0, 2000),
+					})),
+				},
+			})
 			rawResponse = await withTimeout(
-				singleCompletionHandler(this.apiConfiguration, buildPrompt(currentTodos)),
+				singleCompletionHandler(this.apiConfiguration, agreementPrompt),
 				STEP3_AGREEMENT_PASS_TIMEOUT_MS,
 				`STEP 3 agreement pass for "${focusTodo.content}"`,
 			)
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
+			const failureMessage = formatStep3ApiFailureMessage(message)
 			console.error(`[STEP 3] agreement pass API call failed for "${focusTodo.content}":`, error)
 			await this.say(
 				"text",
-				`\u26a0\ufe0f STEP 3 error for "${focusTodo.content}": ${message}`,
+				`\u26a0\ufe0f STEP 3 error for "${focusTodo.content}": ${failureMessage}`,
 				undefined,
 				undefined,
 				undefined,
 				undefined,
 				{ isNonInteractive: true },
 			)
-			return { executed: true, appendedCount: 0, fileAgreementCount: 0, error: message }
+			return { executed: true, appendedCount: 0, fileAgreementCount: 0, error: failureMessage }
 		}
 
 		let agreementResponse: PostSubtaskAgreementResponse
@@ -4304,6 +4534,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			)
 		}
 		let planAgreementCount = 0
+		let planAgreementError: string | undefined
 		const planAgreements = buildPlanAgreementsFromFileAgreements(fileAgreements)
 		if (planAgreements.length > 0) {
 			try {
@@ -4326,6 +4557,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					`[STEP 3] failed to distribute agreements into refine plan sections for "${focusTodo.content}":`,
 					error,
 				)
+				planAgreementError = message
 				await this.say(
 					"text",
 					`\u26a0\ufe0f STEP 3 plan agreement distribution error for "${focusTodo.content}": ${message}`,
@@ -4335,6 +4567,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					undefined,
 					{ isNonInteractive: true },
 				)
+			}
+		}
+
+		if (planAgreementError) {
+			return {
+				executed: true,
+				appendedCount,
+				fileAgreementCount,
+				planAgreementCount,
+				planAgreements,
+				error: `plan agreement distribution failed: ${planAgreementError}`,
 			}
 		}
 
@@ -4648,6 +4891,20 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 		} catch (err) {
 			console.warn("[Task] Failed to create summary directory (non-critical):", err)
+		}
+
+		// Restore refine mode from persisted resume state so that subsequent
+		// API calls use the correct system prompt and refine-only tool set.
+		// Without this, a resumed task falls back to normal mode (28 tools)
+		// even though the conversation history contains refine prompts,
+		// causing the model to repeat STEP 1 indefinitely.
+		if (!this.isRefineMode) {
+			const restored = await this.restoreRefineModeFromResumeState()
+			if (restored) {
+				console.log(
+					`[Task.resumeTaskFromHistory] Restored refine mode: step1Complete=${this.refineStep1Complete}, activeIds=${JSON.stringify(this.activeRefineTodoItemIds)}`,
+				)
+			}
 		}
 
 		// Restore needsContextCompression: if clineMessages show a completed task
@@ -6591,7 +6848,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				return basePrompt
 			}
 
-			let planResult: Awaited<ReturnType<typeof readPlanFiles>> = { plans: [], contexts: [] }
+			let planResult: Awaited<ReturnType<typeof readPlanFiles>> = { plans: [], stubPlans: [], contexts: [] }
 			try {
 				planResult = await readPlanFiles(
 					this.globalStoragePath,
@@ -6606,6 +6863,92 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 			return `${basePrompt}\n\n${buildOpencodeBuildSystemPrompt(currentTodo, this.todoList ?? [], planResult.plans)}`
 		})()
+	}
+
+	private async getRefineBaseSystemPrompt(): Promise<string> {
+		const provider = this.providerRef.deref()
+		if (!provider) {
+			throw new Error("Provider not available")
+		}
+
+		const state = await provider.getState()
+		const { mode, customModePrompts, customInstructions, language, apiConfiguration, enableSubfolderRules } =
+			state ?? {}
+		const rooIgnoreInstructions = this.rooIgnoreController?.getInstructions()
+		const refineMode = mode ?? defaultModeSlug
+		const modeCustomInstructions = customModePrompts?.[refineMode]?.customInstructions ?? ""
+		const modelInfo = this.api.getModel().info
+		const projectInstructions = await addCustomInstructions(
+			modeCustomInstructions,
+			customInstructions || "",
+			this.cwd,
+			refineMode,
+			{
+				language: language ?? formatLanguage(vscode.env.language),
+				rooIgnoreInstructions,
+				settings: {
+					todoListEnabled: apiConfiguration?.todoListEnabled ?? true,
+					useAgentRules:
+						vscode.workspace.getConfiguration(Package.name).get<boolean>("useAgentRules") ?? true,
+					enableSubfolderRules: enableSubfolderRules ?? false,
+					isStealthModel: modelInfo?.isStealthModel,
+					suppressCompletionInstructions: true,
+				},
+			},
+		)
+
+		return `You are a refine planning agent preparing isolated execution packages for parallel subagents.
+
+You are not the build/execution agent. You must not implement code changes, edit files, run mutating commands, complete the task, or present final results.
+
+Your purpose in this phase:
+- Understand the user's request and the existing codebase using read-only exploration.
+- Rewrite the current todo list into architecture-based implementation units.
+- Ensure every active or pending todo item can later be executed by exactly one isolated subagent.
+- Create task contexts, file-target ownership, and plans that make each subagent self-contained without seeing sibling tasks.
+
+====
+
+REFINE TOOL USE
+
+Use the provider-native tool-calling mechanism. Do not use XML markup.
+Use only the tools actually provided in this refine session.
+
+Allowed refine actions:
+- Read/search/list project information.
+- Ask focused follow-up questions when required.
+- Call update_todo_list to rewrite the task list, attach task contexts, and seed exact file targets.
+- After STEP 1 succeeds, call write_todo_plan to record implementation plans for the rewritten todo items.
+
+Forbidden refine actions:
+- Do not edit, create, delete, or overwrite project files.
+- Do not run commands that mutate files, install packages, change configuration, start/stop services, or modify system state.
+- Do not call attempt_completion.
+- Do not switch modes.
+- Do not create execution subtasks manually; parallel subagents are launched automatically after refine planning is complete.
+
+Tool selection rules:
+1. First decide what information is missing.
+2. Prefer targeted code search/read tools over broad exploration when the likely files or symbols are known.
+3. Use broad search/listing only when the relevant subsystem or files are unknown.
+4. Do not assume tool results. Base each next step on the returned evidence.
+5. When multiple independent read-only lookups are useful, issue them together if the API/tooling supports it.
+
+====
+
+REFINE PATH AND SAFETY RULES
+
+- Project base directory: ${this.cwd.toPosix()}
+- All file paths in todos, task contexts, and plans must be relative to the project base directory.
+- Respect ignore/protection rules included in the custom instructions section.
+- environment_details is automatically generated context, not a direct user request.
+- Use environment_details to understand visible files, open tabs, terminals, workspace structure, and project state when relevant.
+- Ask the user only when a real requirement, product decision, or unsafe ambiguity cannot be resolved from code/context.
+- Do not ask for file paths or facts that can be discovered with available read-only tools.
+
+${getSystemInfoSection(this.cwd)}
+
+${projectInstructions}`
 	}
 
 	/**
@@ -6663,12 +7006,21 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		// in the caller.
 		Task.lastGlobalApiRequestTime = performance.now()
 
+		if (this.isRefineMode && !this.refineStep1Complete && this.activeRefineTodoItemIds?.length) {
+			this.activeRefineTodoItemIds = null
+			await this.persistRefineResumeState([])
+		}
+
 		let systemPrompt: string
 		if (this.isRefineMode) {
-			// Keep full project context (rules, tools, system info) — skip the build-switch
-			// portion only, then append the OpenCode plan.txt constraint.
-			// Matches OpenCode pattern: plan.txt is additive, not a system prompt replacement.
-			systemPrompt = (await this.getSystemPrompt(/* skipBuildSwitch */ true)) + "\n\n" + buildRefineSystemPrompt()
+			const currentRefineTodoId = this.activeRefineTodoItemIds?.[0]
+			const currentRefineTodo = currentRefineTodoId
+				? this.todoList?.find((t) => t.id === currentRefineTodoId)
+				: undefined
+			systemPrompt =
+				(await this.getRefineBaseSystemPrompt()) +
+				"\n\n" +
+				buildRefineSystemPrompt(this.refineStep1Complete, currentRefineTodo)
 		} else {
 			systemPrompt = await this.getSystemPrompt()
 		}
@@ -6773,11 +7125,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		let allowedFunctionNames: string[] | undefined
 
 		const hasRefineResumeState = await this.hasRefineResumeState()
+		const hasCompletedRefineStep1ResumeState = await this.hasCompletedRefineStep1ResumeState()
 		const hasSubagentResumeState = !this.isRefineMode && (await this.shouldReviewSubagentResumeState())
 
 		if (this.isRefineMode) {
 			const { getRefineOnlyTools } = await import("../prompts/tools/native-tools")
 			allTools = getRefineOnlyTools({ supportsImages: (modelInfo as any)?.supportsImages === true })
+			if (!this.refineStep1Complete) {
+				allTools = allTools.filter((tool) => !("function" in tool) || tool.function.name !== "write_todo_plan")
+			}
+			const refineToolNames = allTools.map((t) => ("function" in t ? t.function.name : "unknown")).join(", ")
+			console.log(
+				`[build-tools DEBUG] Refine tools (${allTools.length}): ${refineToolNames}, step1Complete=${this.refineStep1Complete}, activeRefineTodoItemIds=${JSON.stringify(this.activeRefineTodoItemIds)}`,
+			)
 		} else {
 			// Gemini requires all tool definitions to be present for history compatibility,
 			// but uses allowedFunctionNames to restrict which tools can be called.
@@ -6808,7 +7168,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				allTools = toolsResult.tools
 				allowedFunctionNames = toolsResult.allowedFunctionNames
 			}
-			if (hasRefineResumeState) {
+			if (hasCompletedRefineStep1ResumeState) {
 				const { default: writeTodoPlan } = await import("../prompts/tools/native-tools/write_todo_plan")
 				if (!allTools.some((tool) => "function" in tool && tool.function.name === "write_todo_plan")) {
 					allTools = [...allTools, writeTodoPlan]
@@ -6858,6 +7218,34 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		{
 			const inspector = ContextInspectorPanel.getInstance()
 			inspector.show()
+			if (this.isRefineMode) {
+				const currentRefineTodoId = this.activeRefineTodoItemIds?.[0]
+				const currentRefineTodo = currentRefineTodoId
+					? this.todoList?.find((todo) => todo.id === currentRefineTodoId)
+					: undefined
+				inspector.logRefinePayloadDiagnostic({
+					step: getRefinePayloadStep(this.refineStep1Complete),
+					stage: "createMessage",
+					taskId: this.taskId,
+					modelId: this.api.getModel().id,
+					provider: this.apiConfiguration?.apiProvider,
+					stepState: {
+						refineStep1Complete: this.refineStep1Complete,
+						activeRefineTodoItemIds: this.activeRefineTodoItemIds,
+						currentRefineTodoId,
+						currentRefineTodoContent: currentRefineTodo?.content,
+						subagentsPending: this.subagentsPending,
+						hasRefineResumeState,
+						retryAttempt,
+					},
+					promptChecks: buildRefinePromptDiagnostics(systemPrompt),
+					historyChecks: buildRefineHistoryDiagnostics(cleanConversationHistory as ApiMessage[]),
+					toolChecks: buildRefineToolDiagnostics(allTools),
+					systemPrompt,
+					messages: cleanConversationHistory as any[],
+					metadata,
+				})
+			}
 			inspector.logCapturedContext({
 				systemPrompt,
 				messages: cleanConversationHistory as any[],
@@ -7228,6 +7616,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						}
 						return []
 					}
+					if (
+						!this.refineStep1Complete &&
+						block.name === "update_todo_list" &&
+						(!block.input ||
+							typeof block.input !== "object" ||
+							!("item_plan_targets" in (block.input as Record<string, unknown>)))
+					) {
+						if (typeof block.id === "string") {
+							filteredToolUseIds.add(block.id)
+						}
+						return []
+					}
 				}
 
 				if (block?.type === "tool_result" && typeof block.tool_use_id === "string") {
@@ -7555,110 +7955,134 @@ Environment:
 // System prompt is guaranteed present in every API call, unlike user messages which can
 // be stripped by buildEffectiveHistory or merged by mergeConsecutiveApiMessages.
 // Source: https://github.com/anomalyco/opencode  plan.txt + prompt.ts insertReminders()
-function buildRefineSystemPrompt(): string {
-	return `<system-reminder>
-# Plan Mode - System Reminder
+function buildRefineSystemPrompt(refineStep1Complete: boolean, currentRefineTodo?: TodoItem): string {
+	const workflowState = refineStep1Complete
+		? [
+				"## Current Refine State",
+				"",
+				"STEP 1 is already complete. The refined todo list and STEP 1 plan target skeletons have been recorded.",
+				"Do NOT call `update_todo_list` again unless the previous update failed or the user explicitly asks to change the refined task breakdown.",
+				currentRefineTodo
+					? `Next required tool call: \`write_todo_plan\` with todo_item_id "${currentRefineTodo.id}" for "${currentRefineTodo.content}".`
+					: "Continue with `write_todo_plan` for the current unfinished refine todo id from the latest tool result.",
+			].join("\n")
+		: [
+				"## Current Refine State",
+				"",
+				"STEP 1 has not succeeded yet. Your next refine mutation should be exactly one `update_todo_list` call. First extract the required file targets from the previous todo list, task context, and known codebase context; then classify those files into architecture/subsystem groups and encode the classified files in required `item_plan_targets`.",
+				"Any earlier `update_todo_list` result that did not include `item_plan_targets` was a pre-refine task-list update, not a successful refine STEP 1. Do not imitate that old call shape.",
+				"Do NOT call `write_todo_plan` until `update_todo_list` succeeds and returns the new todo ids.",
+			].join("\n")
 
-CRITICAL: Plan mode ACTIVE - you are in READ-ONLY phase. STRICTLY FORBIDDEN:
+	return `<system-reminder>
+# Refine Planning Reminder
+
+CRITICAL: Refine mode is active. STRICTLY FORBIDDEN:
 ANY file edits, modifications, or system changes. Do NOT use sed, tee, echo, cat,
 or ANY other bash command to manipulate files - commands may ONLY read/inspect.
 This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user
-edit requests. You may ONLY observe, analyze, and plan. Any modification attempt
-is a critical violation. ZERO exceptions.
+edit requests. You may ONLY observe, analyze, rewrite the todo list, and record
+plans with the refine tools. Any project-file modification attempt is a critical
+violation. ZERO exceptions.
 
 ---
 
-## Responsibility
+## Immediate Objective
 
-Your current responsibility is to think, read, search, and construct a well-formed plan that accomplishes the goal the user wants to achieve. Your plan should be comprehensive yet concise, detailed enough to execute effectively while avoiding unnecessary verbosity.
+Your current job is to prepare execution packages for automatic parallel subagents.
 
-Ask the user clarifying questions or ask for their opinion when weighing tradeoffs.
+${workflowState}
 
-**NOTE:** At any point in time through this workflow you should feel free to ask the user questions or clarifications. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins.
+Use read-only tools only when needed to identify exact file paths or resolve a real
+requirement ambiguity. Ask the user only for product decisions or unsafe ambiguity
+that cannot be resolved from the codebase.
 
----
-
-## Important
-
-The user indicated that they do not want you to execute yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received.
-
-The refine workflow has exactly TWO mandatory steps:
-**STEP 1** — Use \`update_todo_list\` to REWRITE the entire todo list into architecture-based groups.
-**STEP 2** — Use \`write_todo_plan\` for EACH resulting todo item to record detailed implementation plans.
-
-You MUST complete STEP 1 before STEP 2. Do NOT call \`write_todo_plan\` on the old todo items — always rewrite the list first. These are the only mutation tools you are allowed to use; all other actions must be READ-ONLY.
+Do NOT implement. Do NOT call \`attempt_completion\`. Do NOT create execution
+subtasks manually.
 
 ---
 
-## Plan Workflow
+## STEP 1 — Rewrite Todo List and Seed File Targets
 
-### Phase 1: Initial Understanding
-Goal: Gain a comprehensive understanding of the user's request by reading through code and asking them questions. Critical: In this phase you should only use read-only exploration tools.
+This section applies ONLY before a successful refine STEP 1 \`update_todo_list\`
+result exists in the conversation. If STEP 1 is already complete, skip this
+section and follow "After STEP 1" below.
 
-1. Focus on understanding the user's request and the code associated with their request
+Call \`update_todo_list\` exactly once to replace the entire old todo list. STEP 1
+is a file-target extraction and classification pass:
 
-2. Explore the codebase efficiently using the available read-only tools (codebase_search, read_file, list_files, find_by_name, search_files, etc.).
-   - Use targeted searches when the task is isolated to known files, the user provided specific file paths, or you're making a small targeted change.
-   - Use broader exploration when: the scope is uncertain, multiple areas of the codebase are involved, or you need to understand existing patterns before planning.
-   - Quality over quantity - try to use the minimum number of tool calls necessary
+1. Extract every file that must be created, modified, or deleted from the previous
+   todo list, existing task contexts, conversation requirements, and known codebase
+   context.
+2. Classify those files by architecture/subsystem ownership, not by feature wording
+   and not one todo per file.
+3. Convert each file classification group into one concise todo item.
+4. Put the exact files for each classification group into that todo item's aligned
+   \`item_plan_targets\` inner array.
 
-3. After exploring the code, use \`ask_followup_question\` to clarify ambiguities in the user request up front.
+The classification MUST be visible in the tool arguments: each \`todos\` row names
+one architecture/subsystem group, and the same row's \`item_plan_targets\` inner
+array lists that group's files.
 
-### Phase 2: Rewrite Todo List (STEP 1)
-Goal: Use \`update_todo_list\` to replace the current todo list with an architecture-based decomposition.
+The \`update_todo_list\` call MUST include:
 
-**MANDATORY — Architecture-Based Task Grouping:**
-You MUST group tasks by **architectural layer or subsystem**, NOT by individual file, feature, or step. Combine all files belonging to the same layer into ONE todo item and aim for the MINIMUM number of coarse-grained execution units.
-Each todo item SHOULD list the main files involved so that the build agent can implement the entire layer in one focused turn.
-Do NOT create todo items for planning/specification-only work; keep only concrete implementation units in the rewritten list.
+1. \`todos\`
+   - Full replacement markdown checklist.
+   - Single-level only, in execution order.
+   - Coarse architecture/subsystem implementation groups.
+   - Do NOT create one todo per file.
+   - Do NOT pack the full file list into todo text.
 
-**MANDATORY — \`item_contexts\` on \`update_todo_list\`:** In STEP 1 you MUST pass \`item_contexts\` — an array of markdown strings, **one per checklist line** (same order and length as \`todos\`). Use \`""\` for a line with no extra spec. For each non-empty entry, include only the architecture-level context the build subagent must independently honor: subsystem role, involved files/modules, task boundaries, major dependencies, integration direction, and other high-level constraints from the rewritten decomposition.
-Treat each non-empty \`item_contexts\` entry as the base architecture context for the rewritten task that STEP 2 will plan against and STEP 3 may later extend with execution-derived agreements.
+2. \`item_contexts\`
+   - Array aligned 1:1 with \`todos\`.
+   - Every active or pending item needs a non-empty entry starting with "## Task Context".
+   - Keep it brief: describe the task role, boundaries, and key dependencies.
+   - Do NOT write detailed implementation plans here.
 
-**CRITICAL — Shared Context Rule:** If two or more tasks must independently honor the same architectural boundary, task rule, dependency, or high-level integration constraint from the rewritten decomposition, you MUST copy the relevant text into EVERY task's \`item_contexts\` entry. Each build subagent is isolated — it only sees its own context. If you omit shared context from an affected task, that task can produce incompatible or incomplete output. Never assume a task can "see" another task's context.
+3. \`item_plan_targets\`
+   - Array aligned 1:1 with \`todos\`.
+   - Required output of the file extraction and classification pass.
+   - Every active or pending todo item MUST have a non-empty inner array.
+   - Each inner array MUST enumerate every exact file that the matching todo item
+     needs to create, modify, or delete.
+   - Each target must be { "target": "relative/project/path.ext", "action": "CREATE|MODIFY|DELETE" }.
+   - Do NOT omit known files.
+   - Do NOT duplicate the same file target across unfinished todo items.
+   - Do NOT write plan body text here; the system records these as empty STEP 1
+         plan target skeletons for STEP 2 to fill.
 
-Call \`update_todo_list\` NOW with the rewritten list **and** \`item_contexts\`. The response will show the new todo ids; you will need those ids for Phase 3.
+You MUST complete STEP 1 before STEP 2. Do NOT call \`write_todo_plan\` on the
+old todo items. After calling \`update_todo_list\`, stop and wait for the tool
+result with the new todo ids. Once that tool result is available, STEP 1 is done;
+do not rewrite the todo list again.
 
-### Phase 3: Write Plans (STEP 2)
-Goal: Use \`write_todo_plan\` for EACH todo item from the rewritten list.
+---
 
-**CRITICAL — Sequential STEP 2 Context Flow:** STEP 2 is strictly sequential. Call \`write_todo_plan\` for exactly ONE todo item at a time, in the order returned by \`update_todo_list\`. After each \`write_todo_plan\` call, STOP that assistant response and wait for the tool result. The system will run STEP 3 immediately after that plan, merge any new cross-task agreements into todo contexts, and return a fresh "Sequential refine state" snapshot. Use that latest snapshot before writing the next todo's plan. Never issue multiple \`write_todo_plan\` calls in the same assistant response.
+## STEP 2 — Fill Detailed Plans
 
-**CRITICAL — Context Isolation:** The build agent receives the todo-level task context from Phase 2 (\`item_contexts\`) plus these plan entries. It has NO access to Phase 1 exploration results, the full conversation history, or other items' plans. Each \`write_todo_plan\` call must supply **self-contained implementation blueprints** (per-file or general sections) that enable fully autonomous implementation.
+After STEP 1 succeeds, use \`write_todo_plan\` for the new todo ids to fill the
+seeded file targets with detailed implementation plans. The next tool call after
+a successful STEP 1 should be \`write_todo_plan\` for the first unfinished/current
+refine todo id. Call \`write_todo_plan\` for exactly one todo item at a time and
+wait for the returned sequential refine state before moving on.
 
-**CRITICAL — Step 2 Scope:** Use STEP 2 to write self-contained implementation plans. Keep the COMPLETE rewritten todo list in mind, but do NOT force STEP 2 to predict every concrete agreement that might only become clear during implementation.
-If an important pre-execution coordination note is already obvious during planning, you MAY append it to the END of the relevant tasks' context using \`context_appends\` on the same \`write_todo_plan\` call.
-Any STEP 2 shared note must still be concrete and executable. Do NOT write vague guidance such as "use the shared interface", "keep the payload aligned", or "follow the backend contract". When a convention concerns an interface, type, DTO, function, event, route, schema, status, env key, or payload, write the exact name and the full required fields, values, signatures, or shape that affected tasks must match.
-The long agreement checklist is a thinking aid for identifying relevant conflict-prevention details, not a required output format. Do NOT force a rigid scaffold like always writing "接口 / 函数 / 重要方法 / 类" when the task does not need it.
-The detailed coordination checklist, plan format rules, and \`context_appends\` usage guidance live in the \`write_todo_plan\` tool description. Use that tool description as the detailed authority for STEP 2.
-If a shared detailed rule is only learned or confirmed while implementing a todo item, leave that discovery to the automatic STEP 3 agreement pass instead of forcing STEP 2 to guess it. Keep STEP 1 \`item_contexts\` architecture-focused.
+## STEP 3 — Agreement Pass And Automatic Execution
 
-**What belongs in \`write_todo_plan\` (not in \`item_contexts\`):**
-1. **Background** from Phase 1 for this layer: file paths, line numbers, code patterns, snippets the implementer needs.
-2. **Cross-task dependencies** and ordering for this item.
-3. **Implementation intent**: create/modify/delete which files; patterns and libraries.
-4. **Verification**: tests, expected behavior, how to confirm correctness.
+After each successful STEP 2 \`write_todo_plan\` call, the system automatically runs
+STEP 3 for that refined todo item to mine concrete cross-task agreements and merge
+them into other refine contexts or plan sections. You do NOT call a STEP 3 tool.
 
-**Shared supporting context** starts in STEP 1 as architecture context in \`item_contexts\`, may be optionally extended in STEP 2 via \`context_appends\` for obvious pre-execution notes, and may be further extended automatically in STEP 3 after individual subagents complete.
+When all plans are recorded and refine mode exits, parallel subagent execution is
+automatically triggered. You do NOT need to call any additional tool. The system
+launches one subagent per rewritten todo item concurrently. Each subagent receives
+ONLY its assigned todo item, that item's task context, and that item's filled plan
+entries; it does not see sibling plans or the full conversation.
 
-For each todo item returned by Phase 2, call \`write_todo_plan\` in sequential order. Each call may include multiple \`plans\` entries for that ONE todo item, but do not call \`write_todo_plan\` for the next todo until the previous call returns and STEP 3 has updated the contexts. Additional calls for the same todo item are allowed only if the returned sequential state still requires that same todo item.
-
-Rules:
-- Do NOT create a separate todo item for planning/specification-only work — supporting context belongs in \`item_contexts\` or \`context_appends\`, not in the todo list text
-- The \`plans\` array contains per-file or per-section implementation blueprints
-- Include only your recommended approach, not all alternatives
-- Keep plans detailed enough for fully autonomous execution
-
-### Phase 4: Automatic Parallel Execution
-After all plans are recorded (i.e., \`write_todo_plan\` has been called for every todo item and refine mode exits), parallel subagent execution will be **automatically triggered**. You do NOT need to call any additional tool — the system will launch one subagent per todo item concurrently. Each subagent receives ONLY its own plan and task context and should focus implementation on that assigned package.
-
-### Phase 5: Automatic Agreement Completion (STEP 3)
-After each subagent finishes, the system will automatically run a dedicated API pass that reviews the completed todo item, its plan, and the subagent's final result. When that pass identifies concrete agreements, it merges them into task context under a structured file-owned agreement section grouped by code-file path.
-STEP 3 is automatic. You do NOT call a tool for it. Your responsibility is to make STEP 1 architecture context solid and STEP 2 plans self-contained; execution-time file-owned agreement harvesting is handled by the system after each completed subtask.
-
-**Important:** Do NOT attempt to implement items yourself or complete/end the task from refine mode after plans are written. The system handles execution automatically. Use \`ask_followup_question\` to clarify requirements/approach BEFORE writing plans.
-
-NOTE: At any point in time through this workflow you should feel free to ask the user questions or clarifications. Don't make large assumptions about user intent. The goal is to present a well researched plan to the user, and tie any loose ends before implementation begins.
+After each subagent finishes, the system may also run a dedicated agreement pass
+that reviews the completed todo item, its plan, and the subagent's final result.
+Concrete cross-task agreements are merged into task contexts under a structured
+file-owned agreement section grouped by code-file path. You do NOT call a tool for
+this.
 </system-reminder>`
 }
 
@@ -7670,11 +8094,11 @@ function buildRefinePrompt(fullTodoList: string): string {
 
 ${fullTodoList}
 
-STEP 1: Use \`update_todo_list\` to rewrite the list into architecture-based implementation groups, with required \`item_contexts\` that describe only each task's architecture role, task boundaries, and high-level dependencies.
-STEP 2: Use \`write_todo_plan\` sequentially for each resulting todo item, exactly one todo item per assistant response. After each call, wait for STEP 3 and the returned "Sequential refine state" before planning the next todo. Focus on self-contained implementation guidance; use \`context_appends\` only when an important coordination note is already obvious before execution starts.
-STEP 3: After each subagent finishes, the system will automatically run a dedicated API pass to merge concrete cross-task agreements into task contexts, grouped by the refined code file that owns each agreement.
+STEP 1: First extract every file that must be created, modified, or deleted from the previous todo list, existing task context, conversation requirements, and known codebase context. Classify those files by architecture/subsystem ownership. Then call \`update_todo_list\` once to rewrite the whole list so each classification group becomes one concise todo item. Include required \`item_contexts\` and required \`item_plan_targets\`; every active or pending todo item must have a non-empty aligned \`item_plan_targets\` inner array enumerating its exact files. Keep todo text concise and do not pack the full file list into the todo text.
+STEP 2: After STEP 1 succeeds, do not call \`update_todo_list\` again unless the tool result reported an error or the user explicitly asks to change the refined task breakdown. Use \`write_todo_plan\` sequentially for the new todo ids to fill the seeded file targets with detailed plans.
+STEP 3: After each successful STEP 2 plan write, the system automatically runs the agreement pass and merges concrete cross-task agreements into task contexts or plan sections. You do not call a STEP 3 tool. When all plans are recorded, the system automatically launches one subagent per rewritten todo item. Each subagent receives only its assigned todo item, task context, and filled plan entries.
 
-Follow the Plan Workflow defined in the system prompt. Start with Phase 1 (Initial Understanding).`
+Follow the refine reminder in the system prompt. If no successful refine STEP 1 marker exists yet, identify any missing exact file paths and perform STEP 1. After STEP 1 succeeds, continue with STEP 2 instead of rewriting the todo list again.`
 }
 
 const AGREEMENT_OUTPUT_SCHEMA = `Return JSON ONLY. No prose. No markdown fences.

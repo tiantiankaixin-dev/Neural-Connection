@@ -352,6 +352,35 @@ describe("NativeToolCallParser", () => {
 					expect(result.params.item_contexts).toBe(JSON.stringify(itemContexts))
 				}
 			})
+
+			it("should preserve item_plan_targets in native args and params", () => {
+				const itemPlanTargets = [
+					[
+						{ target: "src/server.ts", action: "MODIFY" },
+						{ target: "src/routes/auth.ts", action: "CREATE" },
+					],
+					[{ target: "webview-ui/src/App.tsx", action: "MODIFY" }],
+				]
+				const toolCall = {
+					id: "toolu_update_todo_list_plan_targets",
+					name: "update_todo_list" as const,
+					arguments: JSON.stringify({
+						todos: "[-] Backend\n[ ] Frontend",
+						item_contexts: ["backend context", "frontend context"],
+						item_plan_targets: itemPlanTargets,
+					}),
+				}
+
+				const result = NativeToolCallParser.parseToolCall(toolCall)
+
+				expect(result).not.toBeNull()
+				expect(result?.type).toBe("tool_use")
+				if (result?.type === "tool_use") {
+					const nativeArgs = result.nativeArgs as { item_plan_targets?: typeof itemPlanTargets }
+					expect(nativeArgs.item_plan_targets).toEqual(itemPlanTargets)
+					expect(result.params.item_plan_targets).toBe(JSON.stringify(itemPlanTargets))
+				}
+			})
 		})
 	})
 

@@ -324,6 +324,23 @@ export class NativeToolCallParser {
 		return undefined
 	}
 
+	private static parseItemPlanTargets(value: unknown): NativeToolArgs["update_todo_list"]["item_plan_targets"] {
+		if (Array.isArray(value)) {
+			return value as NativeToolArgs["update_todo_list"]["item_plan_targets"]
+		}
+		if (typeof value === "string") {
+			try {
+				const parsed = parseJSON(value)
+				if (Array.isArray(parsed)) {
+					return parsed as NativeToolArgs["update_todo_list"]["item_plan_targets"]
+				}
+			} catch {
+				return undefined
+			}
+		}
+		return undefined
+	}
+
 	/**
 	 * Convert raw file entries from API (with line_ranges) to FileEntry objects
 	 * (with lineRanges). Handles multiple formats for backward compatibility:
@@ -560,11 +577,18 @@ export class NativeToolCallParser {
 				break
 
 			case "update_todo_list":
-				if (partialArgs.todos !== undefined || partialArgs.item_contexts !== undefined) {
+				if (
+					partialArgs.todos !== undefined ||
+					partialArgs.item_contexts !== undefined ||
+					partialArgs.item_plan_targets !== undefined
+				) {
 					nativeArgs = {
 						...(partialArgs.todos !== undefined ? { todos: partialArgs.todos } : {}),
 						...(partialArgs.item_contexts !== undefined
 							? { item_contexts: partialArgs.item_contexts }
+							: {}),
+						...(partialArgs.item_plan_targets !== undefined
+							? { item_plan_targets: this.parseItemPlanTargets(partialArgs.item_plan_targets) }
 							: {}),
 					}
 				}
@@ -915,6 +939,9 @@ export class NativeToolCallParser {
 						nativeArgs = {
 							todos: args.todos,
 							...(args.item_contexts !== undefined ? { item_contexts: args.item_contexts } : {}),
+							...(args.item_plan_targets !== undefined
+								? { item_plan_targets: this.parseItemPlanTargets(args.item_plan_targets) }
+								: {}),
 						} as NativeArgsFor<TName>
 					}
 					break

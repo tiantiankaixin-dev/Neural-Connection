@@ -403,6 +403,10 @@ export async function presentAssistantMessage(cline: Task) {
 				}
 			}
 
+			if (cline.isRefineMode) {
+				console.log(`[refine-tool-call] tool=${block.name}, id=${toolCallId}, partial=${block.partial}`)
+			}
+
 			if (cline.didRejectTool || cline.pendingRefineRequest) {
 				// Ignore any tool content after user has rejected tool once or requested refine.
 				// For native tool calling, we must send a tool_result for every tool_use to avoid API errors

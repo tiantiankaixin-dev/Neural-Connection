@@ -15,12 +15,18 @@ interface TodoPlanEntry {
 	content: string
 }
 
+interface TodoPlanTarget {
+	target: string
+	action: string
+}
+
 interface TodoPlanData {
 	savedPath?: string
 	savedPaths?: string[]
 	planType?: "file" | "general"
 	contexts: string[]
 	plans: TodoPlanEntry[]
+	targetStubs?: TodoPlanTarget[]
 }
 
 /**
@@ -32,6 +38,7 @@ interface UpdateTodoListToolBlockProps {
 	todos?: TodoItem[]
 	previousTodos?: TodoItem[]
 	todoPlansById?: Record<string, TodoPlanData>
+	planTargets?: TodoPlanTarget[][]
 	refiningTodoItemIds?: string[]
 	activeRefiningTodoItemId?: string
 	refineStatusLabel?: string
@@ -111,11 +118,30 @@ function getDisplayedPlanContent(content: string) {
 	return stripped.trim() || content
 }
 
+function normalizePlanTargetsForDisplay(value: unknown): TodoPlanTarget[] {
+	if (!Array.isArray(value)) {
+		return []
+	}
+	return value
+		.map((entry) => {
+			if (!entry || typeof entry !== "object") {
+				return undefined
+			}
+			const record = entry as Record<string, unknown>
+			return typeof record.target === "string" && typeof record.action === "string"
+				? { target: record.target, action: record.action }
+				: undefined
+		})
+		.filter((entry): entry is TodoPlanTarget => !!entry)
+}
+
 function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }) {
 	const [isExpanded, setIsExpanded] = React.useState(false)
 	const [expandedSections, setExpandedSections] = React.useState<Set<number>>(new Set())
 	const [expandedContexts, setExpandedContexts] = React.useState<Set<number>>(new Set())
-	const hasPlan = !!plan && (plan.plans.length > 0 || plan.contexts.length > 0)
+	const targetStubs = plan?.targetStubs ?? []
+	const hasTargetStubs = targetStubs.length > 0
+	const hasPlan = !!plan && (plan.plans.length > 0 || plan.contexts.length > 0 || hasTargetStubs)
 	const hasContexts = !!plan && plan.contexts.length > 0
 
 	const toggleContext = (idx: number) => {
@@ -193,9 +219,11 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 						{hasPlan
 							? plan.plans.length > 0
 								? `${plan.plans.length} ${plan.planType === "general" ? "section(s)" : "file(s)"}`
-								: plan.contexts.length > 0
-									? `${plan.contexts.length} task context block(s)`
-									: "No refine details"
+								: hasTargetStubs
+									? `${targetStubs.length} STEP 1 target(s) seeded`
+									: plan.contexts.length > 0
+										? `${plan.contexts.length} task context block(s)`
+										: "No refine details"
 							: "No refine details"}
 					</div>
 				</div>
@@ -218,6 +246,48 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 			</div>
 			{isExpanded && hasPlan && plan && (
 				<div style={{ borderTop: "1px solid var(--vscode-editorGroup-border)" }}>
+					{hasTargetStubs && (
+						<div style={{ borderBottom: "1px solid var(--vscode-editorGroup-border)" }}>
+							<div
+								style={{
+									display: "flex",
+									alignItems: "center",
+									gap: 6,
+									padding: "6px 10px 6px 20px",
+									fontSize: 12,
+									color: "var(--vscode-foreground)",
+								}}>
+								<span
+									className="codicon codicon-list-tree"
+									style={{
+										fontSize: 12,
+										flexShrink: 0,
+										color: "var(--vscode-charts-blue)",
+									}}
+								/>
+								<span style={{ fontWeight: 500, opacity: 0.9 }}>STEP 1 File Targets</span>
+								<span style={{ color: "var(--vscode-descriptionForeground)", fontSize: 11 }}>
+									{targetStubs.length} seeded
+								</span>
+							</div>
+							<div
+								style={{
+									padding: "0 14px 8px 36px",
+									fontFamily: "var(--vscode-editor-font-family)",
+									fontSize: 12,
+									color: "var(--vscode-descriptionForeground)",
+								}}>
+								{targetStubs.map((target, index) => (
+									<div key={`${target.action}-${target.target}-${index}`}>
+										<span style={{ color: "var(--vscode-charts-blue)", marginRight: 6 }}>
+											{target.action}
+										</span>
+										<span>{target.target}</span>
+									</div>
+								))}
+							</div>
+						</div>
+					)}
 					{/* Context sections — parent agent's cross-cutting context (interfaces, contracts, dependencies) */}
 					{hasContexts &&
 						plan.contexts.map((ctx, ctxIdx) => (
@@ -338,6 +408,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	todos = [],
 	previousTodos,
 	todoPlansById,
+	planTargets,
 	refiningTodoItemIds,
 	activeRefiningTodoItemId,
 	refineStatusLabel = "subagent...",
@@ -364,6 +435,10 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	const [expandedInlineThinkingIds, setExpandedInlineThinkingIds] = useState<Set<string>>(new Set())
 	const [selectedForRefine, setSelectedForRefine] = useState<Set<string>>(new Set())
 	const [isRefineMode, setIsRefineMode] = useState(false)
+	const displayPlanTargets = React.useMemo(
+		() => (Array.isArray(planTargets) ? planTargets.map((targets) => normalizePlanTargetsForDisplay(targets)) : []),
+		[planTargets],
+	)
 	const refiningTodoIdSet = React.useMemo(
 		() => new Set((showRefiningIndicator ? refiningTodoItemIds : []) ?? []),
 		[refiningTodoItemIds, showRefiningIndicator],
@@ -617,17 +692,33 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 								const changeType = changeMap.get(todo.id || todo.content) as TodoChangeType | undefined
 								const changeColor = changeType ? CHANGE_COLORS[changeType] : "transparent"
 								const todoPlan = todo.id ? todoPlansById?.[todo.id] : undefined
+								const targetStubs = displayPlanTargets[idx] ?? []
+								const contextFromTodo = todo.context?.trim() ? [todo.context.trim()] : []
 								const effectivePlan: TodoPlanData | undefined =
-									todoPlan ??
-									(todo.context?.trim() ? { contexts: [todo.context.trim()], plans: [] } : undefined)
+									todoPlan || contextFromTodo.length > 0 || targetStubs.length > 0
+										? {
+												...(todoPlan ?? { contexts: contextFromTodo, plans: [] }),
+												contexts: todoPlan?.contexts?.length
+													? todoPlan.contexts
+													: contextFromTodo,
+												plans: todoPlan?.plans ?? [],
+												targetStubs: todoPlan?.targetStubs?.length
+													? todoPlan.targetStubs
+													: targetStubs,
+											}
+										: undefined
 								const hasInlineRefinedCard =
-									!isEditing && (!!effectivePlan?.plans?.length || !!effectivePlan?.contexts?.length)
+									!isEditing &&
+									(!!effectivePlan?.plans?.length ||
+										!!effectivePlan?.contexts?.length ||
+										!!effectivePlan?.targetStubs?.length)
 								const isActiveInlineRefining =
 									showRefiningIndicator &&
 									!!todo.id &&
 									activeRefiningTodoItemId === todo.id &&
 									!effectivePlan?.plans?.length &&
-									!effectivePlan?.contexts?.length
+									!effectivePlan?.contexts?.length &&
+									!effectivePlan?.targetStubs?.length
 								const shouldShowInlineRefining =
 									isActiveInlineRefining && !!todo.id && refiningTodoIdSet.has(todo.id)
 								const shouldShowInlineThinking =
