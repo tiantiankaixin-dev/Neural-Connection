@@ -42,6 +42,7 @@ import { BatchFilePermission } from "./BatchFilePermission"
 import { BatchListFilesPermission } from "./BatchListFilesPermission"
 import { BatchDiffApproval } from "./BatchDiffApproval"
 import { ProgressIndicator } from "./ProgressIndicator"
+import { RefineProgressBar } from "./RefineProgressBar"
 import { Markdown } from "./Markdown"
 import { CommandExecution } from "./CommandExecution"
 import { CommandExecutionError } from "./CommandExecutionError"
@@ -102,6 +103,12 @@ interface Step3ModelTransferDiagnostic {
 	todoItemId?: string
 	todoContent?: string
 	progressLabel?: string
+	progress?: {
+		label?: string
+		current?: number
+		total?: number
+		detail?: string
+	}
 	provider?: string
 	modelId?: string
 	errorMessage?: string
@@ -162,6 +169,7 @@ function Step3ModelTransferDetails({ details }: { details: Step3ModelTransferDia
 			modelId: details.modelId,
 			errorMessage: details.errorMessage,
 			errorData: details.errorData,
+			progress: details.progress,
 			agreementCount: details.agreementCount,
 			parsedResponse: details.parsedResponse,
 			fileAgreements: details.fileAgreements,
@@ -227,6 +235,37 @@ function parseStep3ModelTransferDetails(text?: string): {
 	} catch {
 		return { cleanText: text }
 	}
+}
+
+function getStep3Progress(details?: Step3ModelTransferDiagnostic) {
+	const progress = details?.progress
+	if (
+		!progress ||
+		typeof progress.current !== "number" ||
+		typeof progress.total !== "number" ||
+		progress.total <= 0
+	) {
+		return undefined
+	}
+
+	return {
+		label: progress.label || "STEP 3 file agreement progress",
+		current: progress.current,
+		total: progress.total,
+		detail: progress.detail,
+	}
+}
+
+function shouldShowStep3ModelTransferDetails(details?: Step3ModelTransferDiagnostic) {
+	return !!(
+		details &&
+		(details.errorMessage ||
+			details.errorData ||
+			details.promptText ||
+			details.rawResponse ||
+			details.parsedResponse ||
+			details.fileAgreements)
+	)
 }
 
 function isLeakedWriteTodoPlanPayload(text?: string) {
@@ -1755,6 +1794,7 @@ export const ChatRowContent = ({
 					return null // we should never see this message type
 				case "text": {
 					const step3Message = parseStep3ModelTransferDetails(message.text)
+					const step3Progress = getStep3Progress(step3Message.details)
 					if (isLeakedWriteTodoPlanPayload(step3Message.cleanText)) {
 						return null
 					}
@@ -1769,7 +1809,20 @@ export const ChatRowContent = ({
 							</div>
 							<div className="pl-6">
 								<Markdown markdown={step3Message.cleanText} partial={message.partial} />
-								{step3Message.details && <Step3ModelTransferDetails details={step3Message.details} />}
+								{step3Progress && (
+									<div className="mt-2">
+										<RefineProgressBar
+											label={step3Progress.label}
+											current={step3Progress.current}
+											total={step3Progress.total}
+											detail={step3Progress.detail}
+											tone="purple"
+										/>
+									</div>
+								)}
+								{shouldShowStep3ModelTransferDetails(step3Message.details) && (
+									<Step3ModelTransferDetails details={step3Message.details!} />
+								)}
 								{message.images && message.images.length > 0 && (
 									<div style={{ marginTop: "10px" }}>
 										{message.images.map((image, index) => (

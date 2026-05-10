@@ -165,6 +165,46 @@ export const MAX_IMAGES_PER_MESSAGE = 20 // This is the Anthropic limit.
 
 const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0
 
+function getLatestTodoPlanTargetsById(clineMessages: ClineMessage[]): Record<string, TodoPlanTarget[]> {
+	let latestTargetsById: Record<string, TodoPlanTarget[]> = {}
+
+	for (const message of clineMessages) {
+		if (
+			!(
+				(message.type === "ask" && message.ask === "tool") ||
+				(message.type === "say" && message.say === "user_edit_todos")
+			)
+		) {
+			continue
+		}
+
+		try {
+			const parsed = JSON.parse(message.text ?? "{}")
+			if (!parsed || parsed.tool !== "updateTodoList" || !Array.isArray(parsed.todos)) {
+				continue
+			}
+
+			if (!Array.isArray(parsed.planTargets)) {
+				continue
+			}
+
+			const nextTargetsById: Record<string, TodoPlanTarget[]> = {}
+			for (const [index, todo] of parsed.todos.entries()) {
+				const id = todo && typeof todo.id === "string" ? todo.id : undefined
+				if (!id) {
+					continue
+				}
+				nextTargetsById[id] = normalizeTodoPlanTargets(parsed.planTargets[index])
+			}
+			latestTargetsById = nextTargetsById
+		} catch {
+			continue
+		}
+	}
+
+	return latestTargetsById
+}
+
 const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewProps> = (
 	{ isHidden, showAnnouncement, hideAnnouncement },
 	ref,
@@ -238,6 +278,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	const todoPlansById = useMemo<Record<string, TodoPlanData>>(() => {
 		const result: Record<string, TodoPlanData> = {}
+		const latestPlanTargetsByTodoId = getLatestTodoPlanTargetsById(messages)
 
 		for (const message of messages) {
 			if (message.type !== "say" || message.say !== "refine_result" || !message.text) {
@@ -281,6 +322,27 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				}
 			} catch {
 				// ignore invalid refine_result payloads
+			}
+		}
+
+		for (const todo of latestTodos) {
+			const id = todo.id
+			if (!id) {
+				continue
+			}
+			const targetStubs = latestPlanTargetsByTodoId[id]
+			if (!targetStubs?.length) {
+				continue
+			}
+			const existing = result[id]
+			if (existing) {
+				existing.targetStubs = mergeTodoPlanTargets(existing.targetStubs, targetStubs)
+			} else {
+				result[id] = {
+					contexts: [],
+					plans: [],
+					targetStubs,
+				}
 			}
 		}
 

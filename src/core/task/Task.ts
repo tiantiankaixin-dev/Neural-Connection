@@ -166,7 +166,7 @@ import {
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
 const STEP3_AGREEMENT_PASS_TIMEOUT_MS = 180_000
-const STEP3_REFINE_PLAN_BATCH_SIZE = 1
+const STEP3_REFINE_PLAN_BATCH_SIZE = 3
 const REFINE_RESUME_STATE_FILE = "refine_state.json"
 const SUBAGENT_RESUME_STATE_FILE = "subagent_state.json"
 
@@ -224,10 +224,11 @@ type AgreementPassExtractionOutcome = {
 }
 
 type Step3ModelTransferDiagnostic = {
-	stage: "api_call" | "parse_response" | "success"
+	stage: "running" | "api_call" | "parse_response" | "success"
 	todoItemId: string
 	todoContent: string
 	progressLabel?: string
+	progress?: Step3ProgressInfo
 	provider?: string
 	modelId?: string
 	errorMessage?: string
@@ -241,6 +242,13 @@ type Step3ModelTransferDiagnostic = {
 		filePath: string
 		content: string
 	}>
+}
+
+type Step3ProgressInfo = {
+	label?: string
+	current: number
+	total: number
+	detail?: string
 }
 
 type RefineResumeState = {
@@ -261,6 +269,7 @@ type SubagentResumeState = {
 type AgreementPassOptions = {
 	updateAllTodoContexts?: boolean
 	progressLabel?: string
+	progress?: Step3ProgressInfo
 	emitExtractionResult?: boolean
 }
 
@@ -2336,8 +2345,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			"STEP 2 does not create or reclassify targets; every file plan target/action must exactly match one STEP 1 item_plan_targets entry for the current todo item.",
 			"Put subtopics such as file purpose, dependencies, routes, exports, functions, tests, and Task Context inside the owning file target's body, never as separate plan entries.",
 			'For plan_type="general", target must be a descriptive section title and action must be "GENERAL".',
-			"If the current todo feels too large to plan clearly in one response, you may split it across multiple write_todo_plan calls for the same todo_item_id.",
-			"Each write_todo_plan call may cover only a coherent subset of the remaining STEP 1 file targets; continue the same todo_item_id until the tool result reports no missing targets.",
+			"For file-based STEP 2 refine plans, each write_todo_plan call may cover at most 3 STEP 1 file targets; continue the same todo_item_id in batches of up to 3 until complete.",
+			"When the previous tool result names the next target batch, the next write_todo_plan call must use exactly those listed target names and actions.",
+			"Each write_todo_plan call may cover only a coherent subset of up to 3 remaining STEP 1 file targets; continue the same todo_item_id until the tool result reports no missing targets.",
 		].join("\n")
 		const step3RetryReminder = this.pendingRefineStep3RetryTodoItemId
 			? [
@@ -2862,6 +2872,51 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return undefined
 	}
 
+	private isRefineStep1UpdateTodoListAsk(type: ClineAsk, text?: string): boolean {
+		if (type !== "tool") {
+			return false
+		}
+		try {
+			const data = JSON.parse(text || "{}")
+			return data.tool === "updateTodoList" && data.refineMode === true && data.refineStep === 1
+		} catch {
+			return false
+		}
+	}
+
+	private async upsertRefineStep1UpdateTodoListAsk(
+		type: ClineAsk,
+		text: string | undefined,
+		partial: boolean | undefined,
+		progressStatus: ToolProgressStatus | undefined,
+		isProtected: boolean | undefined,
+	): Promise<number | undefined> {
+		if (!this.isRefineStep1UpdateTodoListAsk(type, text)) {
+			return undefined
+		}
+
+		const lastIdx = findLastIndex(this.clineMessages, (message) => {
+			return (
+				message.type === "ask" &&
+				message.ask !== undefined &&
+				this.isRefineStep1UpdateTodoListAsk(message.ask, message.text)
+			)
+		})
+		if (lastIdx === -1) {
+			return undefined
+		}
+
+		const message = this.clineMessages[lastIdx]
+		message.text = text
+		message.partial = partial
+		message.progressStatus = progressStatus
+		message.isProtected = isProtected
+		this.lastMessageTs = message.ts
+		await this.saveClineMessages()
+		await this.updateClineMessage(message)
+		return message.ts
+	}
+
 	// Note that `partial` has three valid states true (partial message),
 	// false (completion of partial message), undefined (individual complete
 	// message).
@@ -2886,7 +2941,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 
 		let askTs: number
 
-		if (partial !== undefined) {
+		const upsertedAskTs = await this.upsertRefineStep1UpdateTodoListAsk(
+			type,
+			text,
+			partial,
+			progressStatus,
+			isProtected,
+		)
+		if (upsertedAskTs !== undefined) {
+			askTs = upsertedAskTs
+			if (partial) {
+				throw new AskIgnoredError("updating existing refine step1 update_todo_list")
+			}
+		} else if (partial !== undefined) {
 			const lastMessage = this.clineMessages.at(-1)
 
 			const isUpdatingPreviousPartial =
@@ -4552,6 +4619,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 	public async enqueuePostRefineAgreementPass(
 		refinedTodo: TodoItem,
 		planFiles: PlanFile[],
+		fileProgress?: { current: number; total: number },
 	): Promise<PostSubtaskAgreementPassOutcome> {
 		if (planFiles.length === 0) {
 			return Promise.resolve({
@@ -4561,6 +4629,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				skippedReason: "no plan files for refine-time agreement pass",
 			})
 		}
+		const progressTotal = Math.max(fileProgress?.total ?? planFiles.length, planFiles.length)
+		const progressBaseFileCount = fileProgress
+			? Math.min(Math.max(0, fileProgress.current - planFiles.length), progressTotal)
+			: 0
 		const batches: PlanFile[][] = []
 		for (let i = 0; i < planFiles.length; i += STEP3_REFINE_PLAN_BATCH_SIZE) {
 			batches.push(planFiles.slice(i, i + STEP3_REFINE_PLAN_BATCH_SIZE))
@@ -4569,6 +4641,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const extractedFileAgreements: PostSubtaskFileAgreement[] = []
 		for (let i = 0; i < batches.length; i++) {
 			const batch = batches[i]
+			const processedFileCount = Math.min((i + 1) * STEP3_REFINE_PLAN_BATCH_SIZE, planFiles.length)
+			const currentFileCount = Math.min(progressBaseFileCount + processedFileCount, progressTotal)
 			const extraction = await this.enqueueAgreementExtractionPass(
 				refinedTodo,
 				(todos, availableTargets) =>
@@ -4580,7 +4654,12 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					}),
 				batch,
 				{
-					progressLabel: `(batch ${i + 1}/${batches.length})`,
+					progress: {
+						label: "STEP 3 file agreement progress",
+						current: currentFileCount,
+						total: progressTotal,
+						detail: `Processing ${batch.length} file${batch.length === 1 ? "" : "s"} in this STEP 3 pass`,
+					},
 					updateAllTodoContexts: true,
 				},
 			)
@@ -4603,7 +4682,18 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		return this.mergeAgreementPassFileAgreements(
 			refinedTodo,
 			mergePostSubtaskFileAgreements(extractedFileAgreements),
-			{ updateAllTodoContexts: true },
+			{
+				updateAllTodoContexts: true,
+				progress: {
+					label: "STEP 3 file agreement progress",
+					current: Math.min(progressBaseFileCount + planFiles.length, progressTotal),
+					total: progressTotal,
+					detail:
+						progressBaseFileCount + planFiles.length >= progressTotal
+							? "All plan files checked"
+							: "Current STEP 3 plan batch checked",
+				},
+			},
 		)
 	}
 
@@ -4632,7 +4722,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					availableTargets,
 				}),
 			planFiles,
-			{ updateAllTodoContexts: true },
+			{
+				updateAllTodoContexts: true,
+				...(planFiles.length > 0
+					? {
+							progress: {
+								label: "STEP 3 file agreement progress",
+								current: planFiles.length,
+								total: planFiles.length,
+								detail: "All plan files checked",
+							},
+						}
+					: {}),
+			},
 		)
 	}
 
@@ -4718,12 +4820,26 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const availableSharedTargets = await this.collectAvailableAgreementTargets(currentTodos, planFiles)
 		const agreementPrompt = buildPrompt(currentTodos, availableSharedTargets)
 		const progressLabel = options.progressLabel ? ` ${options.progressLabel}` : ""
+		const runningDetails: Step3ModelTransferDiagnostic = {
+			stage: "running",
+			todoItemId: focusTodo.id,
+			todoContent: focusTodo.content,
+			progressLabel: options.progressLabel,
+			progress: options.progress,
+			planFiles: planFiles.map((plan) => ({
+				filePath: plan.filePath,
+				content: plan.content,
+			})),
+		}
 
 		// Visible signal that Step 3 is running — so the user can see it in chat
 		// even when no agreements end up being appended.
 		await this.say(
 			"text",
-			`\u2699\ufe0f STEP 3 agreement pass${progressLabel} running for "${focusTodo.content}"...`,
+			formatStep3MessageWithModelTransferDetails(
+				`\u2699\ufe0f STEP 3 agreement pass${progressLabel} running for "${focusTodo.content}"...`,
+				runningDetails,
+			),
 			undefined,
 			undefined,
 			undefined,
@@ -4773,6 +4889,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				todoItemId: focusTodo.id,
 				todoContent: focusTodo.content,
 				progressLabel: options.progressLabel,
+				progress: options.progress,
 				provider: this.apiConfiguration?.apiProvider,
 				modelId: this.api.getModel().id,
 				errorMessage: message,
@@ -4809,6 +4926,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				todoItemId: focusTodo.id,
 				todoContent: focusTodo.content,
 				progressLabel: options.progressLabel,
+				progress: options.progress,
 				provider: this.apiConfiguration?.apiProvider,
 				modelId: this.api.getModel().id,
 				errorMessage: message,
@@ -4845,6 +4963,7 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			todoItemId: focusTodo.id,
 			todoContent: focusTodo.content,
 			progressLabel: options.progressLabel,
+			progress: options.progress,
 			provider: this.apiConfiguration?.apiProvider,
 			modelId: this.api.getModel().id,
 			promptText: agreementPrompt,
@@ -4908,9 +5027,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 		}
 		if (fileAgreements.length === 0) {
+			const details: Step3ModelTransferDiagnostic = {
+				stage: "success",
+				todoItemId: focusTodo.id,
+				todoContent: focusTodo.content,
+				progress: options.progress,
+				planFiles: [],
+			}
 			await this.say(
 				"text",
-				`\u2705 STEP 3 for "${focusTodo.content}": no new agreements`,
+				formatStep3MessageWithModelTransferDetails(
+					`\u2705 STEP 3 for "${focusTodo.content}": no new agreements`,
+					details,
+				),
 				undefined,
 				undefined,
 				undefined,
@@ -4952,9 +5081,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		if (successParts.length === 0) {
+			const details: Step3ModelTransferDiagnostic = {
+				stage: "success",
+				todoItemId: focusTodo.id,
+				todoContent: focusTodo.content,
+				progress: options.progress,
+				planFiles: [],
+			}
 			await this.say(
 				"text",
-				`\u2705 STEP 3 for "${focusTodo.content}": no new agreements`,
+				formatStep3MessageWithModelTransferDetails(
+					`\u2705 STEP 3 for "${focusTodo.content}": no new agreements`,
+					details,
+				),
 				undefined,
 				undefined,
 				undefined,
@@ -4962,9 +5101,19 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				{ isNonInteractive: true },
 			)
 		} else {
+			const details: Step3ModelTransferDiagnostic = {
+				stage: "success",
+				todoItemId: focusTodo.id,
+				todoContent: focusTodo.content,
+				progress: options.progress,
+				planFiles: [],
+			}
 			await this.say(
 				"text",
-				`\u2705 STEP 3 for "${focusTodo.content}": ${successParts.join(" and ")}`,
+				formatStep3MessageWithModelTransferDetails(
+					`\u2705 STEP 3 for "${focusTodo.content}": ${successParts.join(" and ")}`,
+					details,
+				),
 				undefined,
 				undefined,
 				undefined,

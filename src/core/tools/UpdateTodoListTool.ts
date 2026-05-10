@@ -29,6 +29,19 @@ interface UpdateTodoListParams {
 
 let approvedTodoList: TodoItem[] | undefined = undefined
 
+function buildUpdateTodoListApprovalPayload(
+	task: Task,
+	todos: TodoItem[],
+	planTargets?: PlanTargetStubEntry[][] | UpdateTodoListPlanTargetParams[][],
+) {
+	return {
+		tool: "updateTodoList",
+		todos,
+		planTargets,
+		...(task.isRefineMode && !task.refineStep1Complete ? { refineMode: true, refineStep: 1 } : {}),
+	}
+}
+
 export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 	readonly name = "update_todo_list" as const
 
@@ -119,11 +132,9 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 				return
 			}
 
-			const approvalMsg = JSON.stringify({
-				tool: "updateTodoList",
-				todos: normalizedTodos,
-				planTargets: itemPlanTargetGroupsResult.groups,
-			})
+			const approvalMsg = JSON.stringify(
+				buildUpdateTodoListApprovalPayload(task, normalizedTodos, itemPlanTargetGroupsResult.groups),
+			)
 
 			approvedTodoList = cloneDeep(normalizedTodos)
 			console.log(`[UpdateTodoList.execute] BEFORE askApproval, todoCount=${normalizedTodos.length}`)
@@ -371,11 +382,13 @@ export class UpdateTodoListTool extends BaseTool<"update_todo_list"> {
 			shouldEnsureTaskContexts,
 		)
 
-		const approvalMsg = JSON.stringify({
-			tool: "updateTodoList",
-			todos: todos,
-			planTargets: Array.isArray(rawItemPlanTargets) ? rawItemPlanTargets : undefined,
-		})
+		const approvalMsg = JSON.stringify(
+			buildUpdateTodoListApprovalPayload(
+				task,
+				todos,
+				Array.isArray(rawItemPlanTargets) ? rawItemPlanTargets : undefined,
+			),
+		)
 		await task.ask("tool", approvalMsg, block.partial).catch(() => {})
 	}
 }

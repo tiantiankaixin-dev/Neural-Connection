@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react"
 import { ToolUseBlock, ToolUseBlockHeader } from "../common/ToolUseBlock"
 import MarkdownBlock from "../common/MarkdownBlock"
+import { RefineProgressBar } from "./RefineProgressBar"
 
 interface TodoItem {
 	id?: string
@@ -102,6 +103,21 @@ const STATUS_OPTIONS = [
 
 const genId = () => Math.random().toString(36).slice(2, 10)
 
+function areTodoListsEqual(a: TodoItem[], b: TodoItem[]): boolean {
+	if (a.length !== b.length) {
+		return false
+	}
+	return a.every((todo, index) => {
+		const other = b[index]
+		return (
+			todo.id === other?.id &&
+			todo.content === other.content &&
+			(todo.status || "") === (other.status || "") &&
+			(todo.context || "") === (other.context || "")
+		)
+	})
+}
+
 const CHANGE_COLORS: Record<TodoChangeType, string> = {
 	added: "var(--vscode-charts-blue)",
 	status_changed: "var(--vscode-charts-yellow)",
@@ -153,9 +169,14 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 	const hasPlan = !!plan && (plan.plans.length > 0 || plan.contexts.length > 0 || hasTargetStubs)
 	const hasContexts = !!plan && plan.contexts.length > 0
 	const plannedTargetKeys = new Set((plan?.plans ?? []).map((entry) => normalizeTargetKey(entry.filePath)))
+	const hasFilePlanProgress = !!plan && plan.planType !== "general" && plan.plans.length > 0
+	const step2ProgressTotal = hasTargetStubs ? targetStubs.length : hasFilePlanProgress ? plan.plans.length : 0
 	const plannedTargetCount = hasTargetStubs
 		? targetStubs.filter((target) => plannedTargetKeys.has(normalizeTargetKey(target.target))).length
-		: (plan?.plans.length ?? 0)
+		: hasFilePlanProgress
+			? plan.plans.length
+			: 0
+	const hasStep2Progress = step2ProgressTotal > 0
 
 	const toggleContext = (idx: number) => {
 		setExpandedContexts((prev) => {
@@ -229,15 +250,24 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 						{todo.content}
 					</div>
 					<div style={{ color: "var(--vscode-descriptionForeground)", fontSize: 12 }}>
-						{hasPlan
-							? hasTargetStubs
-								? `${plannedTargetCount}/${targetStubs.length} STEP 2 target(s) planned`
-								: plan.plans.length > 0
-									? `${plan.plans.length} ${plan.planType === "general" ? "section(s)" : "file(s)"}`
-									: plan.contexts.length > 0
-										? `${plan.contexts.length} task context block(s)`
-										: "No refine details"
-							: "No refine details"}
+						{hasPlan ? (
+							hasStep2Progress ? (
+								<RefineProgressBar
+									label="STEP 2 file plan progress"
+									current={plannedTargetCount}
+									total={step2ProgressTotal}
+									compact
+								/>
+							) : plan.plans.length > 0 ? (
+								`${plan.plans.length} ${plan.planType === "general" ? "section(s)" : "file(s)"}`
+							) : plan.contexts.length > 0 ? (
+								`${plan.contexts.length} task context block(s)`
+							) : (
+								"No refine details"
+							)
+						) : (
+							"No refine details"
+						)}
 					</div>
 				</div>
 				<span
@@ -279,9 +309,6 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 									}}
 								/>
 								<span style={{ fontWeight: 500, opacity: 0.9 }}>STEP 1 File Targets</span>
-								<span style={{ color: "var(--vscode-descriptionForeground)", fontSize: 11 }}>
-									{plannedTargetCount}/{targetStubs.length} planned
-								</span>
 							</div>
 							<div
 								style={{
@@ -290,6 +317,14 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 									fontSize: 12,
 									color: "var(--vscode-descriptionForeground)",
 								}}>
+								<div style={{ marginBottom: 8, fontFamily: "var(--vscode-font-family)" }}>
+									<RefineProgressBar
+										label="STEP 2 file plan progress"
+										current={plannedTargetCount}
+										total={targetStubs.length}
+										compact
+									/>
+								</div>
 								{targetStubs.map((target, index) => (
 									<div
 										key={`${target.action}-${target.target}-${index}`}
@@ -315,6 +350,20 @@ function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }
 									</div>
 								))}
 							</div>
+						</div>
+					)}
+					{!hasTargetStubs && hasStep2Progress && (
+						<div
+							style={{
+								padding: "8px 14px 8px 36px",
+								borderBottom: "1px solid var(--vscode-editorGroup-border)",
+							}}>
+							<RefineProgressBar
+								label="STEP 2 file plan progress"
+								current={plannedTargetCount}
+								total={step2ProgressTotal}
+								compact
+							/>
 						</div>
 					)}
 					{/* Context sections — parent agent's cross-cutting context (interfaces, contracts, dependencies) */}
@@ -493,7 +542,13 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 
 	// Sync when external props.todos changes
 	useEffect(() => {
-		setEditTodos(todos.length > 0 ? todos.map((todo) => ({ ...todo, id: todo.id || genId() })) : [])
+		setEditTodos((prev) => {
+			const next =
+				todos.length > 0
+					? todos.map((todo, index) => ({ ...todo, id: todo.id || prev[index]?.id || genId() }))
+					: []
+			return areTodoListsEqual(prev, next) ? prev : next
+		})
 	}, [todos])
 
 	// Auto focus on new item
@@ -721,7 +776,9 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 								const changeType = changeMap.get(todo.id || todo.content) as TodoChangeType | undefined
 								const changeColor = changeType ? CHANGE_COLORS[changeType] : "transparent"
 								const todoPlan = todo.id ? todoPlansById?.[todo.id] : undefined
-								const targetStubs = displayPlanTargets[idx] ?? []
+								const targetStubs = todoPlan?.targetStubs?.length
+									? todoPlan.targetStubs
+									: (displayPlanTargets[idx] ?? [])
 								const contextFromTodo = todo.context?.trim() ? [todo.context.trim()] : []
 								const effectivePlan: TodoPlanData | undefined =
 									todoPlan || contextFromTodo.length > 0 || targetStubs.length > 0
@@ -731,9 +788,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 													? todoPlan.contexts
 													: contextFromTodo,
 												plans: todoPlan?.plans ?? [],
-												targetStubs: todoPlan?.targetStubs?.length
-													? todoPlan.targetStubs
-													: targetStubs,
+												targetStubs,
 											}
 										: undefined
 								const hasInlineRefinedCard =

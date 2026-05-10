@@ -22,6 +22,8 @@ interface WriteTodoPlanParams {
 	plans: StructuredPlanEntry[]
 }
 
+const REFINE_STEP2_PLAN_BATCH_SIZE = 3
+
 const PROJECT_FILE_TARGET_PATTERN =
 	/(?:^|[\s:：,，;；()[\]{}"'`])((?:\.\/)?[A-Za-z0-9@._-]+(?:\/[A-Za-z0-9@._-]+)+\.[A-Za-z0-9_-]{1,12})(?=$|[\s,，;；)）\]】}>"'`])/g
 
@@ -271,6 +273,10 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				const retryAgreementPass = await task.enqueuePostRefineAgreementPass(
 					todoItem,
 					retryPlanReadResult.plans,
+					{
+						current: retryPlanReadResult.plans.length,
+						total: retryCompletion.expectedTargets.length || retryPlanReadResult.plans.length,
+					},
 				)
 				const retryAgreementPassFailed = retryAgreementPass.error || !retryAgreementPass.executed
 				const retryIsComplete = !retryAgreementPassFailed && retryCompletion.isComplete
@@ -412,9 +418,29 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				}
 			}
 			if (expectedTargetsByKey.size > 0) {
-				const expectedTargetList = [...expectedTargetsByKey.values()]
+				const expectedTargets = [...expectedTargetsByKey.values()]
+				const savedTargetKeys = new Set(
+					existingPlanReadResult.plans.map((plan) => normalizeTargetForComparison(plan.filePath)),
+				)
+				const nextBatchTargetList = expectedTargets
+					.filter((entry) => !savedTargetKeys.has(normalizeTargetForComparison(entry.target)))
+					.slice(0, REFINE_STEP2_PLAN_BATCH_SIZE)
 					.map((entry) => `  - ${entry.action ? `${entry.action} ` : ""}${entry.target}`)
 					.join("\n")
+				const expectedTargetList = expectedTargets
+					.map((entry) => `  - ${entry.action ? `${entry.action} ` : ""}${entry.target}`)
+					.join("\n")
+				if (normalizedStructuredEntries.length > REFINE_STEP2_PLAN_BATCH_SIZE) {
+					task.consecutiveMistakeCount++
+					task.recordToolError("write_todo_plan")
+					task.didToolFailInCurrentTurn = true
+					pushToolResult(
+						formatResponse.toolError(
+							`STEP 2 write_todo_plan batches may cover at most ${REFINE_STEP2_PLAN_BATCH_SIZE} file target(s) per call.\n\nReceived ${normalizedStructuredEntries.length} file target(s). Retry the SAME todo_item_id with exactly these next target(s), then wait for STEP 3 before continuing:\n${nextBatchTargetList || "(no remaining STEP 1 targets)"}\n\nAllowed STEP 1 targets:\n${expectedTargetList}`,
+						),
+					)
+					return
+				}
 				if (planType !== "file") {
 					task.consecutiveMistakeCount++
 					task.recordToolError("write_todo_plan")
@@ -533,7 +559,10 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 
 			await emitRefineResult("step2", false, true)
 
-			const agreementPass = await task.enqueuePostRefineAgreementPass(todoItem, normalizedPlanEntries)
+			const agreementPass = await task.enqueuePostRefineAgreementPass(todoItem, normalizedPlanEntries, {
+				current: planReadResult.plans.length,
+				total: completion.expectedTargets.length || planReadResult.plans.length,
+			})
 			const agreementPassFailed = agreementPass.error || !agreementPass.executed
 			const isComplete = !agreementPassFailed && completion.isComplete
 
@@ -587,6 +616,23 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 			)
 			await emitRefineResult("step3", isComplete, true, step3PlanReadResult)
 
+			const savedTargetKeysForResult = new Set(
+				step3PlanReadResult.plans.map((plan) => normalizeTargetForComparison(plan.filePath)),
+			)
+			const remainingExpectedTargets =
+				step3PlanReadResult.stubPlans.length > 0
+					? step3PlanReadResult.stubPlans
+							.map((plan) => {
+								const parsedHeader = parsePlanTargetHeader(plan.content)
+								return {
+									target: parsedHeader?.path ?? plan.filePath,
+									action: parsedHeader?.action,
+								}
+							})
+							.filter(
+								(entry) => !savedTargetKeysForResult.has(normalizeTargetForComparison(entry.target)),
+							)
+					: completion.missingTargets.map((target) => ({ target, action: undefined }))
 			const label = planType === "general" ? "general plan section(s)" : "plan file(s)"
 			const fileList = normalizedPlanEntries.map((e) => `  - ${e.filePath}`).join("\n")
 			const savedPathList = savedPaths.map((p) => `  - ${p}`).join("\n")
@@ -595,7 +641,13 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 				: !agreementPass.executed
 					? `STEP 3 agreement pass did not run after writing the plan for "${todoItem.content}": ${agreementPass.skippedReason ?? "unknown reason"}`
 					: undefined
-			const missingTargetList = completion.missingTargets.map((target) => `  - ${target}`).join("\n")
+			const missingTargetList = remainingExpectedTargets
+				.map((entry) => `  - ${entry.action ? `${entry.action} ` : ""}${entry.target}`)
+				.join("\n")
+			const nextBatchTargetList = remainingExpectedTargets
+				.slice(0, REFINE_STEP2_PLAN_BATCH_SIZE)
+				.map((entry) => `  - ${entry.action ? `${entry.action} ` : ""}${entry.target}`)
+				.join("\n")
 			const resultIntro = step3FailureMessage
 				? `Plan batch was saved, but STEP 3 failed for todo item "${todoItem.content}":\n${fileList}`
 				: `Successfully wrote ${normalizedPlanEntries.length} ${label} for todo item "${todoItem.content}":\n${fileList}`
@@ -608,7 +660,7 @@ export class WriteTodoPlanTool extends BaseTool<"write_todo_plan"> {
 							: "\n\n[TODO PLAN COMPLETE — Continue with the next refine todo item.]"
 						: `\n\n[PLAN BATCH RECORDED — Continue the same refine todo item.]${
 								missingTargetList
-									? `\nRemaining expected plan target(s) for this todo:\n${missingTargetList}\n\nNext action: call write_todo_plan again for the SAME todo_item_id and cover only a coherent subset of these remaining targets if needed. Previously recorded plan entries are already saved and accumulate; do not repeat them.`
+									? `\nRemaining expected plan target(s) for this todo:\n${missingTargetList}\n\nNext action: call write_todo_plan again for the SAME todo_item_id and cover exactly these next target(s), then wait for STEP 3 before continuing:\n${nextBatchTargetList}\n\nPreviously recorded plan entries are already saved and accumulate; do not repeat them.`
 									: "\nThe system could not infer all expected file targets from the todo text, so continue this same todo only if more plan entries are still needed. Previously recorded plan entries are already saved and accumulate; do not repeat them."
 							}`
 			}`

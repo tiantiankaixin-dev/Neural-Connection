@@ -785,7 +785,11 @@ export async function readPlanFiles(
 	}
 
 	if (resultsById.length > 0 || stubResultsById.length > 0) {
-		return { plans: resultsById, stubPlans: stubResultsById, contexts: contextsById }
+		return {
+			plans: resultsById,
+			stubPlans: stubResultsById.length > 0 ? stubResultsById : fallbackStubResultsByContent,
+			contexts: contextsById.length > 0 ? contextsById : contextsByContent,
+		}
 	}
 	return {
 		plans: fallbackResultsByContent,
