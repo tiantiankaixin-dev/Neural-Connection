@@ -19,47 +19,30 @@ export function RefineProgressBar({
 }: RefineProgressBarProps) {
 	const safeTotal = Math.max(0, Math.floor(total))
 	const safeCurrent = safeTotal > 0 ? Math.min(Math.max(0, Math.floor(current)), safeTotal) : 0
-	const percentage = safeTotal > 0 ? (safeCurrent / safeTotal) * 100 : 0
-	const color = tone === "purple" ? "var(--vscode-charts-purple)" : "var(--vscode-charts-blue)"
+	const progressMax = safeTotal > 0 ? safeTotal : 1
+	const className = [
+		"refine-progress",
+		compact ? "refine-progress--compact" : "",
+		tone === "purple" ? "refine-progress--purple" : "refine-progress--blue",
+	]
+		.filter(Boolean)
+		.join(" ")
 
 	return (
-		<div style={{ display: "flex", flexDirection: "column", gap: compact ? 3 : 5, width: "100%" }}>
-			<div
-				style={{
-					display: "flex",
-					alignItems: "center",
-					justifyContent: "space-between",
-					gap: 8,
-					fontSize: compact ? 11 : 12,
-					color: "var(--vscode-descriptionForeground)",
-				}}>
+		<div className={className}>
+			<div className="refine-progress__header">
 				<span>{label}</span>
-				<span style={{ fontFamily: "var(--vscode-editor-font-family)", color: "var(--vscode-foreground)" }}>
+				<span className="refine-progress__count">
 					{safeCurrent}/{safeTotal}
 				</span>
 			</div>
-			<div
-				style={{
-					height: compact ? 5 : 7,
-					borderRadius: 999,
-					background: "var(--vscode-editorGroup-border)",
-					overflow: "hidden",
-				}}>
-				<div
-					style={{
-						width: `${percentage}%`,
-						height: "100%",
-						borderRadius: 999,
-						background: color,
-						transition: "width 160ms ease-out",
-					}}
-				/>
-			</div>
-			{detail && (
-				<div style={{ fontSize: 11, color: "var(--vscode-descriptionForeground)", lineHeight: 1.35 }}>
-					{detail}
-				</div>
-			)}
+			<progress
+				className="refine-progress__bar"
+				value={safeCurrent}
+				max={progressMax}
+				aria-label={`${label} ${safeCurrent}/${safeTotal}`}
+			/>
+			{detail && <div className="refine-progress__detail">{detail}</div>}
 		</div>
 	)
 }

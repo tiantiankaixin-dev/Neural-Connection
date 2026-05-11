@@ -39,6 +39,7 @@ interface UpdateTodoListToolBlockProps {
 	todos?: TodoItem[]
 	previousTodos?: TodoItem[]
 	todoPlansById?: Record<string, TodoPlanData>
+	todoTargetsById?: Record<string, TodoPlanTarget[]>
 	planTargets?: TodoPlanTarget[][]
 	refiningTodoItemIds?: string[]
 	activeRefiningTodoItemId?: string
@@ -158,6 +159,22 @@ function normalizeTargetKey(value: string): string {
 		.replace(/^\.\/+/, "")
 		.replace(/\/+/g, "/")
 		.toLowerCase()
+}
+
+function mergePlanTargetLists(...groups: Array<TodoPlanTarget[] | undefined>): TodoPlanTarget[] {
+	const merged: TodoPlanTarget[] = []
+	const seen = new Set<string>()
+	for (const group of groups) {
+		for (const target of group ?? []) {
+			const key = `${target.action}:${normalizeTargetKey(target.target)}`
+			if (seen.has(key)) {
+				continue
+			}
+			seen.add(key)
+			merged.push(target)
+		}
+	}
+	return merged
 }
 
 function RefinedTodoCard({ todo, plan }: { todo: TodoItem; plan?: TodoPlanData }) {
@@ -486,6 +503,7 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 	todos = [],
 	previousTodos,
 	todoPlansById,
+	todoTargetsById,
 	planTargets,
 	refiningTodoItemIds,
 	activeRefiningTodoItemId,
@@ -517,6 +535,15 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 		() => (Array.isArray(planTargets) ? planTargets.map((targets) => normalizePlanTargetsForDisplay(targets)) : []),
 		[planTargets],
 	)
+	const displayPlanTargetsByTodoId = React.useMemo(() => {
+		const targetsByTodoId = new Map<string, TodoPlanTarget[]>()
+		for (const [index, todo] of todos.entries()) {
+			if (todo.id) {
+				targetsByTodoId.set(todo.id, displayPlanTargets[index] ?? [])
+			}
+		}
+		return targetsByTodoId
+	}, [displayPlanTargets, todos])
 	const refiningTodoIdSet = React.useMemo(
 		() => new Set((showRefiningIndicator ? refiningTodoItemIds : []) ?? []),
 		[refiningTodoItemIds, showRefiningIndicator],
@@ -776,9 +803,14 @@ const UpdateTodoListToolBlock: React.FC<UpdateTodoListToolBlockProps> = ({
 								const changeType = changeMap.get(todo.id || todo.content) as TodoChangeType | undefined
 								const changeColor = changeType ? CHANGE_COLORS[changeType] : "transparent"
 								const todoPlan = todo.id ? todoPlansById?.[todo.id] : undefined
-								const targetStubs = todoPlan?.targetStubs?.length
-									? todoPlan.targetStubs
-									: (displayPlanTargets[idx] ?? [])
+								const stableTargetStubs = todo.id ? todoTargetsById?.[todo.id] : undefined
+								const messageTargetStubs = todo.id ? displayPlanTargetsByTodoId.get(todo.id) : undefined
+								const targetStubs = mergePlanTargetLists(
+									stableTargetStubs,
+									todoPlan?.targetStubs,
+									messageTargetStubs,
+									displayPlanTargets[idx],
+								)
 								const contextFromTodo = todo.context?.trim() ? [todo.context.trim()] : []
 								const effectivePlan: TodoPlanData | undefined =
 									todoPlan || contextFromTodo.length > 0 || targetStubs.length > 0

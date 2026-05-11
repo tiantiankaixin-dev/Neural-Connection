@@ -548,6 +548,79 @@ input[cmdk-input]:focus {
 	background-color: color-mix(in srgb, var(--vscode-editorGroup-border) 100%, transparent);
 }
 
+.refine-progress {
+	display: flex;
+	flex-direction: column;
+	gap: 5px;
+	width: 100%;
+}
+
+.refine-progress--compact {
+	gap: 3px;
+}
+
+.refine-progress__header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	font-size: 12px;
+	color: var(--vscode-descriptionForeground);
+}
+
+.refine-progress--compact .refine-progress__header {
+	font-size: 11px;
+}
+
+.refine-progress__count {
+	font-family: var(--vscode-editor-font-family);
+	color: var(--vscode-foreground);
+}
+
+.refine-progress__bar {
+	display: block;
+	width: 100%;
+	height: 7px;
+	appearance: none;
+	border: 0;
+	border-radius: 999px;
+	background: var(--vscode-editorGroup-border);
+	overflow: hidden;
+}
+
+.refine-progress--compact .refine-progress__bar {
+	height: 5px;
+}
+
+.refine-progress__bar::-webkit-progress-bar {
+	border-radius: 999px;
+	background: var(--vscode-editorGroup-border);
+}
+
+.refine-progress__bar::-webkit-progress-value {
+	border-radius: 999px;
+	background: var(--vscode-charts-blue);
+}
+
+.refine-progress__bar::-moz-progress-bar {
+	border-radius: 999px;
+	background: var(--vscode-charts-blue);
+}
+
+.refine-progress--purple .refine-progress__bar::-webkit-progress-value {
+	background: var(--vscode-charts-purple);
+}
+
+.refine-progress--purple .refine-progress__bar::-moz-progress-bar {
+	background: var(--vscode-charts-purple);
+}
+
+.refine-progress__detail {
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+	line-height: 1.35;
+}
+
 @keyframes ground-slide {
 	0% {
 		transform: translateX(0);

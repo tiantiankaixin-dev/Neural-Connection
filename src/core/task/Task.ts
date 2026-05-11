@@ -270,7 +270,6 @@ type AgreementPassOptions = {
 	updateAllTodoContexts?: boolean
 	progressLabel?: string
 	progress?: Step3ProgressInfo
-	emitExtractionResult?: boolean
 }
 
 type AgreementPassPromptBuilder = (todos: TodoItem[], availableTargets: string[]) => string
@@ -2792,6 +2791,48 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				if (existingData.previousTodos && !newData._preservedPrevious) {
 					newData.previousTodos = existingData.previousTodos
 				}
+				const existingPlanTargets = Array.isArray(existingData.planTargets)
+					? existingData.planTargets
+					: Array.isArray(existingData.item_plan_targets)
+						? existingData.item_plan_targets
+						: undefined
+				if (!Array.isArray(newData.planTargets) && !Array.isArray(newData.item_plan_targets)) {
+					if (
+						Array.isArray(existingPlanTargets) &&
+						Array.isArray(existingData.todos) &&
+						Array.isArray(newData.todos)
+					) {
+						const planTargetsByTodoId = new Map<string, unknown>()
+						for (const [index, todo] of existingData.todos.entries()) {
+							if (todo && typeof todo.id === "string") {
+								planTargetsByTodoId.set(todo.id, existingPlanTargets[index] ?? [])
+							}
+						}
+						const remappedPlanTargets = newData.todos.map((todo: unknown, index: number) => {
+							if (todo && typeof todo === "object" && typeof (todo as { id?: unknown }).id === "string") {
+								return planTargetsByTodoId.get((todo as { id: string }).id) ?? []
+							}
+							return existingPlanTargets[index] ?? []
+						})
+						if (
+							remappedPlanTargets.some((targets: unknown) => Array.isArray(targets) && targets.length > 0)
+						) {
+							newData.planTargets = remappedPlanTargets
+						}
+					}
+					if (!Array.isArray(newData.planTargets) && Array.isArray(newData.todos)) {
+						const recoveredPlanTargets = await this.readTodoPlanTargetsForDisplay(newData.todos)
+						if (recoveredPlanTargets.some((targets) => targets.length > 0)) {
+							newData.planTargets = recoveredPlanTargets
+						}
+					}
+				}
+				if (newData.refineMode === undefined && existingData.refineMode !== undefined) {
+					newData.refineMode = existingData.refineMode
+				}
+				if (newData.refineStep === undefined && existingData.refineStep !== undefined) {
+					newData.refineStep = existingData.refineStep
+				}
 				this.clineMessages[lastIdx].text = JSON.stringify(newData)
 			} catch {
 				this.clineMessages[lastIdx].text = text
@@ -2801,6 +2842,44 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		} else {
 			await this.say("user_edit_todos", text)
 		}
+	}
+
+	private async readTodoPlanTargetsForDisplay(
+		todos: unknown[],
+	): Promise<Array<Array<{ target: string; action: string }>>> {
+		const groups: Array<Array<{ target: string; action: string }>> = []
+		for (const todo of todos) {
+			if (!todo || typeof todo !== "object") {
+				groups.push([])
+				continue
+			}
+			const todoItem = todo as { id?: unknown; content?: unknown }
+			if (typeof todoItem.id !== "string" || typeof todoItem.content !== "string") {
+				groups.push([])
+				continue
+			}
+			try {
+				const readResult = await readPlanFiles(
+					this.globalStoragePath,
+					this.taskId,
+					this.taskTimestamp,
+					todoItem.id,
+					todoItem.content,
+				)
+				const targets = [...readResult.stubPlans, ...readResult.plans]
+					.map((plan) => parsePlanTargetHeader(plan.content))
+					.filter(
+						(header): header is { action: "CREATE" | "MODIFY" | "DELETE"; path: string } =>
+							!!header &&
+							(header.action === "CREATE" || header.action === "MODIFY" || header.action === "DELETE"),
+					)
+					.map((header) => ({ target: header.path, action: header.action }))
+				groups.push(targets)
+			} catch {
+				groups.push([])
+			}
+		}
+		return groups
 	}
 
 	private async updateClineMessage(message: ClineMessage) {
@@ -4820,32 +4899,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		const availableSharedTargets = await this.collectAvailableAgreementTargets(currentTodos, planFiles)
 		const agreementPrompt = buildPrompt(currentTodos, availableSharedTargets)
 		const progressLabel = options.progressLabel ? ` ${options.progressLabel}` : ""
-		const runningDetails: Step3ModelTransferDiagnostic = {
-			stage: "running",
-			todoItemId: focusTodo.id,
-			todoContent: focusTodo.content,
-			progressLabel: options.progressLabel,
-			progress: options.progress,
-			planFiles: planFiles.map((plan) => ({
-				filePath: plan.filePath,
-				content: plan.content,
-			})),
-		}
-
-		// Visible signal that Step 3 is running — so the user can see it in chat
-		// even when no agreements end up being appended.
-		await this.say(
-			"text",
-			formatStep3MessageWithModelTransferDetails(
-				`\u2699\ufe0f STEP 3 agreement pass${progressLabel} running for "${focusTodo.content}"...`,
-				runningDetails,
-			),
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			{ isNonInteractive: true },
-		)
 
 		let rawResponse: string
 		try {
@@ -4958,57 +5011,10 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			planFiles,
 			availableSharedTargets,
 		)
-		const successDetails: Step3ModelTransferDiagnostic = {
-			stage: "success",
-			todoItemId: focusTodo.id,
-			todoContent: focusTodo.content,
-			progressLabel: options.progressLabel,
-			progress: options.progress,
-			provider: this.apiConfiguration?.apiProvider,
-			modelId: this.api.getModel().id,
-			promptText: agreementPrompt,
-			rawResponse,
-			parsedResponse: agreementResponse,
-			fileAgreements,
-			agreementCount: fileAgreements.reduce((count, entry) => count + entry.agreements.length, 0),
-			planFiles: planFiles.map((plan) => ({
-				filePath: plan.filePath,
-				content: plan.content,
-			})),
-		}
 		if (fileAgreements.length === 0) {
-			if (options.emitExtractionResult !== false) {
-				await this.say(
-					"text",
-					formatStep3MessageWithModelTransferDetails(
-						`\u2705 STEP 3${progressLabel} for "${focusTodo.content}": no new agreements`,
-						successDetails,
-					),
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					{ isNonInteractive: true },
-				)
-			}
 			return { executed: true, fileAgreements: [] }
 		}
 
-		if (options.emitExtractionResult === false) {
-			return { executed: true, fileAgreements }
-		}
-		await this.say(
-			"text",
-			formatStep3MessageWithModelTransferDetails(
-				`\u2705 STEP 3${progressLabel} extraction for "${focusTodo.content}": extracted ${successDetails.agreementCount} file-owned agreement${successDetails.agreementCount === 1 ? "" : "s"}; pending merge after all STEP 3 batches finish`,
-				successDetails,
-			),
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			{ isNonInteractive: true },
-		)
 		return { executed: true, fileAgreements }
 	}
 
@@ -5027,25 +5033,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 		}
 		if (fileAgreements.length === 0) {
-			const details: Step3ModelTransferDiagnostic = {
-				stage: "success",
-				todoItemId: focusTodo.id,
-				todoContent: focusTodo.content,
-				progress: options.progress,
-				planFiles: [],
-			}
-			await this.say(
-				"text",
-				formatStep3MessageWithModelTransferDetails(
-					`\u2705 STEP 3 for "${focusTodo.content}": no new agreements`,
-					details,
-				),
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				{ isNonInteractive: true },
-			)
 			return { executed: true, appendedCount: 0, fileAgreementCount: 0, planAgreements: [] }
 		}
 
@@ -5081,45 +5068,9 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 		}
 
 		if (successParts.length === 0) {
-			const details: Step3ModelTransferDiagnostic = {
-				stage: "success",
-				todoItemId: focusTodo.id,
-				todoContent: focusTodo.content,
-				progress: options.progress,
-				planFiles: [],
-			}
-			await this.say(
-				"text",
-				formatStep3MessageWithModelTransferDetails(
-					`\u2705 STEP 3 for "${focusTodo.content}": no new agreements`,
-					details,
-				),
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				{ isNonInteractive: true },
-			)
+			return { executed: true, appendedCount, fileAgreementCount, planAgreementCount: 0, planAgreements: [] }
 		} else {
-			const details: Step3ModelTransferDiagnostic = {
-				stage: "success",
-				todoItemId: focusTodo.id,
-				todoContent: focusTodo.content,
-				progress: options.progress,
-				planFiles: [],
-			}
-			await this.say(
-				"text",
-				formatStep3MessageWithModelTransferDetails(
-					`\u2705 STEP 3 for "${focusTodo.content}": ${successParts.join(" and ")}`,
-					details,
-				),
-				undefined,
-				undefined,
-				undefined,
-				undefined,
-				{ isNonInteractive: true },
-			)
+			console.debug(`[STEP 3] ${focusTodo.content}: ${successParts.join(" and ")}`)
 		}
 
 		return { executed: true, appendedCount, fileAgreementCount, planAgreementCount: 0, planAgreements: [] }

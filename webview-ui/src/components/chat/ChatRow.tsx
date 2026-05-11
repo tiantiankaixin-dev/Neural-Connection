@@ -268,6 +268,22 @@ function shouldShowStep3ModelTransferDetails(details?: Step3ModelTransferDiagnos
 	)
 }
 
+function isRefineStepStatusText(text?: string, details?: Step3ModelTransferDiagnostic) {
+	if (details?.errorMessage || details?.errorData) {
+		return false
+	}
+	const normalized = (text ?? "")
+		.trim()
+		.replace(/^[^A-Za-z0-9]+/, "")
+		.trim()
+	if (!/^STEP\s*[123]\b/i.test(normalized)) {
+		return false
+	}
+	return /\b(agreement pass|file agreement|no new agreements|write_todo_plan|update_todo_list|item_plan_targets|plan target|plan batch|refine|running|checked|complete|completed|recorded|retry|extraction|extracted|agreement|agreements|pending merge|appended|merged)\b/i.test(
+		normalized,
+	)
+}
+
 function isLeakedWriteTodoPlanPayload(text?: string) {
 	if (!text) {
 		return false
@@ -554,6 +570,7 @@ interface ChatRowProps {
 	message: ClineMessage
 	lastModifiedMessage?: ClineMessage
 	todoPlansById?: Record<string, TodoPlanData>
+	todoTargetsById?: Record<string, TodoPlanTarget[]>
 	refiningTodoItemIds?: string[]
 	activeRefiningTodoItemId?: string
 	refineStatusLabel?: string
@@ -641,6 +658,7 @@ export const ChatRowContent = ({
 	message,
 	lastModifiedMessage,
 	todoPlansById,
+	todoTargetsById,
 	refiningTodoItemIds,
 	activeRefiningTodoItemId,
 	refineStatusLabel,
@@ -1083,6 +1101,7 @@ export const ChatRowContent = ({
 							todos={displayedTodos}
 							planTargets={groupedPlanTargets ?? planTargets}
 							todoPlansById={todoPlansById}
+							todoTargetsById={todoTargetsById}
 							refiningTodoItemIds={refiningTodoItemIds}
 							activeRefiningTodoItemId={activeRefiningTodoItemId}
 							refineStatusLabel={refineStatusLabel}
@@ -1798,19 +1817,32 @@ export const ChatRowContent = ({
 					if (isLeakedWriteTodoPlanPayload(step3Message.cleanText)) {
 						return null
 					}
+					const hideRefineStepText = isRefineStepStatusText(step3Message.cleanText, step3Message.details)
+					const hasVisibleContent =
+						!hideRefineStepText ||
+						!!step3Progress ||
+						shouldShowStep3ModelTransferDetails(step3Message.details) ||
+						!!message.images?.length
+					if (!hasVisibleContent) {
+						return null
+					}
 
 					return (
 						<div className="group">
-							<div style={headerStyle}>
-								<MessageCircle className="w-4 shrink-0" aria-label="Speech bubble icon" />
-								<span style={{ fontWeight: "bold" }}>{t("chat:text.rooSaid")}</span>
-								<div style={{ flexGrow: 1 }} />
-								<OpenMarkdownPreviewButton markdown={step3Message.cleanText} />
-							</div>
+							{!hideRefineStepText && (
+								<div style={headerStyle}>
+									<MessageCircle className="w-4 shrink-0" aria-label="Speech bubble icon" />
+									<span style={{ fontWeight: "bold" }}>{t("chat:text.rooSaid")}</span>
+									<div style={{ flexGrow: 1 }} />
+									<OpenMarkdownPreviewButton markdown={step3Message.cleanText} />
+								</div>
+							)}
 							<div className="pl-6">
-								<Markdown markdown={step3Message.cleanText} partial={message.partial} />
+								{!hideRefineStepText && (
+									<Markdown markdown={step3Message.cleanText} partial={message.partial} />
+								)}
 								{step3Progress && (
-									<div className="mt-2">
+									<div className={hideRefineStepText ? undefined : "mt-2"}>
 										<RefineProgressBar
 											label={step3Progress.label}
 											current={step3Progress.current}
@@ -2096,6 +2128,7 @@ export const ChatRowContent = ({
 									: prevTodos
 							}
 							todoPlansById={todoPlansById}
+							todoTargetsById={todoTargetsById}
 							refiningTodoItemIds={refiningTodoItemIds}
 							activeRefiningTodoItemId={activeRefiningTodoItemId}
 							refineStatusLabel={refineStatusLabel}

@@ -157,6 +157,20 @@ function mergeTodoPlanTargets(existing: TodoPlanTarget[] | undefined, incoming: 
 	return merged
 }
 
+function isUpdateTodoListToolName(value: unknown): boolean {
+	return value === "updateTodoList" || value === "update_todo_list"
+}
+
+function getPlanTargetGroupsFromPayload(parsed: Record<string, unknown>): unknown[] | undefined {
+	if (Array.isArray(parsed.planTargets)) {
+		return parsed.planTargets
+	}
+	if (Array.isArray(parsed.item_plan_targets)) {
+		return parsed.item_plan_targets
+	}
+	return undefined
+}
+
 export interface ChatViewRef {
 	acceptInput: () => void
 }
@@ -165,10 +179,13 @@ export const MAX_IMAGES_PER_MESSAGE = 20 // This is the Anthropic limit.
 
 const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0
 
-function getLatestTodoPlanTargetsById(clineMessages: ClineMessage[]): Record<string, TodoPlanTarget[]> {
-	let latestTargetsById: Record<string, TodoPlanTarget[]> = {}
+function getStableTodoPlanTargetsById(clineMessages: ClineMessage[]): Record<string, TodoPlanTarget[]> {
+	const targetsById: Record<string, TodoPlanTarget[]> = {}
 
 	for (const message of clineMessages) {
+		if (message.partial) {
+			continue
+		}
 		if (
 			!(
 				(message.type === "ask" && message.ask === "tool") ||
@@ -179,30 +196,33 @@ function getLatestTodoPlanTargetsById(clineMessages: ClineMessage[]): Record<str
 		}
 
 		try {
-			const parsed = JSON.parse(message.text ?? "{}")
-			if (!parsed || parsed.tool !== "updateTodoList" || !Array.isArray(parsed.todos)) {
+			const parsed = JSON.parse(message.text ?? "{}") as Record<string, unknown>
+			if (!parsed || !isUpdateTodoListToolName(parsed.tool) || !Array.isArray(parsed.todos)) {
 				continue
 			}
 
-			if (!Array.isArray(parsed.planTargets)) {
+			const planTargetGroups = getPlanTargetGroupsFromPayload(parsed)
+			if (!planTargetGroups) {
 				continue
 			}
 
-			const nextTargetsById: Record<string, TodoPlanTarget[]> = {}
 			for (const [index, todo] of parsed.todos.entries()) {
 				const id = todo && typeof todo.id === "string" ? todo.id : undefined
 				if (!id) {
 					continue
 				}
-				nextTargetsById[id] = normalizeTodoPlanTargets(parsed.planTargets[index])
+				const targets = normalizeTodoPlanTargets(planTargetGroups[index])
+				if (targets.length === 0) {
+					continue
+				}
+				targetsById[id] = mergeTodoPlanTargets(targetsById[id], targets)
 			}
-			latestTargetsById = nextTargetsById
 		} catch {
 			continue
 		}
 	}
 
-	return latestTargetsById
+	return targetsById
 }
 
 const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewProps> = (
@@ -276,9 +296,34 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		return getLatestTodo(messages.filter((message) => !isLeakedWriteTodoPlanMessage(message)))
 	}, [messages, currentTaskTodos])
 
+	const todoTargetsById = useMemo<Record<string, TodoPlanTarget[]>>(() => {
+		const result = getStableTodoPlanTargetsById(messages)
+
+		for (const message of messages) {
+			if (message.type !== "say" || message.say !== "refine_result" || !message.text) {
+				continue
+			}
+
+			try {
+				const parsed = JSON.parse(message.text)
+				if (!parsed?.todoItemId) {
+					continue
+				}
+				const targetStubs = normalizeTodoPlanTargets(parsed.targetStubs)
+				if (targetStubs.length === 0) {
+					continue
+				}
+				result[parsed.todoItemId] = mergeTodoPlanTargets(result[parsed.todoItemId], targetStubs)
+			} catch {
+				continue
+			}
+		}
+
+		return result
+	}, [messages])
+
 	const todoPlansById = useMemo<Record<string, TodoPlanData>>(() => {
 		const result: Record<string, TodoPlanData> = {}
-		const latestPlanTargetsByTodoId = getLatestTodoPlanTargetsById(messages)
 
 		for (const message of messages) {
 			if (message.type !== "say" || message.say !== "refine_result" || !message.text) {
@@ -330,7 +375,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			if (!id) {
 				continue
 			}
-			const targetStubs = latestPlanTargetsByTodoId[id]
+			const targetStubs = todoTargetsById[id]
 			if (!targetStubs?.length) {
 				continue
 			}
@@ -371,7 +416,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		}
 
 		return result
-	}, [messages, latestTodos])
+	}, [messages, latestTodos, todoTargetsById])
 
 	const modifiedMessages = useMemo(() => combineApiRequests(combineCommandSequences(messages.slice(1))), [messages])
 
@@ -2023,6 +2068,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 					key={messageOrGroup.ts}
 					message={messageOrGroup}
 					todoPlansById={todoPlansById}
+					todoTargetsById={todoTargetsById}
 					showRefiningIndicator={isRefining}
 					refiningTodoItemIds={refiningTodoItemIds}
 					activeRefiningTodoItemId={activeRefiningTodoItemId}
@@ -2065,6 +2111,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			toggleRowExpansion,
 			modifiedMessages,
 			todoPlansById,
+			todoTargetsById,
 			groupedMessages.length,
 			isRefining,
 			refiningTodoItemIds,
